@@ -1,0 +1,12 @@
+{
+  "name": "provex-webhook",
+  "version": "1.0.0",
+  "description": "TradingView webhook receiver for Provex ICT alerts",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
