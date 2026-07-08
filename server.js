@@ -1,5 +1,261 @@
-// ✅ New — reads each JSON field directly by name
-const condition = payload.condition  // "cross_above_level1", "killzone_level_break_HIGH_PRIORITY" etc
-const rsi       = payload.rsi        // 41.58
-const cumDelta  = payload.cumDelta   // -7092891
-// emoji/bias logic now based on condition string, not alertMsg
+const http = require("http");
+const https = require("https");
+
+const TELEGRAM_TOKEN    = process.env.TELEGRAM_TOKEN;
+const TELEGRAM_CHAT_ID  = process.env.TELEGRAM_CHAT_ID;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const PORT = process.env.PORT || 3000;
+
+// ============================================================
+// PROVEX ACCOUNT CONFIG
+// ============================================================
+const PROVEX = {
+  totalCapital:  10000,
+  currentPnl:    -584.93,
+  maxRiskPerTrade: 50,
+  leverage:      5,
+  dailyLossLimit: 500,
+  drawdownLimit:  1000,
+};
+
+// ============================================================
+// SYSTEM PROMPT — Krysie's full trading brain
+// ============================================================
+const SYSTEM_PROMPT = `You are Krysie's personal ICT/SMC trade plan generator for crypto futures trading. You receive structured alert data from TradingView and must output a complete, precise trade plan.
+
+## YOUR METHODOLOGY (strict ICT/SMC)
+- Order Blocks (OBs): Entry ONLY from the actual LuxAlgo-drawn OB box boundaries — never from local swing highs/lows
+- -OB (bearish): Short entry zone. +OB (bullish): Long entry zone
+- MSS (Market Structure Shift): Required for directional confirmation
+- SMT Divergence: Bearish SMT at highs = short warning. Bullish SMT at lows = long warning
+- Liquidity sweeps: Sharp wick through a level = sweep. Price must react immediately
+- Volume delta: Negative delta at -OB = bearish confluence. Positive delta at +OB = bullish confluence
+- Kill zones: London (4:33-6:30 PM AEDT) and NY (11 PM-1 AM AEDT) = high credibility. Outside = lower credibility, downweight signals
+
+## 5-POINT ENTRY CHECKLIST (strict, no rounding up)
+1. Sharp liquidity sweep through a marked level
+2. Hard volume delta flip at the sweep moment
+3. Clear MSS marker on chart
+4. BTC confirming same move simultaneously
+5. Retest of broken level holding before entry
+
+Scoring: 5/5 = full size | 3.5-4/5 = half size only | below 3.5 = NO TRADE
+
+## PROVEX RULES
+- Max risk per trade: $50 (half size = $25)
+- Max leverage: 5x
+- TP target per trade: $70-110 profit. Partial close if running past $110-120. Hard ceiling ~$150
+- Consistency rule: no single trade can exceed 40% of total profit
+- Daily loss limit: $500 (closed PnL only)
+- Hard stop orders on exchange immediately — no mental stops
+
+## VALIDATED LESSONS (never violate these)
+1. -OB rejection + sustained negative delta = bearish continuation
+2. Sharp drop + delta flipping positive = absorption, possible exhaustion — don't read delta only at sweep point
+3. SMT divergence at fresh highs after impulsive move = early reversal warning — flag explicitly
+4. Higher timeframe trend dominates counter-trend bounce calls
+5. SUI lags BTC directionally but not reliably — always check own structure
+6. Directional bias confirmed over gap ≠ tradeable path — check intraday high/low
+7. Delta pause mid-downtrend ≠ seller exhaustion if price still making lower lows
+8. Negative delta during strong multi-TF rally = absorption, can flip bullish before delta confirms
+9. ALWAYS anchor entry to the actual drawn OB box boundaries, never to local swing highs
+10. Before any short retest entry: (a) confirm actual -OB box level, (b) check for unmitigated +OB below acting as magnet, (c) check if 4H delta negative + RSI >55 = absorption not distribution
+11. OB identification: -OB = highest-high candle between swing pivot and MSS close. Mitigated when price closes above ob.top → becomes breaker block
+12. Don't anchor retest zones to swing highs. Always use the drawn LuxAlgo box. Confirmed Jul 7-8 2026 ETH
+
+## OUTPUT FORMAT (always follow exactly)
+Respond in this exact structure, no deviations:
+
+CHECKLIST SCORE: X/5
+DIRECTION: [LONG/SHORT/NO TRADE]
+BIAS REASONING: [2-3 sentences max, specific]
+
+ENTRY: $X
+SL: $X  
+TP1: $X (60% close)
+TP2: $X (40% runner, SL→BE after TP1)
+LEVERAGE: 5x
+POSITION SIZE: X ETH/BTC/SUI
+MARGIN REQUIRED: $X
+LIQUIDATION PRICE: $X
+
+PROFIT IF TP1: +$X
+PROFIT IF FULL: +$X
+LOSS IF SL: -$X
+
+INVALIDATION: [specific price + condition that kills this trade]
+KILL ZONE: [Active/Inactive — if inactive, note fakeout risk]
+CONFIDENCE: [HIGH/MEDIUM/LOW] — [one sentence why]
+
+If NO TRADE: explain exactly what condition would trigger an entry instead (Watch Plan).`;
+
+// ============================================================
+// Call Claude API to generate trade plan
+// ============================================================
+async function generateTradePlan(payload) {
+  const accountBalance = PROVEX.totalCapital + PROVEX.currentPnl;
+  const remainingDrawdown = PROVEX.drawdownLimit + PROVEX.currentPnl;
+
+  const userMessage = `New TradingView alert received. Generate a complete trade plan.
+
+ALERT DATA:
+- Symbol: ${payload.symbol || "ETHUSDT"}
+- Condition: ${payload.condition || "unknown"}
+- Price: $${payload.price}
+- RSI: ${payload.rsi}
+- Cumulative Delta: ${payload.cumDelta}
+- Session: ${payload.session}
+- Kill Zone Active: ${payload.killzone}
+- Timeframe: ${payload.timeframe}
+
+STRUCTURE (from LuxAlgo toolkit — these are the ACTUAL drawn box levels):
+- Active -OB Zone: $${payload.obBottom} – $${payload.obTop}
+- Active +OB Zone: $${payload.pobBottom} – $${payload.pobTop}
+- Latest SMT Tag: ${payload.smtBias}
+- Latest MSS Direction: ${payload.mssDir}
+
+PROVEX ACCOUNT STATUS:
+- Effective Balance: $${accountBalance.toFixed(2)}
+- Remaining Drawdown Buffer: $${remainingDrawdown.toFixed(2)}
+- Max Risk This Trade: $${PROVEX.maxRiskPerTrade}
+- Daily Loss Limit Remaining: $${PROVEX.dailyLossLimit}`;
+
+  const body = JSON.stringify({
+    model: "claude-sonnet-4-6",
+    max_tokens: 1000,
+    system: SYSTEM_PROMPT,
+    messages: [{ role: "user", content: userMessage }],
+  });
+
+  return new Promise((resolve, reject) => {
+    const req = https.request("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "Content-Length": Buffer.byteLength(body),
+      },
+    }, (res) => {
+      let data = "";
+      res.on("data", (c) => (data += c));
+      res.on("end", () => {
+        try {
+          const parsed = JSON.parse(data);
+          const text = parsed.content?.[0]?.text || "Error: no response from Claude";
+          resolve(text);
+        } catch (e) {
+          reject(new Error("Failed to parse Claude response"));
+        }
+      });
+    });
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+// ============================================================
+// Send Telegram message
+// ============================================================
+async function sendTelegram(message) {
+  const url  = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
+  const body = JSON.stringify({
+    chat_id:    TELEGRAM_CHAT_ID,
+    text:       message,
+    parse_mode: "HTML",
+  });
+  return new Promise((resolve, reject) => {
+    const req = https.request(url, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
+    }, (res) => {
+      let data = "";
+      res.on("data", (c) => (data += c));
+      res.on("end",  () => resolve(JSON.parse(data)));
+    });
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+// ============================================================
+// Format the incoming alert header (fires immediately)
+// ============================================================
+function formatAlertHeader(payload) {
+  const now = new Date().toLocaleString("en-AU", {
+    timeZone: "Australia/Melbourne", dateStyle: "short", timeStyle: "short"
+  });
+  const killzone  = payload.killzone === true || payload.killzone === "true";
+  const kzTag     = killzone ? " ⚡ KILL ZONE" : "";
+  const condition = payload.condition || "unknown";
+  const isPriority = condition.includes("HIGH_PRIORITY");
+  const isShort   = condition.includes("OB_SHORT") || condition.includes("overbought") || condition.includes("cross_below");
+  const isLong    = condition.includes("POB_LONG")  || condition.includes("oversold")  || condition.includes("cross_above");
+  const emoji     = isPriority ? "🚨" : isShort ? "🔴" : isLong ? "🟢" : "🔔";
+
+  return `${emoji} <b>PROVEX ALERT${kzTag}</b>
+─────────────────
+<b>Signal:</b>   ${condition}
+<b>Symbol:</b>   ${payload.symbol || "—"}
+<b>Price:</b>    $${payload.price}
+<b>RSI:</b>      ${payload.rsi}
+<b>Delta:</b>    ${payload.cumDelta}
+<b>Session:</b>  ${payload.session}
+<b>TF:</b>       ${payload.timeframe}
+<b>-OB Zone:</b> $${payload.obBottom} – $${payload.obTop}
+<b>+OB Zone:</b> $${payload.pobBottom} – $${payload.pobTop}
+<b>SMT:</b>      ${payload.smtBias}  |  <b>MSS:</b> ${payload.mssDir}
+─────────────────
+⏳ <i>Generating trade plan...</i>
+<b>Time (AEDT):</b> ${now}`;
+}
+
+// ============================================================
+// HTTP Server
+// ============================================================
+const server = http.createServer(async (req, res) => {
+  if (req.method === "GET" && req.url === "/") {
+    res.writeHead(200); res.end("Provex alert server v4 — Claude-powered ✅"); return;
+  }
+
+  if (req.method === "POST" && req.url === "/webhook") {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", async () => {
+      try {
+        let payload;
+        try { payload = JSON.parse(body); } catch { payload = { condition: body }; }
+
+        // Send alert header immediately — don't wait for Claude
+        const header = formatAlertHeader(payload);
+        await sendTelegram(header);
+
+        // Generate trade plan via Claude API
+        const tradePlan = await generateTradePlan(payload);
+
+        // Send the trade plan as a follow-up message
+        const planMsg = `📋 <b>TRADE PLAN — ${payload.symbol || "ETH"}</b>
+─────────────────
+<pre>${tradePlan}</pre>`;
+        await sendTelegram(planMsg);
+
+        console.log("Alert + plan sent ✅", new Date().toISOString(), "| condition:", payload.condition);
+        res.writeHead(200); res.end(JSON.stringify({ ok: true }));
+      } catch (err) {
+        console.error("Error:", err.message);
+        // Still try to send error to Telegram so you know something broke
+        try {
+          await sendTelegram(`⚠️ <b>Bot error:</b> ${err.message}`);
+        } catch {}
+        res.writeHead(500); res.end(JSON.stringify({ ok: false, error: err.message }));
+      }
+    });
+    return;
+  }
+
+  res.writeHead(404); res.end("Not found");
+});
+
+server.listen(PORT, () => console.log(`Server v4 running on port ${PORT}`));
