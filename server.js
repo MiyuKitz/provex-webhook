@@ -228,14 +228,21 @@ const server = http.createServer(async (req, res) => {
         let payload;
         try { payload = JSON.parse(body); } catch { payload = { condition: body }; }
 
-        // Send alert header immediately — don't wait for Claude
+        // Generate trade plan FIRST — don't waste credits or spam on no-trade
+        const tradePlan = await generateTradePlan(payload);
+
+        // NO TRADE — skip Telegram entirely, save credits
+        if (tradePlan.includes("NO TRADE") || tradePlan.includes("DIRECTION: NO TRADE")) {
+          console.log("No trade — skipping Telegram ⏭️", new Date().toISOString(), "| condition:", payload.condition);
+          res.writeHead(200); res.end(JSON.stringify({ ok: true, skipped: true }));
+          return;
+        }
+
+        // Valid trade plan — NOW send alert header + plan
         const header = formatAlertHeader(payload);
         await sendTelegram(header);
 
-        // Generate trade plan via Claude API
-        const tradePlan = await generateTradePlan(payload);
-
-        // Send the trade plan as a follow-up message
+        // Send trade plan
         const planMsg = `📋 <b>TRADE PLAN — ${payload.symbol || "ETH"}</b>
 ─────────────────
 <pre>${tradePlan}</pre>`;
