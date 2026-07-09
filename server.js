@@ -10,12 +10,12 @@ const PORT = process.env.PORT || 3000;
 // PROVEX ACCOUNT CONFIG
 // ============================================================
 const PROVEX = {
-  totalCapital:  10000,
-  currentPnl:    -584.93,
+  totalCapital:    10000,
+  currentPnl:      -598.14,  // updated Jul 9 2026
   maxRiskPerTrade: 50,
-  leverage:      5,
-  dailyLossLimit: 500,
-  drawdownLimit:  1000,
+  leverage:        5,
+  dailyLossLimit:  500,
+  drawdownLimit:   1000,
 };
 
 // ============================================================
@@ -39,7 +39,14 @@ const SYSTEM_PROMPT = `You are Krysie's personal ICT/SMC trade plan generator fo
 4. BTC confirming same move simultaneously
 5. Retest of broken level holding before entry
 
-Scoring: 5/5 = full size | 3.5-4/5 = half size only | below 3.5 = NO TRADE
+Scoring: 5/5 = full size | 4/5 = full size | 3.5/5 = half size only | below 3.5 = NO TRADE
+
+CRITICAL SCORING RULES:
+- If BTC data is missing (btcPrice = 0 or not provided) → point 4 scores 0/1 AND maximum total score is capped at 4/5
+- If score is 3.5/5 AND BTC data is missing → automatic NO TRADE (cannot verify point 4)
+- If remaining drawdown buffer < $400 → minimum score for ANY trade is 4/5 (no 3.5/5 trades allowed)
+- Signal "price_entering_OB_zone" without confirmed rejection candle → point 5 scores 0/1 (touching ≠ rejecting)
+- SL must be minimum 1.5× the OB box height above the -OB top (not just $1-2 above)
 
 ## PROVEX RULES
 - Max risk per trade: $50 (half size = $25)
@@ -59,6 +66,7 @@ Scoring: 5/5 = full size | 3.5-4/5 = half size only | below 3.5 = NO TRADE
 7. Delta pause mid-downtrend ≠ seller exhaustion if price still making lower lows
 8. Negative delta during strong multi-TF rally = absorption, can flip bullish before delta confirms
 9. ALWAYS anchor entry to the actual drawn OB box boundaries, never to local swing highs
+9b. SL placement: minimum 1.5× OB box height above -OB top for shorts, below +OB bottom for longs. Never place SL just $1-2 above/below the OB — wicks through OBs before rejecting are common during kill zones
 10. Before any short retest entry: (a) confirm actual -OB box level, (b) check for unmitigated +OB below acting as magnet, (c) check if 4H delta negative + RSI >55 = absorption not distribution
 11. OB identification: -OB = highest-high candle between swing pivot and MSS close. Mitigated when price closes above ob.top → becomes breaker block
 12. Don't anchor retest zones to swing highs. Always use the drawn LuxAlgo box. Confirmed Jul 7-8 2026 ETH
@@ -113,6 +121,15 @@ STRUCTURE (from LuxAlgo toolkit — these are the ACTUAL drawn box levels):
 - Active +OB Zone: $${payload.pobBottom} – $${payload.pobTop}
 - Latest SMT Tag: ${payload.smtBias}
 - Latest MSS Direction: ${payload.mssDir}
+- Last Swing High: $${payload.swingHigh || 0}
+- Last Swing Low: $${payload.swingLow || 0}
+
+BTC LIVE CORRELATION DATA (use for checklist point 4):
+- BTC Price: $${payload.btcPrice || 0}
+- BTC Cumulative Delta: ${payload.btcDelta || 0}
+- BTC RSI: ${payload.btcRsi || 0}
+- BTC 3-bar Trend: ${payload.btcTrend || "Unknown"}
+- BTC scoring: if btcTrend matches ETH direction AND btcDelta confirms → point 4 = 1/1. If btcTrend neutral → 0.5/1. If btcTrend opposes ETH direction → 0/1 AND flag as high risk
 
 PROVEX ACCOUNT STATUS:
 - Effective Balance: $${accountBalance.toFixed(2)}
