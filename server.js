@@ -13,10 +13,42 @@ const PROVEX = {
   totalCapital:    10000,
   currentPnl:      -598.14,  // updated Jul 9 2026
   maxRiskPerTrade: 50,
-  leverage:        5,
+  maxLeverage:     10,       // ProveX max
   dailyLossLimit:  500,
   drawdownLimit:   1000,
 };
+
+// Dynamic leverage based on confidence + session
+function getLeverage(score, inKillZone, exchange) {
+  if (exchange === "provex") {
+    if (inKillZone) {
+      if (score >= 5)   return 10;  // 5/5 KZ → max leverage
+      if (score >= 4)   return 7;   // 4/5 KZ → high leverage
+      if (score >= 3.5) return 5;   // 3.5/5 KZ → standard
+    } else {
+      if (score >= 5)   return 7;   // 5/5 outside → slightly reduced
+      if (score >= 4)   return 5;   // 4/5 outside → standard
+      return 0;                     // below 4/5 outside → no trade
+    }
+  }
+  return 5; // default fallback
+}
+
+// Calculate position size based on risk, leverage, price, stop distance
+function calcPosition(riskAmount, entryPrice, slPrice, leverage) {
+  const stopDistance = Math.abs(entryPrice - slPrice);
+  if (stopDistance === 0) return { size: 0, margin: 0, liqPrice: 0 };
+  const positionSize = (riskAmount / stopDistance);
+  const notional     = positionSize * entryPrice;
+  const margin       = notional / leverage;
+  const liqPrice     = entryPrice * (1 + (1 / leverage)); // short liq (above entry)
+  return {
+    size:     positionSize.toFixed(3),
+    margin:   margin.toFixed(2),
+    liqPrice: liqPrice.toFixed(2),
+    notional: notional.toFixed(2),
+  };
+}
 
 // ============================================================
 // SYSTEM PROMPT — Krysie's full trading brain
@@ -39,14 +71,28 @@ const SYSTEM_PROMPT = `You are Krysie's personal ICT/SMC trade plan generator fo
 4. BTC confirming same move simultaneously
 5. Retest of broken level holding before entry
 
-Scoring: 5/5 = full size | 4/5 = full size | 3.5/5 = half size only | below 3.5 = NO TRADE
+## TIERED SCORING BASED ON SESSION
+
+KILL ZONE ACTIVE (London 4:33-6:30 PM AEDT | NY 11 PM-1 AM AEDT):
+- 5/5 → Full size ($50 risk), full plan
+- 4/5 → Full size ($50 risk), full plan  
+- 3.5/5 → Half size ($25 risk), half plan
+- Below 3.5 → NO TRADE
+
+OUTSIDE KILL ZONE:
+- 5/5 → Reduced size ($35 risk), full plan, note fakeout risk
+- 4/5 → Half size ($25 risk), plan with caution note
+- 3.5/5 → NO TRADE (insufficient edge without kill zone)
+- Below 3.5 → NO TRADE always
 
 CRITICAL SCORING RULES:
-- If BTC data is missing (btcPrice = 0 or not provided) → point 4 scores 0/1 AND maximum total score is capped at 4/5
-- If score is 3.5/5 AND BTC data is missing → automatic NO TRADE (cannot verify point 4)
-- If remaining drawdown buffer < $400 → minimum score for ANY trade is 4/5 (no 3.5/5 trades allowed)
-- Signal "price_entering_OB_zone" without confirmed rejection candle → point 5 scores 0/1 (touching ≠ rejecting)
-- SL must be minimum 1.5× the OB box height above the -OB top (not just $1-2 above)
+- If BTC data missing (btcPrice = 0) → point 4 = 0/1, max score capped at 4/5
+- If score 3.5/5 AND BTC missing → NO TRADE regardless of session
+- If drawdown buffer < $400 → minimum 4/5 required in kill zone, 5/5 required outside
+- Signal "OB_SHORT_REJECTION_CONFIRMED" = bearish candle closed inside OB → point 5 = 1/1
+- Signal "price_entering_OB_zone" = touch only → point 5 = 0/1
+- SL minimum 1.5× OB box height above -OB top
+- Outside kill zone: always add warning "FAKEOUT RISK — lower volume session"
 
 ## PROVEX RULES
 - Max risk per trade: $50 (half size = $25)
@@ -76,26 +122,33 @@ Respond in this exact structure, no deviations:
 
 CHECKLIST SCORE: X/5
 DIRECTION: [LONG/SHORT/NO TRADE]
+CONFIDENCE: [HIGH/MEDIUM/LOW]
 BIAS REASONING: [2-3 sentences max, specific]
 
 ENTRY: $X
 SL: $X  
 TP1: $X (60% close)
 TP2: $X (40% runner, SL→BE after TP1)
-LEVERAGE: 5x
+LEVERAGE: Xx (calculated from confidence + session)
 POSITION SIZE: X ETH/BTC/SUI
 MARGIN REQUIRED: $X
 LIQUIDATION PRICE: $X
+MAX RISK: $X
 
 PROFIT IF TP1: +$X
 PROFIT IF FULL: +$X
 LOSS IF SL: -$X
 
+LEVERAGE REASONING: [why this leverage — e.g. "5/5 kill zone = 10x", "4/5 outside KZ = 5x"]
 INVALIDATION: [specific price + condition that kills this trade]
 KILL ZONE: [Active/Inactive — if inactive, note fakeout risk]
-CONFIDENCE: [HIGH/MEDIUM/LOW] — [one sentence why]
 
-If NO TRADE: explain exactly what condition would trigger an entry instead (Watch Plan).`;
+If NO TRADE: explain exactly what condition would trigger an entry instead (Watch Plan).
+
+LEVERAGE RULES TO APPLY:
+Kill zone 5/5 → 10x | Kill zone 4/5 → 7x | Kill zone 3.5/5 → 5x
+Outside KZ 5/5 → 7x | Outside KZ 4/5 → 5x | Outside KZ 3.5/5 → NO TRADE
+Max risk always $50 ProveX regardless of leverage — only position size changes`;
 
 // ============================================================
 // Call Claude API to generate trade plan
