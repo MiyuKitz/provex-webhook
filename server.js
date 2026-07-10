@@ -241,39 +241,37 @@ const server = http.createServer(async (req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
     req.on("end", async () => {
-      try {
-        let payload;
-        try { payload = JSON.parse(body); } catch { payload = { condition: body }; }
+      let payload;
+      try { payload = JSON.parse(body); } catch { payload = { condition: body }; }
 
-        // Generate trade plan FIRST — don't waste credits or spam on no-trade
+      // Respond to TradingView IMMEDIATELY (before Claude API call)
+      // This prevents webhook timeout errors
+      res.writeHead(200); res.end(JSON.stringify({ ok: true }));
+
+      // Now process async in background — TradingView already got its 200 OK
+      try {
+        // Generate trade plan FIRST — don't waste credits on no-trade
         const tradePlan = await generateTradePlan(payload);
 
         // NO TRADE — skip Telegram entirely, save credits
         if (tradePlan.includes("NO TRADE") || tradePlan.includes("DIRECTION: NO TRADE")) {
           console.log("No trade — skipping Telegram ⏭️", new Date().toISOString(), "| condition:", payload.condition);
-          res.writeHead(200); res.end(JSON.stringify({ ok: true, skipped: true }));
           return;
         }
 
-        // Valid trade plan — NOW send alert header + plan
+        // Valid trade plan — send alert header + plan to Telegram
         const header = formatAlertHeader(payload);
         await sendTelegram(header);
 
-        // Send trade plan
         const planMsg = `📋 <b>TRADE PLAN — ${payload.symbol || "ETH"}</b>
 ─────────────────
 <pre>${tradePlan}</pre>`;
         await sendTelegram(planMsg);
 
         console.log("Alert + plan sent ✅", new Date().toISOString(), "| condition:", payload.condition);
-        res.writeHead(200); res.end(JSON.stringify({ ok: true }));
       } catch (err) {
         console.error("Error:", err.message);
-        // Still try to send error to Telegram so you know something broke
-        try {
-          await sendTelegram(`⚠️ <b>Bot error:</b> ${err.message}`);
-        } catch {}
-        res.writeHead(500); res.end(JSON.stringify({ ok: false, error: err.message }));
+        try { await sendTelegram(`⚠️ <b>Bot error:</b> ${err.message}`); } catch {}
       }
     });
     return;
