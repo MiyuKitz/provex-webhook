@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 3000;
 // ============================================================
 const PROVEX = {
   totalCapital:    10000,
-  currentPnl:      -598.14,  // updated Jul 9 2026
+  currentPnl:      -605.86,  // updated Jul 11 2026
   maxRiskPerTrade: 50,
   maxLeverage:     10,       // ProveX max
   dailyLossLimit:  500,
@@ -303,6 +303,27 @@ const server = http.createServer(async (req, res) => {
 
       // Now process async in background — TradingView already got its 200 OK
       try {
+        // PRE-FILTER — only call Claude API for high priority signals
+        // Weak signals (RSI, MSS alone, SMT alone, outside OB watch) are skipped
+        // This saves ~90% of API credits
+        const condition = payload.condition || "";
+        const highPrioritySignals = [
+          "KILLZONE_OB_SHORT_HIGH_PRIORITY",
+          "KILLZONE_POB_LONG_HIGH_PRIORITY",
+          "OB_SHORT_REJECTION_CONFIRMED",
+          "POB_LONG_REJECTION_CONFIRMED",
+          "cross_manual_level1",
+          "cross_manual_level2",
+          "cross_manual_level3",
+        ];
+
+        const isHighPriority = highPrioritySignals.some(s => condition.includes(s));
+
+        if (!isHighPriority) {
+          console.log("Low priority signal — skipping Claude API ⏭️", new Date().toISOString(), "| condition:", condition);
+          return;
+        }
+
         // Generate trade plan FIRST — don't waste credits on no-trade
         const tradePlan = await generateTradePlan(payload);
 
