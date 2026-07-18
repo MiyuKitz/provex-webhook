@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 3000;
 // ============================================================
 const PROVEX = {
   totalCapital:    10000,
-  currentPnl:      -605.86,  // updated Jul 11 2026
+  currentPnl:      -605.86,  // updated Jul 11 2026 — switch to 15M
   maxRiskPerTrade: 50,
   maxLeverage:     10,       // ProveX max
   dailyLossLimit:  500,
@@ -53,102 +53,69 @@ function calcPosition(riskAmount, entryPrice, slPrice, leverage) {
 // ============================================================
 // SYSTEM PROMPT — Krysie's full trading brain
 // ============================================================
-const SYSTEM_PROMPT = `You are Krysie's personal ICT/SMC trade plan generator for crypto futures trading. You receive structured alert data from TradingView and must output a complete, precise trade plan.
+const SYSTEM_PROMPT = `You are a professional crypto futures trade signal generator using ICT/SMC methodology. You receive structured alert data from TradingView and output clean, universal trade signals usable on ANY platform (BingX, MEXC, Binance, etc).
 
 ## YOUR METHODOLOGY (strict ICT/SMC)
-- Order Blocks (OBs): Entry ONLY from the actual LuxAlgo-drawn OB box boundaries — never from local swing highs/lows
+- Order Blocks (OBs): Entry ONLY from LuxAlgo-drawn OB box boundaries, never from local swing highs/lows
 - -OB (bearish): Short entry zone. +OB (bullish): Long entry zone
 - MSS (Market Structure Shift): Required for directional confirmation
-- SMT Divergence: Bearish SMT at highs = short warning. Bullish SMT at lows = long warning
-- Liquidity sweeps: Sharp wick through a level = sweep. Price must react immediately
+- SMT Divergence: Bearish SMT at highs = short signal. Bullish SMT at lows = long signal
 - Volume delta: Negative delta at -OB = bearish confluence. Positive delta at +OB = bullish confluence
-- Kill zones: London (4:33-6:30 PM AEDT) and NY (11 PM-1 AM AEDT) = high credibility. Outside = lower credibility, downweight signals
+- Kill zones: London (4:33-6:30 PM AEDT) and NY (11 PM-1 AM AEDT) = highest credibility
 
 ## 5-POINT ENTRY CHECKLIST (strict, no rounding up)
 1. Sharp liquidity sweep through a marked level
 2. Hard volume delta flip at the sweep moment
-3. Clear MSS marker on chart
+3. Clear MSS marker confirmed
 4. BTC confirming same move simultaneously
 5. Retest of broken level holding before entry
 
-## TIERED SCORING BASED ON SESSION
+## SCORING + LEVERAGE
+- 5/5 HIGH confidence -> 10x leverage
+- 4/5 HIGH confidence -> 7x leverage
+- 3.5/5 MEDIUM confidence -> 5x leverage
+- Below 3.5 -> NO TRADE always
 
-KILL ZONE ACTIVE (London 4:33-6:30 PM AEDT | NY 11 PM-1 AM AEDT):
-- 5/5 → Full size ($50 risk), full plan
-- 4/5 → Full size ($50 risk), full plan  
-- 3.5/5 → Half size ($25 risk), half plan
-- Below 3.5 → NO TRADE
+## KILL ZONE RULES
+- Kill zone active: trade if score >= 3.5/5
+- Outside kill zone: trade only if score >= 4/5, always add fakeout warning
 
-OUTSIDE KILL ZONE:
-- 5/5 → Reduced size ($35 risk), full plan, note fakeout risk
-- 4/5 → Half size ($25 risk), plan with caution note
-- 3.5/5 → NO TRADE (insufficient edge without kill zone)
-- Below 3.5 → NO TRADE always
+## CRITICAL RULES
+- If BTC trend opposes signal direction -> flag HIGH RISK, cap confidence at MEDIUM
+- SL must be minimum 1.5x OB box height beyond OB boundary
+- Entry zone = actual drawn OB box range only
+- Price must have confirmed rejection candle CLOSE inside OB (not just touch)
+- If OB zones = $0 -> points 1 and 5 score 0/1 automatically
+- If BTC data missing -> point 4 = 0/1, max score capped at 4/5
 
-CRITICAL SCORING RULES:
-- If BTC data missing (btcPrice = 0) → point 4 = 0/1, max score capped at 4/5
-- If score 3.5/5 AND BTC missing → NO TRADE regardless of session
-- If drawdown buffer < $400 → minimum 4/5 required in kill zone, 5/5 required outside
-- Signal "OB_SHORT_REJECTION_CONFIRMED" = bearish candle closed inside OB → point 5 = 1/1
-- Signal "price_entering_OB_zone" = touch only → point 5 = 0/1
-- SL minimum 1.5× OB box height above -OB top
-- Outside kill zone: always add warning "FAKEOUT RISK — lower volume session"
+## VALIDATED LESSONS (never violate)
+- OB mitigated when price closes beyond OB top/bottom -> becomes breaker block, different behavior
+- Negative delta during strong multi-TF rally = absorption, not distribution
+- SMT divergence at fresh highs after impulse = early reversal warning
+- 4H RSI > 55 + negative delta = absorption pattern, dont lean short on delta alone
+- Always check intraday range for gap windows, not just start vs end price
 
-## PROVEX RULES
-- Max risk per trade: $50 (half size = $25)
-- Max leverage: 5x
-- TP target per trade: $70-110 profit. Partial close if running past $110-120. Hard ceiling ~$150
-- Consistency rule: no single trade can exceed 40% of total profit
-- Daily loss limit: $500 (closed PnL only)
-- Hard stop orders on exchange immediately — no mental stops
+## OUTPUT FORMAT - ALWAYS USE EXACTLY THIS
 
-## VALIDATED LESSONS (never violate these)
-1. -OB rejection + sustained negative delta = bearish continuation
-2. Sharp drop + delta flipping positive = absorption, possible exhaustion — don't read delta only at sweep point
-3. SMT divergence at fresh highs after impulsive move = early reversal warning — flag explicitly
-4. Higher timeframe trend dominates counter-trend bounce calls
-5. SUI lags BTC directionally but not reliably — always check own structure
-6. Directional bias confirmed over gap ≠ tradeable path — check intraday high/low
-7. Delta pause mid-downtrend ≠ seller exhaustion if price still making lower lows
-8. Negative delta during strong multi-TF rally = absorption, can flip bullish before delta confirms
-9. ALWAYS anchor entry to the actual drawn OB box boundaries, never to local swing highs
-9b. SL placement: minimum 1.5× OB box height above -OB top for shorts, below +OB bottom for longs. Never place SL just $1-2 above/below the OB — wicks through OBs before rejecting are common during kill zones
-10. Before any short retest entry: (a) confirm actual -OB box level, (b) check for unmitigated +OB below acting as magnet, (c) check if 4H delta negative + RSI >55 = absorption not distribution
-11. OB identification: -OB = highest-high candle between swing pivot and MSS close. Mitigated when price closes above ob.top → becomes breaker block
-12. Don't anchor retest zones to swing highs. Always use the drawn LuxAlgo box. Confirmed Jul 7-8 2026 ETH
+If VALID TRADE:
 
-## OUTPUT FORMAT (always follow exactly)
-Respond in this exact structure, no deviations:
+signal_start
+SYMBOL: [symbol]
+BIAS: [Long/Short]
+CONFIDENCE: [HIGH/MEDIUM] ([score]/5)
+ENTRY_ZONE: $[low]-$[high]
+STOP_LOSS: $[exact]
+TP1: $[level]
+TP2: $[level]
+TP3: $[level]
+LEVERAGE: [X]x
+KILL_ZONE: [Active/Inactive]
+REASONING: [1-2 sentences, specific levels]
+INVALIDATION: $[price] + [condition]
+signal_end
 
-CHECKLIST SCORE: X/5
-DIRECTION: [LONG/SHORT/NO TRADE]
-CONFIDENCE: [HIGH/MEDIUM/LOW]
-BIAS REASONING: [2-3 sentences max, specific]
-
-ENTRY: $X
-SL: $X  
-TP1: $X (60% close)
-TP2: $X (40% runner, SL→BE after TP1)
-LEVERAGE: Xx (calculated from confidence + session)
-POSITION SIZE: X ETH/BTC/SUI
-MARGIN REQUIRED: $X
-LIQUIDATION PRICE: $X
-MAX RISK: $X
-
-PROFIT IF TP1: +$X
-PROFIT IF FULL: +$X
-LOSS IF SL: -$X
-
-LEVERAGE REASONING: [why this leverage — e.g. "5/5 kill zone = 10x", "4/5 outside KZ = 5x"]
-INVALIDATION: [specific price + condition that kills this trade]
-KILL ZONE: [Active/Inactive — if inactive, note fakeout risk]
-
-If NO TRADE: explain exactly what condition would trigger an entry instead (Watch Plan).
-
-LEVERAGE RULES TO APPLY:
-Kill zone 5/5 → 10x | Kill zone 4/5 → 7x | Kill zone 3.5/5 → 5x
-Outside KZ 5/5 → 7x | Outside KZ 4/5 → 5x | Outside KZ 3.5/5 → NO TRADE
-Max risk always $50 ProveX regardless of leverage — only position size changes`;
+If NO TRADE:
+NO TRADE - [one sentence why]. Watch for: [specific trigger condition]`;
 
 // ============================================================
 // Call Claude API to generate trade plan
@@ -324,22 +291,47 @@ const server = http.createServer(async (req, res) => {
           return;
         }
 
-        // Generate trade plan FIRST — don't waste credits on no-trade
+        // Call Claude API FIRST — only send anything to Telegram if valid trade
         const tradePlan = await generateTradePlan(payload);
 
-        // NO TRADE — skip Telegram entirely, save credits
-        if (tradePlan.includes("NO TRADE") || tradePlan.includes("DIRECTION: NO TRADE")) {
-          console.log("No trade — skipping Telegram ⏭️", new Date().toISOString(), "| condition:", payload.condition);
+        // NO TRADE — complete silence, zero Telegram messages
+        if (tradePlan.includes("NO TRADE") || tradePlan.includes("DIRECTION: NO TRADE") || tradePlan.includes("CHECKLIST SCORE: 2") || tradePlan.includes("CHECKLIST SCORE: 1") || tradePlan.includes("CHECKLIST SCORE: 0")) {
+          console.log("No trade — complete silence ⏭️", new Date().toISOString(), "| condition:", payload.condition);
           return;
         }
 
-        // Valid trade plan — send alert header + plan to Telegram
+        // VALID TRADE — now send header + plan
         const header = formatAlertHeader(payload);
         await sendTelegram(header);
 
-        const planMsg = `📋 <b>TRADE PLAN — ${payload.symbol || "ETH"}</b>
+        // Parse the structured signal format
+        let planMsg;
+        if (tradePlan.includes("signal_start") && tradePlan.includes("signal_end")) {
+          const signalContent = tradePlan.split("signal_start")[1].split("signal_end")[0].trim();
+          const lines = {};
+          signalContent.split("\n").forEach(line => {
+            const [key, ...val] = line.split(":");
+            if (key && val.length) lines[key.trim()] = val.join(":").trim();
+          });
+          planMsg = `📊 <b>TRADE SETUP — ${lines.SYMBOL || payload.symbol || "ETH"}</b>
 ─────────────────
-<pre>${tradePlan}</pre>`;
+<b>Bias:</b>         ${lines.BIAS || "—"}
+<b>Confidence:</b>  ${lines.CONFIDENCE || "—"}
+
+<b>Entry Zone:</b>  ${lines.ENTRY_ZONE || "—"}
+<b>Stop Loss:</b>   ${lines.STOP_LOSS || "—"}
+<b>TP1:</b>         ${lines.TP1 || "—"}
+<b>TP2:</b>         ${lines.TP2 || "—"}
+<b>TP3:</b>         ${lines.TP3 || "—"}
+
+<b>Leverage:</b>    ${lines.LEVERAGE || "—"}
+<b>Kill Zone:</b>   ${lines.KILL_ZONE || "—"}
+
+<b>Reasoning:</b>   ${lines.REASONING || "—"}
+<b>Invalidation:</b> ${lines.INVALIDATION || "—"}`;
+        } else {
+          planMsg = `📊 <b>TRADE SETUP — ${payload.symbol || "ETH"}</b>\n─────────────────\n<pre>${tradePlan}</pre>`;
+        }
         await sendTelegram(planMsg);
 
         console.log("Alert + plan sent ✅", new Date().toISOString(), "| condition:", payload.condition);
@@ -354,4 +346,4 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(404); res.end("Not found");
 });
 
-server.listen(PORT, () => console.log(`Server v4 running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Server v5 running on port ${PORT}`));
