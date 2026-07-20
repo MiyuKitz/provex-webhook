@@ -7,53 +7,11 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const PORT = process.env.PORT || 3000;
 
 // ============================================================
-// PROVEX ACCOUNT CONFIG
-// ============================================================
-const PROVEX = {
-  totalCapital:    10000,
-  currentPnl:      -605.86,  // updated Jul 11 2026 — switch to 15M
-  maxRiskPerTrade: 50,
-  maxLeverage:     10,       // ProveX max
-  dailyLossLimit:  500,
-  drawdownLimit:   1000,
-};
-
-// Dynamic leverage based on confidence + session
-function getLeverage(score, inKillZone, exchange) {
-  if (exchange === "provex") {
-    if (inKillZone) {
-      if (score >= 5)   return 10;  // 5/5 KZ → max leverage
-      if (score >= 4)   return 7;   // 4/5 KZ → high leverage
-      if (score >= 3.5) return 5;   // 3.5/5 KZ → standard
-    } else {
-      if (score >= 5)   return 7;   // 5/5 outside → slightly reduced
-      if (score >= 4)   return 5;   // 4/5 outside → standard
-      return 0;                     // below 4/5 outside → no trade
-    }
-  }
-  return 5; // default fallback
-}
-
-// Calculate position size based on risk, leverage, price, stop distance
-function calcPosition(riskAmount, entryPrice, slPrice, leverage) {
-  const stopDistance = Math.abs(entryPrice - slPrice);
-  if (stopDistance === 0) return { size: 0, margin: 0, liqPrice: 0 };
-  const positionSize = (riskAmount / stopDistance);
-  const notional     = positionSize * entryPrice;
-  const margin       = notional / leverage;
-  const liqPrice     = entryPrice * (1 + (1 / leverage)); // short liq (above entry)
-  return {
-    size:     positionSize.toFixed(3),
-    margin:   margin.toFixed(2),
-    liqPrice: liqPrice.toFixed(2),
-    notional: notional.toFixed(2),
-  };
-}
-
-// ============================================================
 // SYSTEM PROMPT — Krysie's full trading brain
+// (platform-agnostic — no account balance / sizing / drawdown data.
+//  Output is a pure technical signal usable on any exchange.)
 // ============================================================
-const SYSTEM_PROMPT = `You are a professional crypto futures trade signal generator using ICT/SMC methodology. You receive structured alert data from TradingView and output clean, universal trade signals usable on ANY platform (BingX, MEXC, Binance, etc).
+const SYSTEM_PROMPT = `You are a professional crypto futures trade signal generator using ICT/SMC methodology. You receive structured alert data from TradingView and output clean, universal trade signals usable on ANY crypto futures exchange, regardless of which one the trader happens to use. You do NOT know or care what account, balance, or exchange the user trades on — your job is a pure technical read of price action.
 
 ## YOUR METHODOLOGY (strict ICT/SMC)
 - Order Blocks (OBs): Entry ONLY from LuxAlgo-drawn OB box boundaries, never from local swing highs/lows
@@ -63,22 +21,42 @@ const SYSTEM_PROMPT = `You are a professional crypto futures trade signal genera
 - Volume delta: Negative delta at -OB = bearish confluence. Positive delta at +OB = bullish confluence
 - Kill zones: London (4:33-6:30 PM AEDT) and NY (11 PM-1 AM AEDT) = highest credibility
 
-## 5-POINT ENTRY CHECKLIST (strict, no rounding up)
+## 5-POINT ENTRY CHECKLIST — STRICT BINARY SCORING
+Each point scores EXACTLY 0 or 1. There is NO partial credit, NO "0.5", NO rounding up, on points 1, 2, 3, or 5 — ever, under any circumstance, regardless of how close it seems. Point 4 (BTC) is the ONLY point permitted a 0.5 value, and only for the specific neutral-trend case defined below. If you catch yourself writing "partial," "close enough," or assigning 0.5 to any point other than #4 — stop, that is a rule violation, score it 0 instead.
+
 1. Sharp liquidity sweep through a marked level
+   - PASS (1) only if the payload data shows price actually swept beyond a specific marked level (swing high/low, liquidity pool) with a wick or close beyond it.
+   - FAIL (0) if price is merely "inside" or "near" a zone without evidence of an actual sweep having occurred. Being inside the OB is the ENTRY criteria, not the sweep criteria — do not let one satisfy the other.
 2. Hard volume delta flip at the sweep moment
+   - PASS (1) only if cumulative delta shows a clear directional flip/spike aligned with the sweep, not just "delta is negative/positive" in isolation.
+   - FAIL (0) otherwise.
 3. Clear MSS marker confirmed
+   - PASS (1) only if mssDir explicitly matches the trade direction (Down for short, Up for long).
+   - FAIL (0) if mssDir is "None" or contradicts direction.
 4. BTC confirming same move simultaneously
+   - PASS (1) if btcTrend matches direction AND btcDelta confirms.
+   - 0.5 ONLY if btcTrend is explicitly "Neutral".
+   - FAIL (0) if btcTrend opposes direction, or if BTC data is missing/zero.
 5. Retest of broken level holding before entry
+   - PASS (1) only if there is a confirmed rejection candle that CLOSED back inside/beyond the level, not merely price sitting at or touching it.
+   - FAIL (0) if the alert data doesn't explicitly confirm a closed rejection candle — "price is currently at the boundary" is NOT a pass.
+
+Before writing the final score, list each of the 5 points with PASS/FAIL and ONE short phrase citing the data point that justifies it — keep this audit compact, a single line per point, not a paragraph. Then sum honestly. Do not adjust the sum to clear the confidence threshold — the threshold is a filter, not a target to hit.
+
+CRITICAL: the signal_start/signal_end block (or the NO TRADE line) is the only part of your response that actually reaches the trader — everything above it is scratch work. You MUST always reach a complete signal_start...signal_end block or a complete NO TRADE line before you run out of room. If you're generating a long audit, compress it further rather than risk leaving the final block unfinished. An incomplete signal is worse than a short audit.
 
 ## SCORING + LEVERAGE
-- 5/5 HIGH confidence -> 10x leverage
-- 4/5 HIGH confidence -> 7x leverage
-- 3.5/5 MEDIUM confidence -> 5x leverage
-- Below 3.5 -> NO TRADE always
+Leverage is a suggested range, not a fixed number — available leverage varies by exchange (most major crypto futures exchanges offer somewhere in the 10x-80x+ range), so give a flexible band scaled to confidence:
+- 5/5 HIGH confidence -> suggest 50x-80x
+- 4/5 HIGH confidence -> suggest 25x-50x
+- 3.5/5 MEDIUM confidence -> suggest 10x-25x
+- Below 3.5 -> NO TRADE always, no exceptions, regardless of how compelling the setup looks otherwise
+
+Note in REASONING if leverage above 40x is suggested: at that range, a small adverse wick can liquidate before the stop-loss even triggers — flag this explicitly so the trader sizes accordingly.
 
 ## KILL ZONE RULES
 - Kill zone active: trade if score >= 3.5/5
-- Outside kill zone: trade only if score >= 4/5, always add fakeout warning
+- Outside kill zone: trade only if score >= 4/5, always add fakeout warning in REASONING
 
 ## CRITICAL RULES
 - If BTC trend opposes signal direction -> flag HIGH RISK, cap confidence at MEDIUM
@@ -87,6 +65,7 @@ const SYSTEM_PROMPT = `You are a professional crypto futures trade signal genera
 - Price must have confirmed rejection candle CLOSE inside OB (not just touch)
 - If OB zones = $0 -> points 1 and 5 score 0/1 automatically
 - If BTC data missing -> point 4 = 0/1, max score capped at 4/5
+- If obMitigated or pobMitigated is true for the zone being traded -> that zone is dead, score 0/5 overall, NO TRADE regardless of other points
 
 ## VALIDATED LESSONS (never violate)
 - OB mitigated when price closes beyond OB top/bottom -> becomes breaker block, different behavior
@@ -103,12 +82,12 @@ signal_start
 SYMBOL: [symbol]
 BIAS: [Long/Short]
 CONFIDENCE: [HIGH/MEDIUM] ([score]/5)
+LEVERAGE: [flexible range, e.g. 5x-7x]
 ENTRY_ZONE: $[low]-$[high]
 STOP_LOSS: $[exact]
 TP1: $[level]
 TP2: $[level]
 TP3: $[level]
-LEVERAGE: [X]x
 KILL_ZONE: [Active/Inactive]
 REASONING: [1-2 sentences, specific levels]
 INVALIDATION: $[price] + [condition]
@@ -121,13 +100,10 @@ NO TRADE - [one sentence why]. Watch for: [specific trigger condition]`;
 // Call Claude API to generate trade plan
 // ============================================================
 async function generateTradePlan(payload) {
-  const accountBalance = PROVEX.totalCapital + PROVEX.currentPnl;
-  const remainingDrawdown = PROVEX.drawdownLimit + PROVEX.currentPnl;
-
   const userMessage = `New TradingView alert received. Generate a complete trade plan.
 
 ALERT DATA:
-- Symbol: ${payload.symbol || "ETHUSDT"}
+- Symbol: ${payload.symbol || "UNKNOWN"}
 - Condition: ${payload.condition || "unknown"}
 - Price: $${payload.price}
 - RSI: ${payload.rsi}
@@ -137,8 +113,8 @@ ALERT DATA:
 - Timeframe: ${payload.timeframe}
 
 STRUCTURE (from LuxAlgo toolkit — these are the ACTUAL drawn box levels):
-- Active -OB Zone: $${payload.obBottom} – $${payload.obTop}
-- Active +OB Zone: $${payload.pobBottom} – $${payload.pobTop}
+- Active -OB Zone: $${payload.obBottom} – $${payload.obTop}${payload.obMitigated ? " (MITIGATED — reference only, not live)" : ""}
+- Active +OB Zone: $${payload.pobBottom} – $${payload.pobTop}${payload.pobMitigated ? " (MITIGATED — reference only, not live)" : ""}
 - Latest SMT Tag: ${payload.smtBias}
 - Latest MSS Direction: ${payload.mssDir}
 - Last Swing High: $${payload.swingHigh || 0}
@@ -149,17 +125,11 @@ BTC LIVE CORRELATION DATA (use for checklist point 4):
 - BTC Cumulative Delta: ${payload.btcDelta || 0}
 - BTC RSI: ${payload.btcRsi || 0}
 - BTC 3-bar Trend: ${payload.btcTrend || "Unknown"}
-- BTC scoring: if btcTrend matches ETH direction AND btcDelta confirms → point 4 = 1/1. If btcTrend neutral → 0.5/1. If btcTrend opposes ETH direction → 0/1 AND flag as high risk
-
-PROVEX ACCOUNT STATUS:
-- Effective Balance: $${accountBalance.toFixed(2)}
-- Remaining Drawdown Buffer: $${remainingDrawdown.toFixed(2)}
-- Max Risk This Trade: $${PROVEX.maxRiskPerTrade}
-- Daily Loss Limit Remaining: $${PROVEX.dailyLossLimit}`;
+- BTC scoring: if btcTrend matches signal direction AND btcDelta confirms → point 4 = 1/1. If btcTrend neutral → 0.5/1. If btcTrend opposes signal direction → 0/1 AND flag as high risk`;
 
   const body = JSON.stringify({
     model: "claude-sonnet-4-6",
-    max_tokens: 1000,
+    max_tokens: 2000,
     system: SYSTEM_PROMPT,
     messages: [{ role: "user", content: userMessage }],
   });
@@ -232,7 +202,7 @@ function formatAlertHeader(payload) {
   const isLong    = condition.includes("POB_LONG")  || condition.includes("oversold")  || condition.includes("cross_above");
   const emoji     = isPriority ? "🚨" : isShort ? "🔴" : isLong ? "🟢" : "🔔";
 
-  return `${emoji} <b>PROVEX ALERT${kzTag}</b>
+  return `${emoji} <b>TRADE ALERT${kzTag}</b>
 ─────────────────
 <b>Signal:</b>   ${condition}
 <b>Symbol:</b>   ${payload.symbol || "—"}
@@ -241,8 +211,8 @@ function formatAlertHeader(payload) {
 <b>Delta:</b>    ${payload.cumDelta}
 <b>Session:</b>  ${payload.session}
 <b>TF:</b>       ${payload.timeframe}
-<b>-OB Zone:</b> $${payload.obBottom} – $${payload.obTop}
-<b>+OB Zone:</b> $${payload.pobBottom} – $${payload.pobTop}
+<b>-OB Zone:</b> $${payload.obBottom} – $${payload.obTop}${payload.obMitigated ? " (mitigated)" : ""}
+<b>+OB Zone:</b> $${payload.pobBottom} – $${payload.pobTop}${payload.pobMitigated ? " (mitigated)" : ""}
 <b>SMT:</b>      ${payload.smtBias}  |  <b>MSS:</b> ${payload.mssDir}
 ─────────────────
 ⏳ <i>Generating trade plan...</i>
@@ -250,11 +220,26 @@ function formatAlertHeader(payload) {
 }
 
 // ============================================================
+// Format the final, platform-agnostic trade setup message
+// ============================================================
+function formatTradeSetup(lines, payload) {
+  return `📊 Trade Setup:
+- Symbol: ${payload.symbol || "—"}
+- Bias: ${lines.BIAS || "—"}
+- Ideal leverage (be flexible): ${lines.LEVERAGE || "—"}
+- Entry Zone: ${lines.ENTRY_ZONE || "—"}
+- Stop Loss: ${lines.STOP_LOSS || "—"}
+- Take Profit 1: ${lines.TP1 || "—"}
+- Take Profit 2: ${lines.TP2 || "—"}
+- Take Profit 3: ${lines.TP3 || "—"}`;
+}
+
+// ============================================================
 // HTTP Server
 // ============================================================
 const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/") {
-    res.writeHead(200); res.end("Provex alert server v4 — Claude-powered ✅"); return;
+    res.writeHead(200); res.end("Trade alert server v6 — Claude-powered, platform-agnostic ✅"); return;
   }
 
   if (req.method === "POST" && req.url === "/webhook") {
@@ -306,31 +291,37 @@ const server = http.createServer(async (req, res) => {
 
         // Parse the structured signal format
         let planMsg;
-        if (tradePlan.includes("signal_start") && tradePlan.includes("signal_end")) {
+        const hasStart = tradePlan.includes("signal_start");
+        const hasEnd   = tradePlan.includes("signal_end");
+
+        if (hasStart && hasEnd) {
+          // Clean, complete signal — normal path
           const signalContent = tradePlan.split("signal_start")[1].split("signal_end")[0].trim();
           const lines = {};
           signalContent.split("\n").forEach(line => {
             const [key, ...val] = line.split(":");
             if (key && val.length) lines[key.trim()] = val.join(":").trim();
           });
-          planMsg = `📊 <b>TRADE SETUP — ${lines.SYMBOL || payload.symbol || "ETH"}</b>
-─────────────────
-<b>Bias:</b>         ${lines.BIAS || "—"}
-<b>Confidence:</b>  ${lines.CONFIDENCE || "—"}
-
-<b>Entry Zone:</b>  ${lines.ENTRY_ZONE || "—"}
-<b>Stop Loss:</b>   ${lines.STOP_LOSS || "—"}
-<b>TP1:</b>         ${lines.TP1 || "—"}
-<b>TP2:</b>         ${lines.TP2 || "—"}
-<b>TP3:</b>         ${lines.TP3 || "—"}
-
-<b>Leverage:</b>    ${lines.LEVERAGE || "—"}
-<b>Kill Zone:</b>   ${lines.KILL_ZONE || "—"}
-
-<b>Reasoning:</b>   ${lines.REASONING || "—"}
-<b>Invalidation:</b> ${lines.INVALIDATION || "—"}`;
+          planMsg = formatTradeSetup(lines, payload);
+        } else if (hasStart && !hasEnd) {
+          // Truncated mid-generation (hit max_tokens before finishing).
+          // Salvage what's there, but NEVER present it as a clean plan without
+          // a loud warning — an incomplete SL/entry is worse than no signal.
+          const signalContent = tradePlan.split("signal_start")[1].trim();
+          const lines = {};
+          signalContent.split("\n").forEach(line => {
+            const [key, ...val] = line.split(":");
+            if (key && val.length) lines[key.trim()] = val.join(":").trim();
+          });
+          const missingCritical = !lines.BIAS || !lines.ENTRY_ZONE || !lines.STOP_LOSS;
+          if (missingCritical) {
+            planMsg = `⚠️ <b>Signal generation was cut off before completing</b> — critical levels (entry/SL) never finished generating. This is NOT a valid trade plan — do not act on it.`;
+          } else {
+            planMsg = formatTradeSetup(lines, payload) + `\n\n⚠️ <i>Response was truncated — TP levels or leverage may be missing above. Verify manually before entry.</i>`;
+          }
         } else {
-          planMsg = `📊 <b>TRADE SETUP — ${payload.symbol || "ETH"}</b>\n─────────────────\n<pre>${tradePlan}</pre>`;
+          // No structured block at all — malformed response, show raw for debugging
+          planMsg = `📊 <b>TRADE SETUP — ${payload.symbol || "—"}</b>\n─────────────────\n<pre>${tradePlan}</pre>`;
         }
         await sendTelegram(planMsg);
 
@@ -346,4 +337,4 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(404); res.end("Not found");
 });
 
-server.listen(PORT, () => console.log(`Server v5 running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Server v6 running on port ${PORT}`));
