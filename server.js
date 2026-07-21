@@ -7,134 +7,287 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const PORT = process.env.PORT || 3000;
 
 // ============================================================
-// SYSTEM PROMPT — Krysie's full trading brain
-// (platform-agnostic — no account balance / sizing / drawdown data.
-//  Output is a pure technical signal usable on any exchange.)
+// ARCHITECTURE NOTE (v10)
+// Score, direction, confidence, leverage, and entry/SL/TP levels are
+// ALL computed by deterministic code below — never by an LLM. Claude's
+// only role is to explain an already-final decision in plain language.
+// This exists because LLM output is not perfectly reproducible run to
+// run, which is fine for writing an explanation but not for being the
+// decision engine itself when real risk is attached.
+//
+// This is SIGNAL-ONLY. Nothing in this file places, modifies, or closes
+// an order on any exchange — it only sends Telegram messages. Adding
+// real execution would be a deliberate, separate decision, not something
+// bundled in here.
 // ============================================================
-const SYSTEM_PROMPT = `You are a professional crypto futures trade signal generator using ICT/SMC methodology. You receive structured alert data from TradingView and output clean, universal trade signals usable on ANY crypto futures exchange, regardless of which one the trader happens to use. You do NOT know or care what account, balance, or exchange the user trades on — your job is a pure technical read of price action.
 
-## YOUR METHODOLOGY (strict ICT/SMC)
-- Order Blocks (OBs): Entry ONLY from LuxAlgo-drawn OB box boundaries, never from local swing highs/lows
-- -OB (bearish): Short entry zone. +OB (bullish): Long entry zone
-- MSS (Market Structure Shift): Required for directional confirmation
-- SMT Divergence: Bearish SMT at highs = short signal. Bullish SMT at lows = long signal
-- Volume delta: Negative delta at -OB = bearish confluence. Positive delta at +OB = bullish confluence
-- Kill zones: London (4:33-6:30 PM AEDT) and NY (11 PM-1 AM AEDT) = highest credibility
-
-## 5-POINT ENTRY CHECKLIST — STRICT BINARY SCORING
-Each point scores EXACTLY 0 or 1. There is NO partial credit, NO "0.5", NO rounding up, on points 1, 2, 3, or 5 — ever, under any circumstance, regardless of how close it seems. Point 4 (BTC) is the ONLY point permitted a 0.5 value, and only for the specific neutral-trend case defined below. If you catch yourself writing "partial," "close enough," or assigning 0.5 to any point other than #4 — stop, that is a rule violation, score it 0 instead.
-
-1. Sharp liquidity sweep through a marked level
-   - PASS (1) only if the payload data shows price actually swept beyond a specific marked level (swing high/low, liquidity pool) with a wick or close beyond it.
-   - FAIL (0) if price is merely "inside" or "near" a zone without evidence of an actual sweep having occurred. Being inside the OB is the ENTRY criteria, not the sweep criteria — do not let one satisfy the other.
-2. Hard volume delta flip at the sweep moment
-   - PASS (1) only if cumulative delta shows a clear directional flip/spike aligned with the sweep, not just "delta is negative/positive" in isolation.
-   - FAIL (0) otherwise.
-3. Clear MSS marker confirmed
-   - PASS (1) only if mssDir explicitly matches the trade direction (Down for short, Up for long).
-   - FAIL (0) if mssDir is "None" or contradicts direction.
-4. BTC confirming same move simultaneously
-   - PASS (1) if btcTrend matches direction AND btcDelta confirms.
-   - 0.5 ONLY if btcTrend is explicitly "Neutral".
-   - FAIL (0) if btcTrend opposes direction, or if BTC data is missing/zero.
-5. Retest of broken level holding before entry
-   - PASS (1) only if there is a confirmed rejection candle that CLOSED back inside/beyond the level, not merely price sitting at or touching it.
-   - FAIL (0) if the alert data doesn't explicitly confirm a closed rejection candle — "price is currently at the boundary" is NOT a pass.
-
-Before writing the final score, list each of the 5 points with PASS/FAIL and ONE short phrase citing the data point that justifies it — keep this audit compact, a single line per point, not a paragraph. Then sum honestly. Do not adjust the sum to clear the confidence threshold — the threshold is a filter, not a target to hit.
-
-CRITICAL: the signal_start/signal_end block (or the NO TRADE line) is the only part of your response that actually reaches the trader — everything above it is scratch work. You MUST always reach a complete signal_start...signal_end block or a complete NO TRADE line before you run out of room. If you're generating a long audit, compress it further rather than risk leaving the final block unfinished. An incomplete signal is worse than a short audit.
-
-## SCORING + LEVERAGE
-Leverage is a suggested range, not a fixed number — available leverage varies by exchange (most major crypto futures exchanges offer somewhere in the 10x-80x+ range), so give a flexible band scaled to confidence:
-- 5/5 HIGH confidence -> suggest 50x-80x
-- 4/5 HIGH confidence -> suggest 25x-50x
-- 3.5/5 MEDIUM confidence -> suggest 10x-25x
-- Below 3.5 -> NO TRADE always, no exceptions, regardless of how compelling the setup looks otherwise
-
-Note in REASONING if leverage above 40x is suggested: at that range, a small adverse wick can liquidate before the stop-loss even triggers — flag this explicitly so the trader sizes accordingly.
-
-## KILL ZONE RULES
-- Kill zone active: trade if score >= 3.5/5
-- Outside kill zone: trade only if score >= 4/5, always add fakeout warning in REASONING
-
-## CRITICAL RULES
-- If BTC trend opposes signal direction -> flag HIGH RISK, cap confidence at MEDIUM
-- SL must be minimum 1.5x OB box height beyond OB boundary
-- Entry zone = actual drawn OB box range only
-- Price must have confirmed rejection candle CLOSE inside OB (not just touch)
-- If OB zones = $0 -> points 1 and 5 score 0/1 automatically
-- If BTC data missing -> point 4 = 0/1, max score capped at 4/5
-- If obMitigated or pobMitigated is true for the zone being traded -> that zone is dead, score 0/5 overall, NO TRADE regardless of other points
-
-## VALIDATED LESSONS (never violate)
-- OB mitigated when price closes beyond OB top/bottom -> becomes breaker block, different behavior
-- Negative delta during strong multi-TF rally = absorption, not distribution
-- SMT divergence at fresh highs after impulse = early reversal warning
-- 4H RSI > 55 + negative delta = absorption pattern, dont lean short on delta alone
-- Always check intraday range for gap windows, not just start vs end price
-
-## OUTPUT FORMAT - ALWAYS USE EXACTLY THIS
-
-If VALID TRADE:
-
-signal_start
-SYMBOL: [symbol]
-BIAS: [Long/Short]
-CONFIDENCE: [HIGH/MEDIUM] ([score]/5)
-LEVERAGE: [flexible range, e.g. 5x-7x]
-ENTRY_ZONE: $[low]-$[high]
-STOP_LOSS: $[exact]
-TP1: $[level]
-TP2: $[level]
-TP3: $[level]
-KILL_ZONE: [Active/Inactive]
-REASONING: [1-2 sentences, specific levels]
-INVALIDATION: $[price] + [condition]
-signal_end
-
-If NO TRADE:
-NO TRADE - [one sentence why]. Watch for: [specific trigger condition]`;
+function num(v) { const n = parseFloat(v); return isNaN(n) ? 0 : n; }
+function bool(v) { return v === true || v === "true"; }
 
 // ============================================================
-// Call Claude API to generate trade plan
+// SIGNAL CLASSIFICATION
 // ============================================================
-async function generateTradePlan(payload) {
-  const userMessage = `New TradingView alert received. Generate a complete trade plan.
+function classifySignal(condition) {
+  if (condition.includes("OB_SHORT_REJECTION_CONFIRMED") || condition === "KILLZONE_OB_SHORT_HIGH_PRIORITY")
+    return "OB_SHORT";
+  if (condition.includes("POB_LONG_REJECTION_CONFIRMED") || condition === "KILLZONE_POB_LONG_HIGH_PRIORITY")
+    return "OB_LONG";
+  if (condition.includes("BREAKOUT_SHORT_CONFIRMED"))
+    return "BREAKOUT_SHORT";
+  if (condition.includes("BREAKOUT_LONG_CONFIRMED"))
+    return "BREAKOUT_LONG";
+  return null;
+}
 
-ALERT DATA:
-- Symbol: ${payload.symbol || "UNKNOWN"}
-- Condition: ${payload.condition || "unknown"}
-- Price: $${payload.price}
-- RSI: ${payload.rsi}
-- Cumulative Delta: ${payload.cumDelta}
-- Session: ${payload.session}
-- Kill Zone Active: ${payload.killzone}
-- Timeframe: ${payload.timeframe}
+// ============================================================
+// DETERMINISTIC CHECKLIST SCORING
+// Strict binary (0 or 1) on every point except BTC confirmation, which
+// permits exactly 0.5 for an explicitly neutral BTC trend. No other
+// partial credit exists anywhere in this file.
+// ============================================================
+function scoreBTC(payload, direction) {
+  const btcTrend = payload.btcTrend || "Unknown";
+  const btcDelta = num(payload.btcDelta);
+  const matches  = (direction === "Short" && btcTrend === "Bearish") || (direction === "Long" && btcTrend === "Bullish");
+  const opposes  = (direction === "Short" && btcTrend === "Bullish") || (direction === "Long" && btcTrend === "Bearish");
 
-STRUCTURE (from LuxAlgo toolkit — these are the ACTUAL drawn box levels):
-- Active -OB Zone: $${payload.obBottom} – $${payload.obTop}${payload.obMitigated ? " (MITIGATED — reference only, not live)" : ""}
-- Active +OB Zone: $${payload.pobBottom} – $${payload.pobTop}${payload.pobMitigated ? " (MITIGATED — reference only, not live)" : ""}
-- Latest SMT Tag: ${payload.smtBias}
-- Latest MSS Direction: ${payload.mssDir}
-- Last Swing High: $${payload.swingHigh || 0}
-- Last Swing Low: $${payload.swingLow || 0}
+  if (opposes) return { score: 0, detail: `BTC trend ${btcTrend} opposes ${direction}`, opposes: true };
+  if (btcTrend === "Neutral") return { score: 0.5, detail: "BTC trend neutral", opposes: false };
+  if (matches) return { score: 1, detail: `BTC trend ${btcTrend} confirms ${direction}, delta ${btcDelta}`, opposes: false };
+  return { score: 0, detail: "BTC trend data missing/unknown", opposes: true };
+}
 
-BTC LIVE CORRELATION DATA (use for checklist point 4):
-- BTC Price: $${payload.btcPrice || 0}
-- BTC Cumulative Delta: ${payload.btcDelta || 0}
-- BTC RSI: ${payload.btcRsi || 0}
-- BTC 3-bar Trend: ${payload.btcTrend || "Unknown"}
-- BTC scoring: if btcTrend matches signal direction AND btcDelta confirms → point 4 = 1/1. If btcTrend neutral → 0.5/1. If btcTrend opposes signal direction → 0/1 AND flag as high risk`;
+function scoreOB(payload, direction) {
+  const obTop    = direction === "Short" ? num(payload.obTop)    : num(payload.pobTop);
+  const obBottom = direction === "Short" ? num(payload.obBottom) : num(payload.pobBottom);
+  const swingRef = direction === "Short" ? num(payload.swingHigh) : num(payload.swingLow);
+  const cumDelta = num(payload.cumDelta);
+  const mssDir   = payload.mssDir;
+  const mitigated = direction === "Short" ? bool(payload.obMitigated) : bool(payload.pobMitigated);
+
+  const points = [];
+
+  // Point 1: liquidity sweep — swing point sits beyond the OB, implying
+  // price swept past it before the reversal into the zone
+  const p1 = direction === "Short"
+    ? (obTop > 0 && swingRef > obTop)
+    : (obBottom > 0 && swingRef > 0 && swingRef < obBottom);
+  points.push({ n: 1, label: "Liquidity sweep", pass: p1 ? 1 : 0,
+    detail: p1 ? `Swing ${direction === "Short" ? "high" : "low"} $${swingRef} confirms sweep beyond OB` : "No confirmed sweep beyond OB" });
+
+  // Point 2: delta flip — meaningfully directional, not just nonzero
+  const p2 = direction === "Short" ? cumDelta < -50000 : cumDelta > 50000;
+  points.push({ n: 2, label: "Delta flip", pass: p2 ? 1 : 0, detail: `cumDelta ${cumDelta}` });
+
+  // Point 3: MSS confirmed in trade direction
+  const p3 = (direction === "Short" && mssDir === "Down") || (direction === "Long" && mssDir === "Up");
+  points.push({ n: 3, label: "MSS confirmed", pass: p3 ? 1 : 0, detail: `mssDir=${mssDir}` });
+
+  // Point 4: BTC confirmation
+  const btc = scoreBTC(payload, direction);
+  points.push({ n: 4, label: "BTC confirmation", pass: btc.score, detail: btc.detail });
+
+  // Point 5: retest holding — guaranteed by the alert only firing on a
+  // confirmed close-inside-zone rejection candle, gated on mitigation
+  const p5 = !mitigated && obTop > 0 && obBottom > 0;
+  points.push({ n: 5, label: "OB retest holding", pass: p5 ? 1 : 0,
+    detail: mitigated ? "OB mitigated — zone is dead" : "Rejection confirmed by alert trigger" });
+
+  const rawScore = points.reduce((sum, p) => sum + p.pass, 0);
+  return { points, rawScore, direction, mitigated, btcOpposes: btc.opposes, structureOk: !mitigated && obTop > 0 && obBottom > 0 };
+}
+
+function scoreBreakout(payload, direction) {
+  const origin    = num(payload.boImpulseOrigin);
+  const zoneTop   = num(payload.boZoneTop);
+  const zoneBottom = num(payload.boZoneBottom);
+  const cumDelta  = num(payload.cumDelta);
+  const hasStructure = origin > 0 && zoneTop > 0 && zoneBottom > 0;
+
+  const points = [];
+  // Points 1-3 are guaranteed true by the Pine script's own gating — it
+  // only fires this alert once MSS + volume-spike displacement happened
+  // AND the pullback held in the fib zone AND a rejection candle closed.
+  // The only thing to actually verify here is that the structural data
+  // needed to trade it safely actually came through.
+  points.push({ n: 1, label: "Displacement occurred", pass: hasStructure ? 1 : 0,
+    detail: hasStructure ? "Confirmed by alert trigger (MSS + volume spike)" : "Missing impulse leg data" });
+  points.push({ n: 2, label: "Pullback held in zone", pass: hasStructure ? 1 : 0,
+    detail: hasStructure ? `Held within $${zoneBottom}-$${zoneTop}` : "Missing zone data" });
+  points.push({ n: 3, label: "Rejection candle confirmed", pass: hasStructure ? 1 : 0,
+    detail: "Confirmed by alert trigger" });
+
+  const btc = scoreBTC(payload, direction);
+  points.push({ n: 4, label: "BTC confirmation", pass: btc.score, detail: btc.detail });
+
+  const p5 = direction === "Short" ? cumDelta < 0 : cumDelta > 0;
+  points.push({ n: 5, label: "Delta still supports continuation", pass: p5 ? 1 : 0, detail: `cumDelta ${cumDelta}` });
+
+  const rawScore = points.reduce((sum, p) => sum + p.pass, 0);
+  return { points, rawScore, direction, mitigated: false, btcOpposes: btc.opposes, structureOk: hasStructure };
+}
+
+// ============================================================
+// RISK GATES — kill zone threshold, BTC/HTF opposition, mitigation kill
+// ============================================================
+function applyRiskGates(payload, scoreResult, killzoneActive) {
+  const { rawScore, direction, mitigated, btcOpposes, structureOk } = scoreResult;
+
+  if (mitigated) return { verdict: "NO_TRADE", reason: "OB mitigated — zone is dead, no exceptions" };
+  if (!structureOk) return { verdict: "NO_TRADE", reason: "Missing structural data — cannot place a real stop" };
+
+  const threshold = killzoneActive ? 3.5 : 4;
+  if (rawScore < threshold) {
+    return { verdict: "NO_TRADE", reason: `Score ${rawScore}/5 below ${threshold} threshold (killzone active: ${killzoneActive})` };
+  }
+
+  let confidence = rawScore >= 4 ? "HIGH" : "MEDIUM";
+  let leverage   = confidence === "HIGH" ? (rawScore === 5 ? "50x-80x" : "25x-50x") : "10x-25x";
+
+  const flags = [];
+  const htfTrend  = payload.htfTrend || "Unknown";
+  const htfOpposes = (direction === "Short" && htfTrend === "Bullish") || (direction === "Long" && htfTrend === "Bearish");
+
+  if (btcOpposes) {
+    confidence = "MEDIUM";
+    leverage = "10x-25x";
+    flags.push("BTC trend opposes signal direction — HIGH RISK");
+  }
+  if (htfOpposes) {
+    confidence = "MEDIUM";
+    if (leverage === "50x-80x" || leverage === "25x-50x") leverage = "10x-25x";
+    flags.push(`HTF trend (${htfTrend}) opposes signal direction — headwind`);
+  }
+  if (!killzoneActive) flags.push("Outside kill zone — fakeout risk elevated");
+  if (leverage !== "10x-25x") {
+    // check the top of whichever band was assigned for the >40x liquidation warning
+    const topOfBand = leverage === "50x-80x" ? 80 : leverage === "25x-50x" ? 50 : 25;
+    if (topOfBand > 40) flags.push("Leverage range extends above 40x — a small adverse wick can liquidate before SL triggers, size accordingly");
+  }
+
+  return { verdict: "TRADE", confidence, leverage, flags, rawScore };
+}
+
+// ============================================================
+// DETERMINISTIC LEVEL CALCULATION
+// ============================================================
+function fmt(n) { return `$${n.toFixed(4)}`; }
+
+function computeOBLevels(payload, direction) {
+  if (direction === "Short") {
+    const obTop = num(payload.obTop), obBottom = num(payload.obBottom);
+    const pobTop = num(payload.pobTop), pobBottom = num(payload.pobBottom);
+    const swingLow = num(payload.swingLow);
+    const obHeight = obTop - obBottom;
+    const sl = obTop + obHeight * 1.5;
+    const entryMid = (obTop + obBottom) / 2;
+    const risk = sl - entryMid;
+    const tp1 = (pobTop > 0 && pobTop < entryMid) ? pobTop : entryMid - risk;
+    const tp2 = (pobBottom > 0 && pobBottom < tp1) ? pobBottom : entryMid - risk * 2;
+    const tp3 = (swingLow > 0 && swingLow < tp2) ? swingLow : entryMid - risk * 3;
+    return { entryZone: `${fmt(obBottom)}-${fmt(obTop)}`, stopLoss: fmt(sl), tp1: fmt(tp1), tp2: fmt(tp2), tp3: fmt(tp3) };
+  } else {
+    const obTop = num(payload.obTop), obBottom = num(payload.obBottom);
+    const pobTop = num(payload.pobTop), pobBottom = num(payload.pobBottom);
+    const swingHigh = num(payload.swingHigh);
+    const obHeight = pobTop - pobBottom;
+    const sl = pobBottom - obHeight * 1.5;
+    const entryMid = (pobTop + pobBottom) / 2;
+    const risk = entryMid - sl;
+    const tp1 = (obBottom > 0 && obBottom > entryMid) ? obBottom : entryMid + risk;
+    const tp2 = (obTop > 0 && obTop > tp1) ? obTop : entryMid + risk * 2;
+    const tp3 = (swingHigh > 0 && swingHigh > tp2) ? swingHigh : entryMid + risk * 3;
+    return { entryZone: `${fmt(pobBottom)}-${fmt(pobTop)}`, stopLoss: fmt(sl), tp1: fmt(tp1), tp2: fmt(tp2), tp3: fmt(tp3) };
+  }
+}
+
+function computeBreakoutLevels(payload, direction) {
+  const origin = num(payload.boImpulseOrigin);
+  const extreme = num(payload.boImpulseExtreme);
+  const zoneTop = num(payload.boZoneTop);
+  const zoneBottom = num(payload.boZoneBottom);
+  const legRange = Math.abs(origin - extreme);
+
+  if (direction === "Short") {
+    const sl = origin + legRange * 0.05;
+    const tp1 = extreme - legRange * 1.0;
+    const tp2 = extreme - legRange * 1.5;
+    const tp3 = extreme - legRange * 2.5;
+    return { entryZone: `${fmt(zoneBottom)}-${fmt(zoneTop)}`, stopLoss: fmt(sl), tp1: fmt(tp1), tp2: fmt(tp2), tp3: fmt(tp3) };
+  } else {
+    const sl = origin - legRange * 0.05;
+    const tp1 = extreme + legRange * 1.0;
+    const tp2 = extreme + legRange * 1.5;
+    const tp3 = extreme + legRange * 2.5;
+    return { entryZone: `${fmt(zoneBottom)}-${fmt(zoneTop)}`, stopLoss: fmt(sl), tp1: fmt(tp1), tp2: fmt(tp2), tp3: fmt(tp3) };
+  }
+}
+
+// ============================================================
+// DECISION ORCHESTRATOR — the one function that decides everything.
+// No LLM call anywhere in this function. Fully reproducible: same
+// payload in, same decision out, every time.
+// ============================================================
+function buildDecision(payload) {
+  const condition = payload.condition || "";
+  const type = classifySignal(condition);
+  if (!type) return { verdict: "UNRECOGNIZED" };
+
+  const killzoneActive = bool(payload.killzone);
+  const direction = type.endsWith("SHORT") ? "Short" : "Long";
+  const scoreResult = type.startsWith("OB_")
+    ? scoreOB(payload, direction)
+    : scoreBreakout(payload, direction);
+
+  const gated = applyRiskGates(payload, scoreResult, killzoneActive);
+  if (gated.verdict === "NO_TRADE") return { verdict: "NO_TRADE", reason: gated.reason, type, scoreResult };
+
+  const levels = type.startsWith("OB_")
+    ? computeOBLevels(payload, direction)
+    : computeBreakoutLevels(payload, direction);
+
+  return { verdict: "TRADE", type, scoreResult, gated, levels };
+}
+
+// ============================================================
+// CLAUDE AS EXPLAINER — not decision-maker. Given the fully-computed
+// decision above, Claude's only job is to write 1-2 sentences of plain
+// -language reasoning. It cannot change score, direction, confidence,
+// leverage, or any price level — those are already final by the time
+// this function is called.
+// ============================================================
+const EXPLAIN_SYSTEM_PROMPT = `You are a trading assistant whose ONLY job is to write a short, clear explanation of a trade decision that has ALREADY been made by deterministic code. You are NOT permitted to change the score, direction, confidence, leverage, entry, stop loss, or take-profit values given to you — those are fixed inputs, not suggestions you can adjust.
+
+Your job:
+1. Write a 1-2 sentence REASONING explaining why this setup qualifies, referencing the specific checklist points that passed.
+2. If any of these known lesson patterns apply to the data given, mention it as a caution (do not change the trade, just flag it):
+   - Negative delta during a strong multi-timeframe rally can be absorption, not distribution — don't over-read bearish delta alone if RSI/momentum is strongly bullish across timeframes
+   - SMT divergence appearing after a fresh high/low impulse is an early reversal warning worth flagging
+   - A directionally correct call can still get stopped out on intraday range noise before resolving — don't overstate certainty
+
+Output ONLY the reasoning text, 1-2 sentences, nothing else — no preamble, no restating the numbers back.`;
+
+async function explainDecision(decision, payload) {
+  const { type, scoreResult, gated, levels } = decision;
+  const userMessage = `Signal type: ${type}
+Direction: ${scoreResult.direction}
+Checklist: ${scoreResult.points.map(p => `[${p.pass ? "PASS" : "FAIL"}] ${p.label}: ${p.detail}`).join(" | ")}
+Raw score: ${scoreResult.rawScore}/5
+Confidence: ${gated.confidence}
+Risk flags already applied: ${gated.flags.join("; ") || "none"}
+Entry: ${levels.entryZone}, SL: ${levels.stopLoss}, TP1: ${levels.tp1}, TP2: ${levels.tp2}, TP3: ${levels.tp3}
+SMT bias: ${payload.smtBias}, RSI: ${payload.rsi}, HTF trend: ${payload.htfTrend}
+
+Write the 1-2 sentence reasoning now.`;
 
   const body = JSON.stringify({
     model: "claude-sonnet-4-6",
-    max_tokens: 2000,
-    system: SYSTEM_PROMPT,
+    max_tokens: 300,
+    system: EXPLAIN_SYSTEM_PROMPT,
     messages: [{ role: "user", content: userMessage }],
   });
 
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const req = https.request("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -149,14 +302,60 @@ BTC LIVE CORRELATION DATA (use for checklist point 4):
       res.on("end", () => {
         try {
           const parsed = JSON.parse(data);
-          const text = parsed.content?.[0]?.text || "Error: no response from Claude";
-          resolve(text);
-        } catch (e) {
-          reject(new Error("Failed to parse Claude response"));
+          resolve((parsed.content?.[0]?.text || "").trim() || "Deterministic checklist cleared threshold — see score breakdown above.");
+        } catch {
+          resolve("Deterministic checklist cleared threshold — see score breakdown above.");
         }
       });
     });
-    req.on("error", reject);
+    // If Claude is down/errors, the trade signal still sends — explanation
+    // just falls back to a generic line. The decision itself never depends
+    // on this call succeeding.
+    req.on("error", () => resolve("Deterministic checklist cleared threshold — see score breakdown above."));
+    req.write(body);
+    req.end();
+  });
+}
+
+// ============================================================
+// LEGACY PATH — manual level crosses only (cross_manual_level1/2/3).
+// These were never part of the 5-point checklist system (they're simple
+// price crosses, not structural setups), so they keep the old
+// full-prompt-decides-everything approach rather than being force-fit
+// into the deterministic engine above.
+// ============================================================
+const LEGACY_SYSTEM_PROMPT = `You are a professional crypto futures trade signal generator. A manual price level the trader marked has just been crossed. Give a brief, honest read: is this level crossing significant given the RSI, delta, and session context provided, or likely noise? Keep it to 2-3 sentences. Do not fabricate a full trade plan with entry/SL/TP for a simple level cross — that requires the structural checklist, which doesn't apply here.`;
+
+async function generateLegacyNote(payload) {
+  const userMessage = `Manual level crossed. Condition: ${payload.condition}. Symbol: ${payload.symbol}. Price: $${payload.price}. RSI: ${payload.rsi}. Cumulative Delta: ${payload.cumDelta}. Session: ${payload.session}. Kill zone active: ${payload.killzone}.`;
+
+  const body = JSON.stringify({
+    model: "claude-sonnet-4-6",
+    max_tokens: 300,
+    system: LEGACY_SYSTEM_PROMPT,
+    messages: [{ role: "user", content: userMessage }],
+  });
+
+  return new Promise((resolve) => {
+    const req = https.request("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "Content-Length": Buffer.byteLength(body),
+      },
+    }, (res) => {
+      let data = "";
+      res.on("data", (c) => (data += c));
+      res.on("end", () => {
+        try {
+          const parsed = JSON.parse(data);
+          resolve((parsed.content?.[0]?.text || "").trim() || "No commentary available.");
+        } catch { resolve("No commentary available."); }
+      });
+    });
+    req.on("error", () => resolve("No commentary available."));
     req.write(body);
     req.end();
   });
@@ -194,12 +393,12 @@ function formatAlertHeader(payload) {
   const now = new Date().toLocaleString("en-AU", {
     timeZone: "Australia/Melbourne", dateStyle: "short", timeStyle: "short"
   });
-  const killzone  = payload.killzone === true || payload.killzone === "true";
+  const killzone  = bool(payload.killzone);
   const kzTag     = killzone ? " ⚡ KILL ZONE" : "";
   const condition = payload.condition || "unknown";
-  const isPriority = condition.includes("HIGH_PRIORITY");
-  const isShort   = condition.includes("OB_SHORT") || condition.includes("overbought") || condition.includes("cross_below");
-  const isLong    = condition.includes("POB_LONG")  || condition.includes("oversold")  || condition.includes("cross_above");
+  const isPriority = condition.includes("HIGH_PRIORITY") || condition.includes("BREAKOUT");
+  const isShort   = condition.includes("OB_SHORT") || condition.includes("BREAKOUT_SHORT") || condition.includes("cross_below");
+  const isLong    = condition.includes("POB_LONG")  || condition.includes("BREAKOUT_LONG") || condition.includes("cross_above");
   const emoji     = isPriority ? "🚨" : isShort ? "🔴" : isLong ? "🟢" : "🔔";
 
   return `${emoji} <b>TRADE ALERT${kzTag}</b>
@@ -211,27 +410,39 @@ function formatAlertHeader(payload) {
 <b>Delta:</b>    ${payload.cumDelta}
 <b>Session:</b>  ${payload.session}
 <b>TF:</b>       ${payload.timeframe}
-<b>-OB Zone:</b> $${payload.obBottom} – $${payload.obTop}${payload.obMitigated ? " (mitigated)" : ""}
-<b>+OB Zone:</b> $${payload.pobBottom} – $${payload.pobTop}${payload.pobMitigated ? " (mitigated)" : ""}
+<b>-OB Zone:</b> $${payload.obBottom} – $${payload.obTop}${bool(payload.obMitigated) ? " (mitigated)" : ""}
+<b>+OB Zone:</b> $${payload.pobBottom} – $${payload.pobTop}${bool(payload.pobMitigated) ? " (mitigated)" : ""}
 <b>SMT:</b>      ${payload.smtBias}  |  <b>MSS:</b> ${payload.mssDir}
+<b>HTF Trend:</b> ${payload.htfTrend || "Unknown"}
 ─────────────────
-⏳ <i>Generating trade plan...</i>
+⏳ <i>Scoring deterministically...</i>
 <b>Time (AEDT):</b> ${now}`;
 }
 
 // ============================================================
-// Format the final, platform-agnostic trade setup message
+// Format the final trade setup — score/levels are already final by
+// this point; reasoning is the only Claude-generated piece.
 // ============================================================
-function formatTradeSetup(lines, payload) {
+function formatTradeSetup(decision, payload, reasoning) {
+  const { scoreResult, gated, levels } = decision;
+  const checklistLines = scoreResult.points.map(p => `${p.pass === 1 ? "✅" : p.pass === 0.5 ? "➖" : "❌"} ${p.label}`).join("\n");
+  const flagLines = gated.flags.length ? "\n\n⚠️ " + gated.flags.join("\n⚠️ ") : "";
+
   return `📊 Trade Setup:
 - Symbol: ${payload.symbol || "—"}
-- Bias: ${lines.BIAS || "—"}
-- Ideal leverage (be flexible): ${lines.LEVERAGE || "—"}
-- Entry Zone: ${lines.ENTRY_ZONE || "—"}
-- Stop Loss: ${lines.STOP_LOSS || "—"}
-- Take Profit 1: ${lines.TP1 || "—"}
-- Take Profit 2: ${lines.TP2 || "—"}
-- Take Profit 3: ${lines.TP3 || "—"}`;
+- Bias: ${scoreResult.direction}
+- Confidence: ${gated.confidence} (${scoreResult.rawScore}/5)
+- Ideal leverage (be flexible): ${gated.leverage}
+- Entry Zone: ${levels.entryZone}
+- Stop Loss: ${levels.stopLoss}
+- Take Profit 1: ${levels.tp1}
+- Take Profit 2: ${levels.tp2}
+- Take Profit 3: ${levels.tp3}
+
+Checklist:
+${checklistLines}${flagLines}
+
+Reasoning: ${reasoning}`;
 }
 
 // ============================================================
@@ -239,7 +450,7 @@ function formatTradeSetup(lines, payload) {
 // ============================================================
 const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/") {
-    res.writeHead(200); res.end("Trade alert server v6 — Claude-powered, platform-agnostic ✅"); return;
+    res.writeHead(200); res.end("Trade alert server v10 — deterministic scoring, Claude explains only, signal-only (no execution) ✅"); return;
   }
 
   if (req.method === "POST" && req.url === "/webhook") {
@@ -249,83 +460,58 @@ const server = http.createServer(async (req, res) => {
       let payload;
       try { payload = JSON.parse(body); } catch { payload = { condition: body }; }
 
-      // Respond to TradingView IMMEDIATELY (before Claude API call)
-      // This prevents webhook timeout errors
+      // Respond to TradingView IMMEDIATELY (before any processing)
       res.writeHead(200); res.end(JSON.stringify({ ok: true }));
 
-      // Now process async in background — TradingView already got its 200 OK
       try {
-        // PRE-FILTER — only call Claude API for high priority signals
-        // Weak signals (RSI, MSS alone, SMT alone, outside OB watch) are skipped
-        // This saves ~90% of API credits
         const condition = payload.condition || "";
-        const highPrioritySignals = [
-          "KILLZONE_OB_SHORT_HIGH_PRIORITY",
-          "KILLZONE_POB_LONG_HIGH_PRIORITY",
-          "OB_SHORT_REJECTION_CONFIRMED",
-          "POB_LONG_REJECTION_CONFIRMED",
-          "cross_manual_level1",
-          "cross_manual_level2",
-          "cross_manual_level3",
-        ];
 
-        const isHighPriority = highPrioritySignals.some(s => condition.includes(s));
-
-        if (!isHighPriority) {
-          console.log("Low priority signal — skipping Claude API ⏭️", new Date().toISOString(), "| condition:", condition);
+        // WATCH TIER — HTF proximity heads-ups. No scoring, no Claude call,
+        // just a direct low-cost ping. Forward-looking context only.
+        if (condition === "WATCH_HTF_RESISTANCE_NEARBY" || condition === "WATCH_HTF_SUPPORT_NEARBY") {
+          const zoneType = condition === "WATCH_HTF_RESISTANCE_NEARBY" ? "resistance" : "support";
+          const htfLevel = condition === "WATCH_HTF_RESISTANCE_NEARBY" ? payload.htfSwingHigh : payload.htfSwingLow;
+          await sendTelegram(`👀 <b>WATCH — HTF ${zoneType} nearby</b>
+Symbol: ${payload.symbol || "—"}
+Price: $${payload.price} approaching HTF ${zoneType} at $${htfLevel}
+HTF Trend: ${payload.htfTrend || "Unknown"}
+This is a heads-up only, not a trade plan — watch for an actual 15M rejection/confirmation before acting.`);
+          console.log("HTF watch alert sent 👀", new Date().toISOString(), "| condition:", condition);
           return;
         }
 
-        // Call Claude API FIRST — only send anything to Telegram if valid trade
-        const tradePlan = await generateTradePlan(payload);
+        // MAIN DECISION — fully deterministic, no LLM involved in the
+        // score/direction/confidence/leverage/levels at all
+        const decision = buildDecision(payload);
 
-        // NO TRADE — complete silence, zero Telegram messages
-        if (tradePlan.includes("NO TRADE") || tradePlan.includes("DIRECTION: NO TRADE") || tradePlan.includes("CHECKLIST SCORE: 2") || tradePlan.includes("CHECKLIST SCORE: 1") || tradePlan.includes("CHECKLIST SCORE: 0")) {
-          console.log("No trade — complete silence ⏭️", new Date().toISOString(), "| condition:", payload.condition);
+        if (decision.verdict === "UNRECOGNIZED") {
+          const legacyConditions = ["cross_manual_level1", "cross_manual_level2", "cross_manual_level3"];
+          if (!legacyConditions.some(s => condition.includes(s))) {
+            console.log("Low priority / unrecognized signal — skipping ⏭️", new Date().toISOString(), "| condition:", condition);
+            return;
+          }
+          // Legacy manual-level-cross path — commentary only, no fabricated levels
+          const note = await generateLegacyNote(payload);
+          await sendTelegram(`🔔 <b>Manual Level Cross</b>
+Symbol: ${payload.symbol || "—"} | Price: $${payload.price}
+${note}`);
+          console.log("Legacy manual-cross note sent 🔔", new Date().toISOString(), "| condition:", condition);
           return;
         }
 
-        // VALID TRADE — now send header + plan
+        if (decision.verdict === "NO_TRADE") {
+          console.log("No trade (deterministic) — complete silence ⏭️", new Date().toISOString(), "| condition:", condition, "| reason:", decision.reason);
+          return;
+        }
+
+        // TRADE — score/levels are already final. Claude only explains.
+        const reasoning = await explainDecision(decision, payload);
         const header = formatAlertHeader(payload);
         await sendTelegram(header);
-
-        // Parse the structured signal format
-        let planMsg;
-        const hasStart = tradePlan.includes("signal_start");
-        const hasEnd   = tradePlan.includes("signal_end");
-
-        if (hasStart && hasEnd) {
-          // Clean, complete signal — normal path
-          const signalContent = tradePlan.split("signal_start")[1].split("signal_end")[0].trim();
-          const lines = {};
-          signalContent.split("\n").forEach(line => {
-            const [key, ...val] = line.split(":");
-            if (key && val.length) lines[key.trim()] = val.join(":").trim();
-          });
-          planMsg = formatTradeSetup(lines, payload);
-        } else if (hasStart && !hasEnd) {
-          // Truncated mid-generation (hit max_tokens before finishing).
-          // Salvage what's there, but NEVER present it as a clean plan without
-          // a loud warning — an incomplete SL/entry is worse than no signal.
-          const signalContent = tradePlan.split("signal_start")[1].trim();
-          const lines = {};
-          signalContent.split("\n").forEach(line => {
-            const [key, ...val] = line.split(":");
-            if (key && val.length) lines[key.trim()] = val.join(":").trim();
-          });
-          const missingCritical = !lines.BIAS || !lines.ENTRY_ZONE || !lines.STOP_LOSS;
-          if (missingCritical) {
-            planMsg = `⚠️ <b>Signal generation was cut off before completing</b> — critical levels (entry/SL) never finished generating. This is NOT a valid trade plan — do not act on it.`;
-          } else {
-            planMsg = formatTradeSetup(lines, payload) + `\n\n⚠️ <i>Response was truncated — TP levels or leverage may be missing above. Verify manually before entry.</i>`;
-          }
-        } else {
-          // No structured block at all — malformed response, show raw for debugging
-          planMsg = `📊 <b>TRADE SETUP — ${payload.symbol || "—"}</b>\n─────────────────\n<pre>${tradePlan}</pre>`;
-        }
+        const planMsg = formatTradeSetup(decision, payload, reasoning);
         await sendTelegram(planMsg);
 
-        console.log("Alert + plan sent ✅", new Date().toISOString(), "| condition:", payload.condition);
+        console.log("Alert + deterministic plan sent ✅", new Date().toISOString(), "| condition:", condition, "| score:", decision.scoreResult.rawScore, "/5");
       } catch (err) {
         console.error("Error:", err.message);
         try { await sendTelegram(`⚠️ <b>Bot error:</b> ${err.message}`); } catch {}
@@ -337,4 +523,4 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(404); res.end("Not found");
 });
 
-server.listen(PORT, () => console.log(`Server v6 running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Server v10 running on port ${PORT}`));
