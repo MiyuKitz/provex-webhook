@@ -25,6 +25,29 @@ function num(v) { const n = parseFloat(v); return isNaN(n) ? 0 : n; }
 function bool(v) { return v === true || v === "true"; }
 
 // ============================================================
+// DEDUP CACHE (v10.1) — blocks duplicate signals from triggering
+// duplicate Claude API calls / Telegram sends. Same symbol + condition
+// + price arriving again within DEDUP_WINDOW_MS is treated as a repeat
+// of the same real-world event (e.g. multiple stale TradingView alerts
+// all firing for one price move) and silently dropped before any cost
+// is incurred. This is a safety net, not the root fix — the root fix
+// is having exactly one active TradingView alert per symbol.
+// ============================================================
+const recentSignals = new Map(); // key -> last-seen timestamp (ms)
+const DEDUP_WINDOW_MS = 30000; // 30 seconds
+
+function isDuplicateSignal(payload) {
+  const key = `${payload.symbol || ""}|${payload.condition || ""}|${payload.price || ""}`;
+  const now = Date.now();
+  const last = recentSignals.get(key);
+  // prevent unbounded memory growth over a long-running process
+  if (recentSignals.size > 500) recentSignals.clear();
+  recentSignals.set(key, now);
+  if (last && (now - last) < DEDUP_WINDOW_MS) return true;
+  return false;
+}
+
+// ============================================================
 // SIGNAL CLASSIFICATION
 // ============================================================
 function classifySignal(condition) {
@@ -465,6 +488,14 @@ const server = http.createServer(async (req, res) => {
 
       try {
         const condition = payload.condition || "";
+
+        // DEDUP CHECK — must run before ANY branch below, since every branch
+        // (WATCH, main decision, legacy) can call Claude or send Telegram.
+        // A duplicate here means zero further processing of any kind.
+        if (isDuplicateSignal(payload)) {
+          console.log("Duplicate signal within dedup window — skipping ⏭️", new Date().toISOString(), "| condition:", condition, "| symbol:", payload.symbol, "| price:", payload.price);
+          return;
+        }
 
         // WATCH TIER — HTF proximity heads-ups. No scoring, no Claude call,
         // just a direct low-cost ping. Forward-looking context only.
