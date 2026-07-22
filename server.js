@@ -4,7 +4,6 @@ const https = require("https");
 const TELEGRAM_TOKEN    = process.env.TELEGRAM_TOKEN;
 const TELEGRAM_CHAT_ID  = process.env.TELEGRAM_CHAT_ID;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL; // optional — if unset, Discord sends are silently skipped, Telegram keeps working exactly as before
 const PORT = process.env.PORT || 3000;
 
 // ============================================================
@@ -637,104 +636,6 @@ async function sendTelegram(message) {
 }
 
 // ============================================================
-// DISCORD (new) — a SECOND, ADDITIVE channel alongside Telegram, not
-// a replacement. Discord embeds support real color (a colored left
-// border + field styling), which Telegram's Bot API cannot do at all
-// — that's the actual reason for adding this, not a Telegram limitation
-// workaround elsewhere. If DISCORD_WEBHOOK_URL isn't set in Railway's
-// environment variables, this silently no-ops — Telegram keeps working
-// exactly as it always has, nothing breaks if you don't set it up.
-// ============================================================
-async function sendDiscord(embed) {
-  if (!DISCORD_WEBHOOK_URL) return null;
-  const body = JSON.stringify({ embeds: [embed] });
-  return new Promise((resolve) => {
-    try {
-      const url = new URL(DISCORD_WEBHOOK_URL);
-      const req = https.request({
-        hostname: url.hostname,
-        path:     url.pathname + url.search,
-        method:   "POST",
-        headers:  { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
-      }, (res) => {
-        let data = "";
-        res.on("data", (c) => (data += c));
-        res.on("end",  () => resolve(data));
-      });
-      // Discord failing should never break Telegram or the core signal —
-      // resolve quietly rather than throwing
-      req.on("error", () => resolve(null));
-      req.write(body);
-      req.end();
-    } catch {
-      resolve(null);
-    }
-  });
-}
-
-function buildTradeEmbed(decision, payload, reasoning) {
-  const { scoreResult, gated, levels, isSwing } = decision;
-  const isShort = scoreResult.direction === "Short";
-  const color = isShort ? 0xE74C3C : 0x2ECC71; // red for short, green for long
-  const dirEmoji = isShort ? "🔻" : "🔺";
-
-  const fields = [
-    { name: "Bias",       value: `${dirEmoji} ${scoreResult.direction}`,              inline: true },
-    { name: "Confidence", value: `${gated.confidence} (${scoreResult.rawScore}/5)`,   inline: true },
-    { name: "Leverage",   value: gated.leverage,                                       inline: true },
-    { name: "🎯 Entry Zone", value: levels.entryZone, inline: false },
-    { name: "🛑 Stop Loss",  value: levels.stopLoss,  inline: true },
-    { name: "🥇 TP1",        value: levels.tp1,       inline: true },
-    { name: "🥈 TP2",        value: levels.tp2,       inline: true },
-    { name: "🥉 TP3",        value: levels.tp3,       inline: true },
-  ];
-  if (payload.htfTrend) fields.push({ name: "🧭 HTF Trend", value: payload.htfTrend, inline: true });
-  if (isSwing && payload.swingTrend) fields.push({ name: "🌙 1H Structure", value: `${payload.swingTrend} (swing-eligible)`, inline: true });
-  fields.push({
-    name: "✅ Checklist",
-    value: scoreResult.points.map(p => `${p.pass === 1 ? "✅" : p.pass === 0.5 ? "➖" : "❌"} ${p.label}`).join("\n"),
-    inline: false,
-  });
-  if (gated.flags.length) fields.push({ name: "⚠️ Risk Flags", value: gated.flags.map(f => `⚠️ ${f}`).join("\n"), inline: false });
-  fields.push({ name: "📝 Reasoning", value: reasoning, inline: false });
-
-  return {
-    title: `📊 Trade Setup${isSwing ? " 🌙 SWING" : ""} — ${payload.symbol || "—"}`,
-    color,
-    fields,
-    timestamp: new Date().toISOString(),
-  };
-}
-
-function buildWatchEmbed(payload, zoneType, htfLevel) {
-  return {
-    title: "👀 WATCH — HTF Proximity",
-    color: 0xF1C40F, // yellow — heads-up, not a trade
-    description: "Heads-up only, not a trade plan — watch for an actual 15M rejection/confirmation before acting.",
-    fields: [
-      { name: "Symbol",           value: payload.symbol || "—",        inline: true },
-      { name: "Price",            value: `$${payload.price}`,          inline: true },
-      { name: `HTF ${zoneType}`,  value: `$${htfLevel}`,                inline: true },
-      { name: "HTF Trend",        value: payload.htfTrend || "Unknown", inline: true },
-    ],
-    timestamp: new Date().toISOString(),
-  };
-}
-
-function buildLegacyEmbed(payload, note) {
-  return {
-    title: "🔔 Manual Level Cross",
-    color: 0x95A5A6, // gray — informational only
-    description: note,
-    fields: [
-      { name: "Symbol", value: payload.symbol || "—", inline: true },
-      { name: "Price",  value: `$${payload.price}`,   inline: true },
-    ],
-    timestamp: new Date().toISOString(),
-  };
-}
-
-// ============================================================
 // Format the incoming alert header (fires immediately)
 // ============================================================
 function formatAlertHeader(payload) {
@@ -847,7 +748,6 @@ Symbol: ${payload.symbol || "—"}
 Price: $${payload.price} approaching HTF ${zoneType} at $${htfLevel}
 HTF Trend: ${payload.htfTrend || "Unknown"}
 This is a heads-up only, not a trade plan — watch for an actual 15M rejection/confirmation before acting.`);
-          await sendDiscord(buildWatchEmbed(payload, zoneType, htfLevel));
           console.log("HTF watch alert sent 👀", new Date().toISOString(), "| condition:", condition);
           return;
         }
@@ -867,7 +767,6 @@ This is a heads-up only, not a trade plan — watch for an actual 15M rejection/
           await sendTelegram(`🔔 <b>Manual Level Cross</b>
 Symbol: ${payload.symbol || "—"} | Price: $${payload.price}
 ${note}`);
-          await sendDiscord(buildLegacyEmbed(payload, note));
           console.log("Legacy manual-cross note sent 🔔", new Date().toISOString(), "| condition:", condition);
           return;
         }
@@ -883,7 +782,6 @@ ${note}`);
         await sendTelegram(header);
         const planMsg = formatTradeSetup(decision, payload, reasoning);
         await sendTelegram(planMsg);
-        await sendDiscord(buildTradeEmbed(decision, payload, reasoning));
 
         console.log("Alert + deterministic plan sent ✅", new Date().toISOString(), "| condition:", condition, "| score:", decision.scoreResult.rawScore, "/5");
       } catch (err) {
