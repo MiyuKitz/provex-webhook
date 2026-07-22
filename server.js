@@ -48,9 +48,37 @@ function isDuplicateSignal(payload) {
 }
 
 // ============================================================
+// SIGNAL HISTORY (for /dashboard) — in-memory only, resets on restart.
+// This is NOT the outcome tracker (no win/loss/fill data — that's a
+// separate, bigger build). This just gives a real, styled view of what
+// fired recently, since Telegram genuinely cannot render color, layout,
+// or history the way a browser page can.
+// ============================================================
+const signalHistory = [];
+const MAX_HISTORY = 50;
+
+function recordSignal(decision, payload, reasoning) {
+  signalHistory.unshift({
+    timestamp: new Date().toISOString(),
+    payload,
+    decision,
+    reasoning,
+  });
+  if (signalHistory.length > MAX_HISTORY) signalHistory.length = MAX_HISTORY;
+}
+
+function escapeHtml(str) {
+  return String(str ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// ============================================================
 // SIGNAL CLASSIFICATION
 // ============================================================
 function classifySignal(condition) {
+  if (condition.includes("OB_SHORT_SWING_ELIGIBLE_CONFIRMED"))
+    return "OB_SWING_SHORT";
+  if (condition.includes("POB_LONG_SWING_ELIGIBLE_CONFIRMED"))
+    return "OB_SWING_LONG";
   if (condition.includes("OB_SHORT_REJECTION_CONFIRMED") || condition === "KILLZONE_OB_SHORT_HIGH_PRIORITY")
     return "OB_SHORT";
   if (condition.includes("POB_LONG_REJECTION_CONFIRMED") || condition === "KILLZONE_POB_LONG_HIGH_PRIORITY")
@@ -153,7 +181,32 @@ function scoreBreakout(payload, direction) {
 // ============================================================
 // RISK GATES — kill zone threshold, BTC/HTF opposition, mitigation kill
 // ============================================================
-function applyRiskGates(payload, scoreResult, killzoneActive) {
+// ============================================================
+// SMT + RSI CHECKS (new) — these were being computed and sent to
+// Claude for narrative color, but never actually enforced. Now they
+// carry real weight: SMT opposition gets the same treatment as
+// BTC/HTF opposition (this is a documented "never violate" lesson,
+// not a soft suggestion), RSI exhaustion is a softer flag-only caution.
+// ============================================================
+function checkSMT(payload, direction) {
+  const smt = payload.smtBias || "None";
+  if (smt === "None") return null;
+  const opposes  = (direction === "Short" && smt === "Bullish") || (direction === "Long" && smt === "Bearish");
+  const supports = (direction === "Short" && smt === "Bearish") || (direction === "Long" && smt === "Bullish");
+  if (opposes)  return { severity: "caution", text: `${smt} SMT divergence present — early reversal warning against this ${direction.toLowerCase()} (validated lesson, not a soft suggestion)` };
+  if (supports) return { severity: "confluence", text: `${smt} SMT divergence adds confluence for this ${direction.toLowerCase()}` };
+  return null;
+}
+
+function checkRSIExhaustion(payload, direction) {
+  const rsi = num(payload.rsi);
+  if (rsi <= 0) return null;
+  if (direction === "Short" && rsi < 35) return `RSI already at ${rsi} — oversold territory, down-move may be exhausted (absorption risk, don't lean on delta alone)`;
+  if (direction === "Long" && rsi > 65) return `RSI already at ${rsi} — overbought territory, up-move may be exhausted (absorption risk, don't lean on delta alone)`;
+  return null;
+}
+
+function applyRiskGates(payload, scoreResult, killzoneActive, isSwing = false) {
   const { rawScore, direction, mitigated, btcOpposes, structureOk } = scoreResult;
 
   if (mitigated) return { verdict: "NO_TRADE", reason: "OB mitigated — zone is dead, no exceptions" };
@@ -165,7 +218,13 @@ function applyRiskGates(payload, scoreResult, killzoneActive) {
   }
 
   let confidence = rawScore >= 4 ? "HIGH" : "MEDIUM";
-  let leverage   = confidence === "HIGH" ? (rawScore === 5 ? "50x-80x" : "25x-50x") : "10x-25x";
+  // Swing signals use a separate 30x-70x band per Krysie's stated preference
+  // (never below 30x for a swing trade, scaled up to 70x on full confidence).
+  // Non-swing (15M-only) signals keep the original scalp bands unchanged.
+  let leverage = isSwing
+    ? (confidence === "HIGH" ? (rawScore === 5 ? "50x-70x" : "30x-50x") : "30x-40x")
+    : (confidence === "HIGH" ? (rawScore === 5 ? "50x-80x" : "25x-50x") : "10x-25x");
+  const floorLeverage = isSwing ? "30x-40x" : "10x-25x";
 
   const flags = [];
   const htfTrend  = payload.htfTrend || "Unknown";
@@ -173,20 +232,36 @@ function applyRiskGates(payload, scoreResult, killzoneActive) {
 
   if (btcOpposes) {
     confidence = "MEDIUM";
-    leverage = "10x-25x";
+    leverage = floorLeverage;
     flags.push("BTC trend opposes signal direction — HIGH RISK");
   }
   if (htfOpposes) {
     confidence = "MEDIUM";
-    if (leverage === "50x-80x" || leverage === "25x-50x") leverage = "10x-25x";
+    if (leverage !== floorLeverage) leverage = floorLeverage;
     flags.push(`HTF trend (${htfTrend}) opposes signal direction — headwind`);
   }
-  if (!killzoneActive) flags.push("Outside kill zone — fakeout risk elevated");
-  if (leverage !== "10x-25x") {
-    // check the top of whichever band was assigned for the >40x liquidation warning
-    const topOfBand = leverage === "50x-80x" ? 80 : leverage === "25x-50x" ? 50 : 25;
-    if (topOfBand > 40) flags.push("Leverage range extends above 40x — a small adverse wick can liquidate before SL triggers, size accordingly");
+
+  const smtCheck = checkSMT(payload, direction);
+  if (smtCheck) {
+    if (smtCheck.severity === "caution") {
+      confidence = "MEDIUM";
+      if (leverage !== floorLeverage) leverage = floorLeverage;
+    }
+    flags.push(smtCheck.text);
   }
+
+  const rsiCaution = checkRSIExhaustion(payload, direction);
+  if (rsiCaution) flags.push(rsiCaution);
+
+  if (isSwing) {
+    flags.push(`Swing signal — 1H structure agreement confirmed, wider R-multiple targets apply (see TP ladder)`);
+  }
+  if (!killzoneActive) flags.push("Outside kill zone — fakeout risk elevated");
+
+  // Parse the top of whichever band got assigned dynamically, instead of
+  // hardcoding every possible string — works for both scalp and swing bands
+  const topOfBand = parseInt(leverage.split("-")[1], 10);
+  if (topOfBand > 40) flags.push("Leverage range extends above 40x — a small adverse wick can liquidate before SL triggers, size accordingly");
 
   return { verdict: "TRADE", confidence, leverage, flags, rawScore };
 }
@@ -195,6 +270,87 @@ function applyRiskGates(payload, scoreResult, killzoneActive) {
 // DETERMINISTIC LEVEL CALCULATION
 // ============================================================
 function fmt(n) { return `$${n.toFixed(4)}`; }
+
+// ============================================================
+// SWING LEVELS (v12, new) — same entry/SL as the base OB signal (the
+// 15M OB is still the real structural invalidation point regardless of
+// intended hold time), but a much wider R-multiple TP ladder, since
+// 1H structure agreement justifies expecting a bigger move than a
+// pure 15M scalp. TP3 snaps to the real 1H swing high/low when one
+// sits beyond the formulaic target — genuine S/R, not just a number.
+// ============================================================
+// ============================================================
+// STRUCTURE SNAPPING (new) — R-multiples act as a MINIMUM floor, not
+// an exact target. If a genuine structural level (a real swing point,
+// an OB zone edge) sits between the floor and the next tier's floor,
+// use it instead of the raw formula. This is why the actual R-multiple
+// hit can vary trade to trade (3.1R here, 3.6R there) — it's snapping
+// to what's really on the chart, not guessing a score. No invented
+// weights anywhere in this function.
+// ============================================================
+function snapToStructure(direction, floorLevel, nextFloorLevel, candidates) {
+  const valid = candidates.filter(c => c > 0);
+  if (direction === "Short") {
+    // Looking for a real level at or beyond the floor (lower price) but
+    // not as far as the next tier's floor — the least extreme candidate
+    // in that zone is the honest, nearest real target
+    const inZone = valid.filter(c => c <= floorLevel && c > nextFloorLevel);
+    return inZone.length ? Math.max(...inZone) : floorLevel;
+  } else {
+    const inZone = valid.filter(c => c >= floorLevel && c < nextFloorLevel);
+    return inZone.length ? Math.min(...inZone) : floorLevel;
+  }
+}
+
+function computeSwingLevels(payload, direction) {
+  if (direction === "Short") {
+    const obTop = num(payload.obTop), obBottom = num(payload.obBottom);
+    const swingLow1h = num(payload.swingLow1h);
+    const obHeight = obTop - obBottom;
+    const sl = obTop + obHeight * 1.5;
+    const entryMid = (obTop + obBottom) / 2;
+    const risk = sl - entryMid;
+
+    const tp1Floor = entryMid - risk * 3; // minimum acceptable reward, not the exact exit
+    const tp2Floor = entryMid - risk * 5;
+    const tp3Floor = entryMid - risk * 8;
+
+    // Real structural candidates that could sit between each tier —
+    // 15M OB/POB edges, 15M swing low, 1H swing low, 4H swing low
+    const tp1Candidates = [num(payload.pobTop), num(payload.pobBottom), num(payload.swingLow)];
+    const tp1 = snapToStructure("Short", tp1Floor, tp2Floor, tp1Candidates);
+
+    const tp2Candidates = [num(payload.swingLow), swingLow1h];
+    const tp2 = snapToStructure("Short", tp2Floor, tp3Floor, tp2Candidates);
+
+    // TP3 keeps the same logic as before — snap to 1H structure if
+    // genuinely beyond TP2, otherwise use the formulaic 8R floor
+    const tp3 = (swingLow1h > 0 && swingLow1h < tp2) ? swingLow1h : tp3Floor;
+
+    return { entryZone: `${fmt(obBottom)}-${fmt(obTop)}`, stopLoss: fmt(sl), tp1: fmt(tp1), tp2: fmt(tp2), tp3: fmt(tp3), entryMidRaw: entryMid, slRaw: sl, tp1Raw: tp1, tp2Raw: tp2, tp3Raw: tp3, riskRaw: risk };
+  } else {
+    const obTop = num(payload.pobTop), obBottom = num(payload.pobBottom);
+    const swingHigh1h = num(payload.swingHigh1h);
+    const obHeight = obTop - obBottom;
+    const sl = obBottom - obHeight * 1.5;
+    const entryMid = (obTop + obBottom) / 2;
+    const risk = entryMid - sl;
+
+    const tp1Floor = entryMid + risk * 3;
+    const tp2Floor = entryMid + risk * 5;
+    const tp3Floor = entryMid + risk * 8;
+
+    const tp1Candidates = [num(payload.obTop), num(payload.obBottom), num(payload.swingHigh)];
+    const tp1 = snapToStructure("Long", tp1Floor, tp2Floor, tp1Candidates);
+
+    const tp2Candidates = [num(payload.swingHigh), swingHigh1h];
+    const tp2 = snapToStructure("Long", tp2Floor, tp3Floor, tp2Candidates);
+
+    const tp3 = (swingHigh1h > 0 && swingHigh1h > tp2) ? swingHigh1h : tp3Floor;
+
+    return { entryZone: `${fmt(obBottom)}-${fmt(obTop)}`, stopLoss: fmt(sl), tp1: fmt(tp1), tp2: fmt(tp2), tp3: fmt(tp3), entryMidRaw: entryMid, slRaw: sl, tp1Raw: tp1, tp2Raw: tp2, tp3Raw: tp3, riskRaw: risk };
+  }
+}
 
 function computeOBLevels(payload, direction) {
   if (direction === "Short") {
@@ -208,7 +364,7 @@ function computeOBLevels(payload, direction) {
     const tp1 = (pobTop > 0 && pobTop < entryMid) ? pobTop : entryMid - risk;
     const tp2 = (pobBottom > 0 && pobBottom < tp1) ? pobBottom : entryMid - risk * 2;
     const tp3 = (swingLow > 0 && swingLow < tp2) ? swingLow : entryMid - risk * 3;
-    return { entryZone: `${fmt(obBottom)}-${fmt(obTop)}`, stopLoss: fmt(sl), tp1: fmt(tp1), tp2: fmt(tp2), tp3: fmt(tp3) };
+    return { entryZone: `${fmt(obBottom)}-${fmt(obTop)}`, stopLoss: fmt(sl), tp1: fmt(tp1), tp2: fmt(tp2), tp3: fmt(tp3), entryMidRaw: entryMid, slRaw: sl };
   } else {
     const obTop = num(payload.obTop), obBottom = num(payload.obBottom);
     const pobTop = num(payload.pobTop), pobBottom = num(payload.pobBottom);
@@ -220,7 +376,7 @@ function computeOBLevels(payload, direction) {
     const tp1 = (obBottom > 0 && obBottom > entryMid) ? obBottom : entryMid + risk;
     const tp2 = (obTop > 0 && obTop > tp1) ? obTop : entryMid + risk * 2;
     const tp3 = (swingHigh > 0 && swingHigh > tp2) ? swingHigh : entryMid + risk * 3;
-    return { entryZone: `${fmt(pobBottom)}-${fmt(pobTop)}`, stopLoss: fmt(sl), tp1: fmt(tp1), tp2: fmt(tp2), tp3: fmt(tp3) };
+    return { entryZone: `${fmt(pobBottom)}-${fmt(pobTop)}`, stopLoss: fmt(sl), tp1: fmt(tp1), tp2: fmt(tp2), tp3: fmt(tp3), entryMidRaw: entryMid, slRaw: sl };
   }
 }
 
@@ -230,19 +386,20 @@ function computeBreakoutLevels(payload, direction) {
   const zoneTop = num(payload.boZoneTop);
   const zoneBottom = num(payload.boZoneBottom);
   const legRange = Math.abs(origin - extreme);
+  const entryMid = (zoneTop + zoneBottom) / 2;
 
   if (direction === "Short") {
     const sl = origin + legRange * 0.05;
     const tp1 = extreme - legRange * 1.0;
     const tp2 = extreme - legRange * 1.5;
     const tp3 = extreme - legRange * 2.5;
-    return { entryZone: `${fmt(zoneBottom)}-${fmt(zoneTop)}`, stopLoss: fmt(sl), tp1: fmt(tp1), tp2: fmt(tp2), tp3: fmt(tp3) };
+    return { entryZone: `${fmt(zoneBottom)}-${fmt(zoneTop)}`, stopLoss: fmt(sl), tp1: fmt(tp1), tp2: fmt(tp2), tp3: fmt(tp3), entryMidRaw: entryMid, slRaw: sl };
   } else {
     const sl = origin - legRange * 0.05;
     const tp1 = extreme + legRange * 1.0;
     const tp2 = extreme + legRange * 1.5;
     const tp3 = extreme + legRange * 2.5;
-    return { entryZone: `${fmt(zoneBottom)}-${fmt(zoneTop)}`, stopLoss: fmt(sl), tp1: fmt(tp1), tp2: fmt(tp2), tp3: fmt(tp3) };
+    return { entryZone: `${fmt(zoneBottom)}-${fmt(zoneTop)}`, stopLoss: fmt(sl), tp1: fmt(tp1), tp2: fmt(tp2), tp3: fmt(tp3), entryMidRaw: entryMid, slRaw: sl };
   }
 }
 
@@ -256,20 +413,39 @@ function buildDecision(payload) {
   const type = classifySignal(condition);
   if (!type) return { verdict: "UNRECOGNIZED" };
 
+  const isSwing = type.startsWith("OB_SWING_");
   const killzoneActive = bool(payload.killzone);
   const direction = type.endsWith("SHORT") ? "Short" : "Long";
   const scoreResult = type.startsWith("OB_")
     ? scoreOB(payload, direction)
     : scoreBreakout(payload, direction);
 
-  const gated = applyRiskGates(payload, scoreResult, killzoneActive);
+  const gated = applyRiskGates(payload, scoreResult, killzoneActive, isSwing);
   if (gated.verdict === "NO_TRADE") return { verdict: "NO_TRADE", reason: gated.reason, type, scoreResult };
 
-  const levels = type.startsWith("OB_")
-    ? computeOBLevels(payload, direction)
-    : computeBreakoutLevels(payload, direction);
+  const levels = isSwing
+    ? computeSwingLevels(payload, direction)
+    : type.startsWith("OB_")
+      ? computeOBLevels(payload, direction)
+      : computeBreakoutLevels(payload, direction);
 
-  return { verdict: "TRADE", type, scoreResult, gated, levels };
+  // -- Liquidation buffer check (new) — compares actual SL distance
+  // against the ESTIMATED liquidation distance at the top of the
+  // assigned leverage band. This is an approximation (isolated margin,
+  // ignoring maintenance margin/fees/funding, which vary by exchange)
+  // — not a guarantee. It's checked at the top of the band specifically
+  // because that's the riskier case if someone picks max leverage from
+  // within the suggested range.
+  const slDistPct = Math.abs(levels.slRaw - levels.entryMidRaw) / levels.entryMidRaw * 100;
+  const maxLeverage = parseInt(gated.leverage.split("-")[1], 10);
+  const estLiqPct = 100 / maxLeverage;
+  if (slDistPct >= estLiqPct * 0.9) {
+    gated.flags.push(`⚠️ At ${maxLeverage}x, estimated liquidation distance (~${estLiqPct.toFixed(2)}%) is close to or beyond this trade's stop distance (${slDistPct.toFixed(2)}%) — you may be liquidated before the SL executes. This is an approximation; verify against your exchange's actual liquidation calculator, and consider lower leverage or a smaller position.`);
+  } else {
+    gated.flags.push(`Stop distance (${slDistPct.toFixed(2)}%) sits inside the estimated liquidation buffer (~${estLiqPct.toFixed(2)}% at ${maxLeverage}x) under normal conditions — approximate only, actual liquidation mechanics vary by exchange.`);
+  }
+
+  return { verdict: "TRADE", type, scoreResult, gated, levels, isSwing };
 }
 
 // ============================================================
@@ -419,7 +595,7 @@ function formatAlertHeader(payload) {
   const killzone  = bool(payload.killzone);
   const kzTag     = killzone ? " ⚡ KILL ZONE" : "";
   const condition = payload.condition || "unknown";
-  const isPriority = condition.includes("HIGH_PRIORITY") || condition.includes("BREAKOUT");
+  const isPriority = condition.includes("HIGH_PRIORITY") || condition.includes("BREAKOUT") || condition.includes("SWING");
   const isShort   = condition.includes("OB_SHORT") || condition.includes("BREAKOUT_SHORT") || condition.includes("cross_below");
   const isLong    = condition.includes("POB_LONG")  || condition.includes("BREAKOUT_LONG") || condition.includes("cross_above");
   const emoji     = isPriority ? "🚨" : isShort ? "🔴" : isLong ? "🟢" : "🔔";
@@ -447,25 +623,40 @@ function formatAlertHeader(payload) {
 // this point; reasoning is the only Claude-generated piece.
 // ============================================================
 function formatTradeSetup(decision, payload, reasoning) {
-  const { scoreResult, gated, levels } = decision;
+  const { scoreResult, gated, levels, isSwing } = decision;
+  const dirEmoji = scoreResult.direction === "Short" ? "🔻" : "🔺";
   const checklistLines = scoreResult.points.map(p => `${p.pass === 1 ? "✅" : p.pass === 0.5 ? "➖" : "❌"} ${p.label}`).join("\n");
-  const flagLines = gated.flags.length ? "\n\n⚠️ " + gated.flags.join("\n⚠️ ") : "";
+  const flagLines = gated.flags.length ? `\n\n⚠️ <b>Risk Flags</b>\n⚠️ ${gated.flags.join("\n⚠️ ")}` : "";
+  const htfLine = payload.htfTrend ? `\n🧭 <b>HTF Trend:</b> <code>${payload.htfTrend}</code>` : "";
+  const swingLine = isSwing && payload.swingTrend ? `\n🌙 <b>1H Structure:</b> <code>${payload.swingTrend}</code> (swing-eligible)` : "";
+  const titleTag = isSwing ? " 🌙 SWING" : "";
 
-  return `📊 Trade Setup:
-- Symbol: ${payload.symbol || "—"}
-- Bias: ${scoreResult.direction}
-- Confidence: ${gated.confidence} (${scoreResult.rawScore}/5)
-- Ideal leverage (be flexible): ${gated.leverage}
-- Entry Zone: ${levels.entryZone}
-- Stop Loss: ${levels.stopLoss}
-- Take Profit 1: ${levels.tp1}
-- Take Profit 2: ${levels.tp2}
-- Take Profit 3: ${levels.tp3}
+  // Actual R-multiple achieved at each target — computed from real
+  // levels, not a fixed label. This is what actually varies trade to
+  // trade (3.1R here, 3.6R there) when a real structural level sits
+  // closer than the raw multiple would have reached.
+  let rMultLine = "";
+  if (isSwing && levels.riskRaw > 0) {
+    const r1 = Math.abs(levels.tp1Raw - levels.entryMidRaw) / levels.riskRaw;
+    const r2 = Math.abs(levels.tp2Raw - levels.entryMidRaw) / levels.riskRaw;
+    const r3 = Math.abs(levels.tp3Raw - levels.entryMidRaw) / levels.riskRaw;
+    rMultLine = `\n📐 <b>R achieved:</b> <code>${r1.toFixed(1)}R</code> / <code>${r2.toFixed(1)}R</code> / <code>${r3.toFixed(1)}R</code> (min floor: 3R/5R/8R — actual snaps to real structure when it's closer)`;
+  }
 
-Checklist:
+  return `📊 <b>Trade Setup${titleTag}</b>
+━━━━━━━━━━━━━━━
+<b>${payload.symbol || "—"}</b>
+${dirEmoji} ${scoreResult.direction} bias │ <b>${gated.confidence}</b> <code>${scoreResult.rawScore}/5</code> │ <code>${gated.leverage}</code>
+
+🎯 Entry: <code>${levels.entryZone}</code>
+🥇 TP1: <code>${levels.tp1}</code>  │  🥈 TP2: <code>${levels.tp2}</code>  │  🥉 TP3: <code>${levels.tp3}</code>
+🛑 SL: <code>${levels.stopLoss}</code>${rMultLine}
+${htfLine}${swingLine}
+
+✅ <b>Checklist</b>
 ${checklistLines}${flagLines}
 
-Reasoning: ${reasoning}`;
+📝 <b>Reasoning:</b> ${reasoning}`;
 }
 
 // ============================================================
