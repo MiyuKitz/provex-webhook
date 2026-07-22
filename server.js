@@ -674,12 +674,11 @@ function formatAlertHeader(payload) {
 // ============================================================
 function formatTradeSetup(decision, payload, reasoning) {
   const { scoreResult, gated, levels, isSwing } = decision;
-  const dirEmoji = scoreResult.direction === "Short" ? "🔻" : "🔺";
-  const checklistLines = scoreResult.points.map(p => `${p.pass === 1 ? "✅" : p.pass === 0.5 ? "➖" : "❌"} ${p.label}`).join("\n");
-  const flagLines = gated.flags.length ? `\n\n⚠️ <b>Risk Flags</b>\n⚠️ ${gated.flags.join("\n⚠️ ")}` : "";
-  const htfLine = payload.htfTrend ? `\n🧭 <b>HTF Trend:</b> <code>${payload.htfTrend}</code>` : "";
-  const swingLine = isSwing && payload.swingTrend ? `\n🌙 <b>1H Structure:</b> <code>${payload.swingTrend}</code> (swing-eligible)` : "";
-  const titleTag = isSwing ? " 🌙 SWING" : "";
+  const checklistLines = scoreResult.points.map(p => `${p.pass === 1 ? "✅" : p.pass === 0.5 ? "➖" : "❌"} <i>${p.label}</i>`).join("\n");
+  const flagLines = gated.flags.length ? `\n\n<b>Risk Flags:</b>\n${gated.flags.map(f => `⚠️ <i>${f}</i>`).join("\n")}` : "";
+  const htfPart = payload.htfTrend ? ` - HTF Trend: <i>${payload.htfTrend.toUpperCase()}</i>` : "";
+  const swingLine = isSwing && payload.swingTrend ? `\n<i>1H Structure: ${payload.swingTrend} (swing-eligible)</i>` : "";
+  const titleTag = isSwing ? " 🌙" : "";
 
   // Actual R-multiple achieved at each target — computed from real
   // levels, not a fixed label. This is what actually varies trade to
@@ -690,23 +689,22 @@ function formatTradeSetup(decision, payload, reasoning) {
     const r1 = Math.abs(levels.tp1Raw - levels.entryMidRaw) / levels.riskRaw;
     const r2 = Math.abs(levels.tp2Raw - levels.entryMidRaw) / levels.riskRaw;
     const r3 = Math.abs(levels.tp3Raw - levels.entryMidRaw) / levels.riskRaw;
-    rMultLine = `\n📐 <b>R achieved:</b> <code>${r1.toFixed(1)}R</code> / <code>${r2.toFixed(1)}R</code> / <code>${r3.toFixed(1)}R</code> (min floor: 3R/5R/8R — actual snaps to real structure when it's closer)`;
+    rMultLine = `\n<i>R achieved: ${r1.toFixed(1)}R / ${r2.toFixed(1)}R / ${r3.toFixed(1)}R (min floor: 3R/5R/8R)</i>`;
   }
 
   return `📊 <b>Trade Setup${titleTag}</b>
-━━━━━━━━━━━━━━━
-<b>${payload.symbol || "—"}</b>
-${dirEmoji} ${scoreResult.direction} bias │ <b>${gated.confidence}</b> <code>${scoreResult.rawScore}/5</code> │ <code>${gated.leverage}</code>
 
-🎯 Entry: <code>${levels.entryZone}</code>
-🥇 TP1: <code>${levels.tp1}</code>  │  🥈 TP2: <code>${levels.tp2}</code>  │  🥉 TP3: <code>${levels.tp3}</code>
-🛑 SL: <code>${levels.stopLoss}</code>${rMultLine}
-${htfLine}${swingLine}
+<b>${payload.symbol || "—"}</b>${htfPart}
+${scoreResult.direction} bias  │  <i>${gated.confidence} ${scoreResult.rawScore}/5</i>  │  <i>${gated.leverage}</i>
 
-✅ <b>Checklist</b>
+Entry: <i>${levels.entryZone}</i>
+Tp1 <i>${levels.tp1}</i>  │  Tp2 <i>${levels.tp2}</i>  │  Tp3 <i>${levels.tp3}</i>
+Stop loss: <i>${levels.stopLoss}</i>${rMultLine}${swingLine}
+
+<b>Checklist:</b>
 ${checklistLines}${flagLines}
 
-📝 <b>Reasoning:</b> ${reasoning}`;
+<b>Reasoning:</b> <i>${reasoning}</i>`;
 }
 
 // ============================================================
