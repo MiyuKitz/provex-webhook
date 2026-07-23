@@ -672,11 +672,19 @@ function formatAlertHeader(payload) {
 // Format the final trade setup — score/levels are already final by
 // this point; reasoning is the only Claude-generated piece.
 // ============================================================
+function titleCase(s) {
+  if (!s) return s;
+  return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
+}
+
 function formatTradeSetup(decision, payload, reasoning) {
   const { scoreResult, gated, levels, isSwing } = decision;
-  const checklistLines = scoreResult.points.map(p => `${p.pass === 1 ? "✅" : p.pass === 0.5 ? "➖" : "❌"} <i>${p.label}</i>`).join("\n");
-  const flagLines = gated.flags.length ? `\n\n<b>Risk Flags:</b>\n${gated.flags.map(f => `⚠️ <i>${f}</i>`).join("\n")}` : "";
-  const htfPart = payload.htfTrend ? ` - HTF Trend: <i>${payload.htfTrend.toUpperCase()}</i>` : "";
+  // Checklist and risk-flag lines stay PLAIN text — only entry/TP/SL
+  // values and the reasoning paragraph are italicized, per the actual
+  // reference format
+  const checklistLines = scoreResult.points.map(p => `${p.pass === 1 ? "✅" : p.pass === 0.5 ? "➖" : "❌"} ${p.label}`).join("\n");
+  const flagLines = gated.flags.length ? `\n\n<b>Risk Flags:</b>\n${gated.flags.map(f => `⚠️ ${f}`).join("\n")}` : "";
+  const htfPart = payload.htfTrend ? ` - HTF Trend: <i>${payload.htfTrend}</i>` : "";
   const swingLine = isSwing && payload.swingTrend ? `\n<i>1H Structure: ${payload.swingTrend} (swing-eligible)</i>` : "";
   const titleTag = isSwing ? " 🌙" : "";
 
@@ -695,7 +703,7 @@ function formatTradeSetup(decision, payload, reasoning) {
   return `📊 <b>Trade Setup${titleTag}</b>
 
 <b>${payload.symbol || "—"}</b>${htfPart}
-${scoreResult.direction} bias  │  <i>${gated.confidence} ${scoreResult.rawScore}/5</i>  │  <i>${gated.leverage}</i>
+${scoreResult.direction} bias  │  <i>${titleCase(gated.confidence)} ${scoreResult.rawScore}/5</i>  │  <i>${gated.leverage}</i>
 
 Entry: <i>${levels.entryZone}</i>
 Tp1 <i>${levels.tp1}</i>  │  Tp2 <i>${levels.tp2}</i>  │  Tp3 <i>${levels.tp3}</i>
