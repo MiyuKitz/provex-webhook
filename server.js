@@ -125,16 +125,17 @@ function bingxSign(queryString) {
 async function bingxRequest(method, path, params) {
   const timestamp = Date.now();
   const allParams = { ...params, timestamp };
-  // Every param value MUST be URL-encoded — stopLoss is a JSON string
-  // containing {, }, ", :, , which are invalid raw characters in a URL
-  // query string or form body. Without encoding, the request itself was
-  // likely malformed enough to get rejected at BingX's edge/gateway
-  // before their actual order logic ever ran — which is exactly why the
-  // error response body kept coming back completely empty instead of a
-  // real JSON error explaining what was wrong.
-  const paramString = Object.keys(allParams).map(k => `${k}=${encodeURIComponent(allParams[k])}`).join("&");
-  const signature = bingxSign(paramString);
-  const signedString = `${paramString}&signature=${signature}`;
+  // Sign the RAW (unencoded) parameter string — BingX recomputes the
+  // signature server-side from the raw values it parses out of the
+  // request, so signing the encoded version (previous attempt) produced
+  // a different signature than what they expected, causing the
+  // "signature mismatch" rejection. The encoded string is only used for
+  // actually transmitting the request (valid URL/body characters), never
+  // for what gets signed.
+  const rawParamString = Object.keys(allParams).map(k => `${k}=${allParams[k]}`).join("&");
+  const signature = bingxSign(rawParamString);
+  const encodedParamString = Object.keys(allParams).map(k => `${k}=${encodeURIComponent(allParams[k])}`).join("&");
+  const signedString = `${encodedParamString}&signature=${signature}`;
   const fullPath = `${path}?${signedString}`;
 
   // Sending the signed params in BOTH the URL query string AND the POST
