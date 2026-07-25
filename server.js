@@ -125,7 +125,14 @@ function bingxSign(queryString) {
 async function bingxRequest(method, path, params) {
   const timestamp = Date.now();
   const allParams = { ...params, timestamp };
-  const paramString = Object.keys(allParams).map(k => `${k}=${allParams[k]}`).join("&");
+  // Every param value MUST be URL-encoded — stopLoss is a JSON string
+  // containing {, }, ", :, , which are invalid raw characters in a URL
+  // query string or form body. Without encoding, the request itself was
+  // likely malformed enough to get rejected at BingX's edge/gateway
+  // before their actual order logic ever ran — which is exactly why the
+  // error response body kept coming back completely empty instead of a
+  // real JSON error explaining what was wrong.
+  const paramString = Object.keys(allParams).map(k => `${k}=${encodeURIComponent(allParams[k])}`).join("&");
   const signature = bingxSign(paramString);
   const signedString = `${paramString}&signature=${signature}`;
   const fullPath = `${path}?${signedString}`;
