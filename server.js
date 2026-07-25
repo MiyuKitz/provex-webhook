@@ -1087,15 +1087,33 @@ ${note}`);
         }
 
         // TRADE — score/levels are already final. Claude only explains.
+        // Tracking and execution ALWAYS run, regardless of tier — this
+        // keeps the honest full-range testing intact. Only the Telegram
+        // notification is gated, so MEDIUM/flagged signals stop reaching
+        // your phone as a "should I take this" decision, without hiding
+        // them from the tracker or BingX.
+        //
+        // "Cleanest tier" = HIGH confidence, perfect 5/5, zero opposition
+        // flags (no BTC/HTF/SMT disagreement, not a repeat-zone signal,
+        // inside kill zone). This is NOT a profit guarantee — it's just
+        // the setup with the fewest known reasons to distrust it right
+        // now. A clean signal can still lose.
+        const oppositionMarkers = ["opposes signal direction", "Repeat signal on the same zone", "early reversal warning", "Outside kill zone"];
+        const isCleanestSignal = decision.gated.confidence === "HIGH"
+          && decision.scoreResult.rawScore === 5
+          && !decision.gated.flags.some(f => oppositionMarkers.some(marker => f.includes(marker)));
+
         const reasoning = await explainDecision(decision, payload);
-        const header = formatAlertHeader(payload);
-        await sendTelegram(header);
-        const planMsg = formatTradeSetup(decision, payload, reasoning);
-        await sendTelegram(planMsg);
+        if (isCleanestSignal) {
+          const header = formatAlertHeader(payload);
+          await sendTelegram(header);
+          const planMsg = formatTradeSetup(decision, payload, reasoning);
+          await sendTelegram(planMsg);
+        }
         logSignal(decision, payload);
         await executeOnBingX(decision, payload);
 
-        console.log("Alert + deterministic plan sent ✅", new Date().toISOString(), "| condition:", condition, "| score:", decision.scoreResult.rawScore, "/5");
+        console.log(isCleanestSignal ? "Clean signal — alert sent + executed ✅" : "Non-clean signal — silent (still logged + executed) 🔕", new Date().toISOString(), "| condition:", condition, "| score:", decision.scoreResult.rawScore, "/5", "| confidence:", decision.gated.confidence);
       } catch (err) {
         console.error("Error:", err.message);
         try { await sendTelegram(`⚠️ <b>Bot error:</b> ${err.message}`); } catch {}
