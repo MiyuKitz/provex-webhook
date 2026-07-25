@@ -125,9 +125,19 @@ function bingxSign(queryString) {
 async function bingxRequest(method, path, params) {
   const timestamp = Date.now();
   const allParams = { ...params, timestamp };
-  const queryString = Object.keys(allParams).map(k => `${k}=${allParams[k]}`).join("&");
-  const signature = bingxSign(queryString);
-  const fullPath = `${path}?${queryString}&signature=${signature}`;
+  const paramString = Object.keys(allParams).map(k => `${k}=${allParams[k]}`).join("&");
+  const signature = bingxSign(paramString);
+  const signedString = `${paramString}&signature=${signature}`;
+  const fullPath = `${path}?${signedString}`;
+
+  // Sending the signed params in BOTH the URL query string AND the POST
+  // body — the first live attempt returned an empty 400 response, which
+  // is consistent with the order endpoint expecting body params rather
+  // than (or in addition to) query params. Rather than guess which
+  // convention BingX's swap v2 API actually uses, sending both is safe:
+  // most REST frameworks read whichever they expect and ignore the rest.
+  const bodyContent = method === "POST" ? signedString : "";
+  const bodyBuffer = Buffer.from(bodyContent, "utf8");
 
   return new Promise((resolve) => {
     const req = https.request({
@@ -137,11 +147,7 @@ async function bingxRequest(method, path, params) {
       headers: {
         "X-BX-APIKEY": BINGX_API_KEY,
         "Content-Type": "application/x-www-form-urlencoded",
-        // All params are in the query string, not a written body — but for
-        // a POST, leaving Content-Length unset entirely is ambiguous and
-        // was very likely why the first live attempt got back an empty
-        // response. Explicitly declaring zero-length body is the fix.
-        "Content-Length": 0,
+        "Content-Length": bodyBuffer.length,
       },
     }, (res) => {
       let data = "";
@@ -160,6 +166,7 @@ async function bingxRequest(method, path, params) {
       });
     });
     req.on("error", (err) => resolve({ error: err.message }));
+    if (bodyContent) req.write(bodyBuffer);
     req.end();
   });
 }
