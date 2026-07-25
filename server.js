@@ -134,12 +134,29 @@ async function bingxRequest(method, path, params) {
       hostname: "open-api-vst.bingx.com",
       path: fullPath,
       method,
-      headers: { "X-BX-APIKEY": BINGX_API_KEY },
+      headers: {
+        "X-BX-APIKEY": BINGX_API_KEY,
+        "Content-Type": "application/x-www-form-urlencoded",
+        // All params are in the query string, not a written body — but for
+        // a POST, leaving Content-Length unset entirely is ambiguous and
+        // was very likely why the first live attempt got back an empty
+        // response. Explicitly declaring zero-length body is the fix.
+        "Content-Length": 0,
+      },
     }, (res) => {
       let data = "";
       res.on("data", (c) => (data += c));
       res.on("end", () => {
-        try { resolve(JSON.parse(data)); } catch { resolve({ error: "Failed to parse BingX response", raw: data }); }
+        // Log status code + raw body every time — if this ever fails again,
+        // the actual diagnosis (401 = signing/auth issue, 400 = bad params,
+        // 404 = wrong path, etc.) will be right here in Railway's logs
+        // instead of a generic parse error with no way to tell what happened.
+        console.log(`BingX response [${res.statusCode}]:`, data.slice(0, 500));
+        try {
+          resolve(JSON.parse(data));
+        } catch {
+          resolve({ error: "Failed to parse BingX response", statusCode: res.statusCode, raw: data });
+        }
       });
     });
     req.on("error", (err) => resolve({ error: err.message }));
