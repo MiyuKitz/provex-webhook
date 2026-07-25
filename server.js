@@ -663,9 +663,18 @@ function computeOBLevels(payload, direction) {
     const sl = obTop + obHeight * 1.5;
     const entryMid = (obTop + obBottom) / 2;
     const risk = sl - entryMid;
-    const tp1 = (pobTop > 0 && pobTop < entryMid) ? pobTop : entryMid - risk;
-    const tp2 = (pobBottom > 0 && pobBottom < tp1) ? pobBottom : entryMid - risk * 2;
-    const tp3 = (swingLow > 0 && swingLow < tp2) ? swingLow : entryMid - risk * 3;
+    // R-multiples are the FLOOR (minimum distance), not a target to snap
+    // toward loosely. A structural level only replaces the floor if it's
+    // genuinely BEYOND that floor — comparing against entryMid alone (the
+    // old bug) let TP1 land inside the entry zone itself whenever a nearby
+    // +OB happened to sit between obBottom and entryMid, which is exactly
+    // the "already hit before you're even filled" problem.
+    const tp1Floor = entryMid - risk;
+    const tp2Floor = entryMid - risk * 2;
+    const tp3Floor = entryMid - risk * 3;
+    const tp1 = (pobTop > 0 && pobTop < tp1Floor) ? pobTop : tp1Floor;
+    const tp2 = (pobBottom > 0 && pobBottom < tp2Floor && pobBottom < tp1) ? pobBottom : tp2Floor;
+    const tp3 = (swingLow > 0 && swingLow < tp3Floor && swingLow < tp2) ? swingLow : tp3Floor;
     return { entryZone: `${fmt(obBottom)}-${fmt(obTop)}`, stopLoss: fmt(sl), tp1: fmt(tp1), tp2: fmt(tp2), tp3: fmt(tp3), entryMidRaw: entryMid, slRaw: sl, tp1Raw: tp1, tp2Raw: tp2, tp3Raw: tp3 };
   } else {
     const obTop = num(payload.obTop), obBottom = num(payload.obBottom);
@@ -675,9 +684,12 @@ function computeOBLevels(payload, direction) {
     const sl = pobBottom - obHeight * 1.5;
     const entryMid = (pobTop + pobBottom) / 2;
     const risk = entryMid - sl;
-    const tp1 = (obBottom > 0 && obBottom > entryMid) ? obBottom : entryMid + risk;
-    const tp2 = (obTop > 0 && obTop > tp1) ? obTop : entryMid + risk * 2;
-    const tp3 = (swingHigh > 0 && swingHigh > tp2) ? swingHigh : entryMid + risk * 3;
+    const tp1Floor = entryMid + risk;
+    const tp2Floor = entryMid + risk * 2;
+    const tp3Floor = entryMid + risk * 3;
+    const tp1 = (obBottom > 0 && obBottom > tp1Floor) ? obBottom : tp1Floor;
+    const tp2 = (obTop > 0 && obTop > tp2Floor && obTop > tp1) ? obTop : tp2Floor;
+    const tp3 = (swingHigh > 0 && swingHigh > tp3Floor && swingHigh > tp2) ? swingHigh : tp3Floor;
     return { entryZone: `${fmt(pobBottom)}-${fmt(pobTop)}`, stopLoss: fmt(sl), tp1: fmt(tp1), tp2: fmt(tp2), tp3: fmt(tp3), entryMidRaw: entryMid, slRaw: sl, tp1Raw: tp1, tp2Raw: tp2, tp3Raw: tp3 };
   }
 }
