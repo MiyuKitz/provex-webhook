@@ -125,28 +125,26 @@ function bingxSign(queryString) {
 async function bingxRequest(method, path, params) {
   const timestamp = Date.now();
   const allParams = { ...params, timestamp };
-  // Sign the RAW (unencoded) parameter string — BingX recomputes the
-  // signature server-side from the raw values it parses out of the
-  // request, so signing the encoded version (previous attempt) produced
-  // a different signature than what they expected, causing the
-  // "signature mismatch" rejection. The encoded string is only used for
-  // actually transmitting the request (valid URL/body characters), never
-  // for what gets signed.
-  const rawParamString = Object.keys(allParams).map(k => `${k}=${allParams[k]}`).join("&");
+  // Keys MUST be sorted (alphabetical) before building the param string —
+  // this is standard convention for Binance-style signed APIs (which
+  // BingX explicitly models itself on), and I'd missed it entirely until
+  // now. The server reconstructs the signature from parameters in a
+  // consistent order on their end; if our order doesn't match theirs,
+  // the signature comes out different even with otherwise-correct values
+  // — which is exactly the repeated "signature mismatch" symptom, and
+  // wasn't fixed by the raw-vs-encoded change alone since that was a
+  // separate, independent issue.
+  const sortedKeys = Object.keys(allParams).sort();
+  const rawParamString = sortedKeys.map(k => `${k}=${allParams[k]}`).join("&");
   const signature = bingxSign(rawParamString);
-  const encodedParamString = Object.keys(allParams).map(k => `${k}=${encodeURIComponent(allParams[k])}`).join("&");
+  const encodedParamString = sortedKeys.map(k => `${k}=${encodeURIComponent(allParams[k])}`).join("&");
   const signedString = `${encodedParamString}&signature=${signature}`;
   const fullPath = `${path}?${signedString}`;
 
-  // Sending the signed params in BOTH the URL query string AND the POST
-  // body — the first live attempt returned an empty 400 response, which
-  // is consistent with the order endpoint expecting body params rather
-  // than (or in addition to) query params. Rather than guess which
-  // convention BingX's swap v2 API actually uses, sending both is safe:
-  // most REST frameworks read whichever they expect and ignore the rest.
-  const bodyContent = method === "POST" ? signedString : "";
-  const bodyBuffer = Buffer.from(bodyContent, "utf8");
-
+  // Simplified back to query-string-only, no request body — sending the
+  // same params in both places at once (previous attempt) is non-standard
+  // for this API style and may have added its own confusion on top of
+  // the ordering bug. Standard convention here is query-string-only.
   return new Promise((resolve) => {
     const req = https.request({
       hostname: "open-api-vst.bingx.com",
@@ -155,7 +153,7 @@ async function bingxRequest(method, path, params) {
       headers: {
         "X-BX-APIKEY": BINGX_API_KEY,
         "Content-Type": "application/x-www-form-urlencoded",
-        "Content-Length": bodyBuffer.length,
+        "Content-Length": 0,
       },
     }, (res) => {
       let data = "";
@@ -174,7 +172,6 @@ async function bingxRequest(method, path, params) {
       });
     });
     req.on("error", (err) => resolve({ error: err.message }));
-    if (bodyContent) req.write(bodyBuffer);
     req.end();
   });
 }
