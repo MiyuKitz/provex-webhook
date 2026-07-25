@@ -1,10 +1,255 @@
 const http = require("http");
 const https = require("https");
+const fs = require("fs");
+const path = require("path");
 
 const TELEGRAM_TOKEN    = process.env.TELEGRAM_TOKEN;
 const TELEGRAM_CHAT_ID  = process.env.TELEGRAM_CHAT_ID;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const PORT = process.env.PORT || 3000;
+
+// BingX demo (VST) execution — optional. If these aren't set, execution
+// is silently skipped and everything else (Telegram, tracker) keeps
+// working exactly as before. Demo base URL is a genuinely separate
+// sandbox from live trading — confirmed via BingX's own API structure.
+const BINGX_API_KEY    = process.env.BINGX_API_KEY;
+const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
+const BINGX_BASE_URL   = "https://open-api-vst.bingx.com"; // demo/VST only, never live
+
+// ============================================================
+// OUTCOME TRACKER — v1 (new)
+//
+// SCOPE, DELIBERATELY: this logs every real TRADE signal fired, with
+// enough fields to later match against your actual exchange trade
+// history (MEXC export) by symbol + direction + approximate time. It
+// does NOT poll price after firing, does NOT know whether TP/SL was
+// hit, and does NOT track MFE/MAE — that's a genuinely different,
+// bigger system (Tracker v2, needs a position-state-machine + continuous
+// price polling) and was deliberately scoped out for now.
+//
+// IMPORTANT DURABILITY CAVEAT: this writes to a local file on Railway's
+// filesystem, which is EPHEMERAL — a redeploy (which happens every time
+// you push new code) wipes this file. This is fine for now since v1 is
+// meant to be a cheap starting point, but it means: (a) don't treat this
+// as a permanent record without exporting it periodically, and (b) if
+// you want real durability before v2 exists, either export via the
+// /signals or /signals.csv endpoints regularly, or add a Railway volume
+// (persistent storage — check Railway's current docs/pricing for this,
+// since it may require a paid plan) so the file survives redeploys.
+// ============================================================
+const SIGNAL_LOG_FILE = path.join(__dirname, "signals.jsonl");
+
+function logSignal(decision, payload) {
+  try {
+    const { type, scoreResult, gated, levels, isSwing } = decision;
+    const entry = {
+      loggedAt: new Date().toISOString(),
+      symbol: payload.symbol || "—",
+      condition: payload.condition || "",
+      type,
+      isSwing: !!isSwing,
+      direction: scoreResult.direction,
+      rawScore: scoreResult.rawScore,
+      confidence: gated.confidence,
+      leverage: gated.leverage,
+      entryZone: levels.entryZone,
+      stopLoss: levels.stopLoss,
+      tp1: levels.tp1,
+      tp2: levels.tp2,
+      tp3: levels.tp3,
+      flags: gated.flags,
+      checklist: scoreResult.points.map(p => ({ label: p.label, pass: p.pass })),
+      htfTrend: payload.htfTrend || null,
+      btcTrend: payload.btcTrend || null,
+      smtBias: payload.smtBias || null,
+      killzone: bool(payload.killzone),
+      // Outcome fields — left null on purpose. This is where you'd fill
+      // in what actually happened once you match this against your real
+      // trade history, either by hand or with a future v2 matching step.
+      outcome: null,       // "TP1" | "TP2" | "TP3" | "SL" | "manual_close" | "not_taken"
+      realizedR: null,     // actual R multiple achieved, if known
+      notes: null,
+    };
+    fs.appendFileSync(SIGNAL_LOG_FILE, JSON.stringify(entry) + "\n");
+  } catch (err) {
+    // Logging must never break the actual signal — if this fails, the
+    // Telegram message still goes out regardless
+    console.error("Signal logging failed (non-fatal):", err.message);
+  }
+}
+
+function readSignalLog() {
+  try {
+    if (!fs.existsSync(SIGNAL_LOG_FILE)) return [];
+    const lines = fs.readFileSync(SIGNAL_LOG_FILE, "utf8").split("\n").filter(Boolean);
+    return lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function signalsToCSV(signals) {
+  if (!signals.length) return "loggedAt,symbol,type,direction,rawScore,confidence,leverage,entryZone,stopLoss,tp1,tp2,tp3,htfTrend,btcTrend,smtBias,killzone,outcome,realizedR\n";
+  const header = ["loggedAt","symbol","type","direction","rawScore","confidence","leverage","entryZone","stopLoss","tp1","tp2","tp3","htfTrend","btcTrend","smtBias","killzone","outcome","realizedR"];
+  const rows = signals.map(s => header.map(h => {
+    const v = s[h];
+    if (v === null || v === undefined) return "";
+    const str = String(v).replace(/"/g, '""');
+    return `"${str}"`;
+  }).join(","));
+  return header.join(",") + "\n" + rows.join("\n") + "\n";
+}
+
+// ============================================================
+// BINGX DEMO (VST) EXECUTION — new
+//
+// HONEST STATUS: this is built to BingX's documented API structure and
+// signing scheme, but has NOT been tested against a live BingX account
+// yet (no credentials available here to test with). Treat this exactly
+// like every first-pass feature tonight — expect it may need a real-
+// world debugging round once actual demo credentials are in place,
+// same as the OB anchor logic or the zone cooldown fix both needed
+// after their first live test. Don't assume it's flawless on the first
+// real signal.
+//
+// SIZING RULE (per Krysie's instruction): execute on EVERY fired TRADE
+// signal, no filtering by confidence tier or flags — the point is to
+// honestly test the bot's own full range of output, not cherry-pick.
+// Margin scales $900 (MEDIUM) to $2000 (HIGH), leverage scales 30x
+// (MEDIUM) to 40x (HIGH). TP1/TP2/TP3 split the position 40/30/30.
+// ============================================================
+function bingxSign(queryString) {
+  return require("crypto").createHmac("sha256", BINGX_API_SECRET).update(queryString).digest("hex");
+}
+
+async function bingxRequest(method, path, params) {
+  const timestamp = Date.now();
+  const allParams = { ...params, timestamp };
+  const queryString = Object.keys(allParams).map(k => `${k}=${allParams[k]}`).join("&");
+  const signature = bingxSign(queryString);
+  const fullPath = `${path}?${queryString}&signature=${signature}`;
+
+  return new Promise((resolve) => {
+    const req = https.request({
+      hostname: "open-api-vst.bingx.com",
+      path: fullPath,
+      method,
+      headers: { "X-BX-APIKEY": BINGX_API_KEY },
+    }, (res) => {
+      let data = "";
+      res.on("data", (c) => (data += c));
+      res.on("end", () => {
+        try { resolve(JSON.parse(data)); } catch { resolve({ error: "Failed to parse BingX response", raw: data }); }
+      });
+    });
+    req.on("error", (err) => resolve({ error: err.message }));
+    req.end();
+  });
+}
+
+// TradingView sends "SUIUSDT" — BingX swap symbols use "SUI-USDT"
+function toBingXSymbol(symbol) {
+  if (!symbol) return symbol;
+  if (symbol.endsWith("USDT") && !symbol.includes("-")) {
+    return symbol.slice(0, -4) + "-USDT";
+  }
+  return symbol;
+}
+
+function computeBingXSizing(confidence) {
+  // Confidence is always exactly "HIGH" or "MEDIUM" by this point (NO_TRADE
+  // signals never reach execution) — simple, deterministic, matches the
+  // same two-tier scaling pattern already used for leverage bands.
+  return confidence === "HIGH"
+    ? { marginUSDT: 2000, leverage: 40 }
+    : { marginUSDT: 900, leverage: 30 };
+}
+
+async function executeOnBingX(decision, payload) {
+  if (!BINGX_API_KEY || !BINGX_API_SECRET) return; // not configured — silent no-op, nothing else affected
+
+  try {
+    const { scoreResult, gated, levels } = decision;
+    const symbol = toBingXSymbol(payload.symbol);
+    const direction = scoreResult.direction; // "Short" | "Long"
+    const positionSide = direction === "Short" ? "SHORT" : "LONG";
+    const entrySide = direction === "Short" ? "SELL" : "BUY";
+    const exitSide = direction === "Short" ? "BUY" : "SELL"; // opposite side, reduceOnly, to close
+
+    const { marginUSDT, leverage } = computeBingXSizing(gated.confidence);
+    const entryPrice = levels.entryMidRaw;
+    if (!entryPrice || entryPrice <= 0) {
+      console.error("BingX execution skipped — invalid entry price", entryPrice);
+      return;
+    }
+    const notional = marginUSDT * leverage;
+    // Known simplification: quantity precision varies per symbol on BingX
+    // and isn't queried here (would need an extra exchangeInfo call per
+    // symbol). Rounded to 3 decimals as a reasonable default — if BingX
+    // rejects an order for invalid precision on a specific symbol, this
+    // is the first place to look.
+    const quantity = Number((notional / entryPrice).toFixed(3));
+
+    // 1) Set leverage for this symbol/position side before opening
+    const leverageRes = await bingxRequest("POST", "/openApi/swap/v2/trade/leverage", {
+      symbol, side: positionSide, leverage,
+    });
+    console.log("BingX set leverage:", JSON.stringify(leverageRes));
+
+    // 2) Open the position — market entry with stop-loss attached directly
+    // (real protection from the moment the order fills, not a separate
+    // call placed after — avoids a gap where the position is briefly
+    // unprotected)
+    const entryRes = await bingxRequest("POST", "/openApi/swap/v2/trade/order", {
+      symbol,
+      side: entrySide,
+      positionSide,
+      type: "MARKET",
+      quantity,
+      stopLoss: JSON.stringify({ type: "STOP_MARKET", stopPrice: levels.slRaw, price: levels.slRaw }),
+    });
+    console.log("BingX entry order:", JSON.stringify(entryRes));
+
+    if (entryRes.error || entryRes.code !== 0) {
+      await sendTelegram(`⚠️ <b>BingX execution failed</b>\nSymbol: ${symbol}\n${JSON.stringify(entryRes).slice(0, 300)}`);
+      return;
+    }
+
+    // 3) Partial take-profit orders — 40% at TP1, 30% at TP2, 30% at TP3,
+    // each a separate reduce-only LIMIT order (BingX's own takeProfit
+    // param only supports a single price, not a 3-tier split)
+    const tp1Qty = Number((quantity * 0.4).toFixed(3));
+    const tp2Qty = Number((quantity * 0.3).toFixed(3));
+    const tp3Qty = Number((quantity - tp1Qty - tp2Qty).toFixed(3)); // remainder, avoids rounding leftover
+
+    const tpTargets = [
+      { price: levels.tp1Raw ?? null, qty: tp1Qty, label: "TP1" },
+      { price: levels.tp2Raw ?? null, qty: tp2Qty, label: "TP2" },
+      { price: levels.tp3Raw ?? null, qty: tp3Qty, label: "TP3" },
+    ];
+
+    const tpResults = [];
+    for (const tp of tpTargets) {
+      if (!tp.price || tp.price <= 0) { tpResults.push(`${tp.label}: skipped (no price)`); continue; }
+      const res = await bingxRequest("POST", "/openApi/swap/v2/trade/order", {
+        symbol,
+        side: exitSide,
+        positionSide,
+        type: "LIMIT",
+        quantity: tp.qty,
+        price: tp.price,
+        reduceOnly: true,
+      });
+      tpResults.push(`${tp.label}: ${res.code === 0 ? "placed" : JSON.stringify(res).slice(0, 100)}`);
+    }
+
+    await sendTelegram(`✅ <b>BingX demo execution</b>\n${symbol} ${direction} │ ${marginUSDT} VST margin │ ${leverage}x\nQty: ${quantity}\n${tpResults.join("\n")}`);
+    console.log("BingX execution complete", symbol, direction, "| TP results:", tpResults);
+  } catch (err) {
+    console.error("BingX execution error (non-fatal):", err.message);
+    try { await sendTelegram(`⚠️ <b>BingX execution error:</b> ${err.message}`); } catch {}
+  }
+}
 
 // ============================================================
 // ARCHITECTURE NOTE (v10)
@@ -397,7 +642,7 @@ function computeOBLevels(payload, direction) {
     const tp1 = (pobTop > 0 && pobTop < entryMid) ? pobTop : entryMid - risk;
     const tp2 = (pobBottom > 0 && pobBottom < tp1) ? pobBottom : entryMid - risk * 2;
     const tp3 = (swingLow > 0 && swingLow < tp2) ? swingLow : entryMid - risk * 3;
-    return { entryZone: `${fmt(obBottom)}-${fmt(obTop)}`, stopLoss: fmt(sl), tp1: fmt(tp1), tp2: fmt(tp2), tp3: fmt(tp3), entryMidRaw: entryMid, slRaw: sl };
+    return { entryZone: `${fmt(obBottom)}-${fmt(obTop)}`, stopLoss: fmt(sl), tp1: fmt(tp1), tp2: fmt(tp2), tp3: fmt(tp3), entryMidRaw: entryMid, slRaw: sl, tp1Raw: tp1, tp2Raw: tp2, tp3Raw: tp3 };
   } else {
     const obTop = num(payload.obTop), obBottom = num(payload.obBottom);
     const pobTop = num(payload.pobTop), pobBottom = num(payload.pobBottom);
@@ -409,7 +654,7 @@ function computeOBLevels(payload, direction) {
     const tp1 = (obBottom > 0 && obBottom > entryMid) ? obBottom : entryMid + risk;
     const tp2 = (obTop > 0 && obTop > tp1) ? obTop : entryMid + risk * 2;
     const tp3 = (swingHigh > 0 && swingHigh > tp2) ? swingHigh : entryMid + risk * 3;
-    return { entryZone: `${fmt(pobBottom)}-${fmt(pobTop)}`, stopLoss: fmt(sl), tp1: fmt(tp1), tp2: fmt(tp2), tp3: fmt(tp3), entryMidRaw: entryMid, slRaw: sl };
+    return { entryZone: `${fmt(pobBottom)}-${fmt(pobTop)}`, stopLoss: fmt(sl), tp1: fmt(tp1), tp2: fmt(tp2), tp3: fmt(tp3), entryMidRaw: entryMid, slRaw: sl, tp1Raw: tp1, tp2Raw: tp2, tp3Raw: tp3 };
   }
 }
 
@@ -426,13 +671,13 @@ function computeBreakoutLevels(payload, direction) {
     const tp1 = extreme - legRange * 1.0;
     const tp2 = extreme - legRange * 1.5;
     const tp3 = extreme - legRange * 2.5;
-    return { entryZone: `${fmt(zoneBottom)}-${fmt(zoneTop)}`, stopLoss: fmt(sl), tp1: fmt(tp1), tp2: fmt(tp2), tp3: fmt(tp3), entryMidRaw: entryMid, slRaw: sl };
+    return { entryZone: `${fmt(zoneBottom)}-${fmt(zoneTop)}`, stopLoss: fmt(sl), tp1: fmt(tp1), tp2: fmt(tp2), tp3: fmt(tp3), entryMidRaw: entryMid, slRaw: sl, tp1Raw: tp1, tp2Raw: tp2, tp3Raw: tp3 };
   } else {
     const sl = origin - legRange * 0.05;
     const tp1 = extreme + legRange * 1.0;
     const tp2 = extreme + legRange * 1.5;
     const tp3 = extreme + legRange * 2.5;
-    return { entryZone: `${fmt(zoneBottom)}-${fmt(zoneTop)}`, stopLoss: fmt(sl), tp1: fmt(tp1), tp2: fmt(tp2), tp3: fmt(tp3), entryMidRaw: entryMid, slRaw: sl };
+    return { entryZone: `${fmt(zoneBottom)}-${fmt(zoneTop)}`, stopLoss: fmt(sl), tp1: fmt(tp1), tp2: fmt(tp2), tp3: fmt(tp3), entryMidRaw: entryMid, slRaw: sl, tp1Raw: tp1, tp2Raw: tp2, tp3Raw: tp3 };
   }
 }
 
@@ -723,6 +968,24 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200); res.end("Trade alert server v10 — deterministic scoring, Claude explains only, signal-only (no execution) ✅"); return;
   }
 
+  // -- Outcome tracker v1 export endpoints (new). Visit these in a
+  // browser or curl to pull everything logged so far — worth doing
+  // periodically given Railway's filesystem is ephemeral (a redeploy
+  // wipes this file), so treat these as "export before you forget",
+  // not a permanent archive.
+  if (req.method === "GET" && req.url === "/signals") {
+    const signals = readSignalLog();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ count: signals.length, signals }, null, 2));
+    return;
+  }
+  if (req.method === "GET" && req.url === "/signals.csv") {
+    const signals = readSignalLog();
+    res.writeHead(200, { "Content-Type": "text/csv", "Content-Disposition": "attachment; filename=signals.csv" });
+    res.end(signalsToCSV(signals));
+    return;
+  }
+
   if (req.method === "POST" && req.url === "/webhook") {
     let body = "";
     req.on("data", (c) => (body += c));
@@ -788,6 +1051,8 @@ ${note}`);
         await sendTelegram(header);
         const planMsg = formatTradeSetup(decision, payload, reasoning);
         await sendTelegram(planMsg);
+        logSignal(decision, payload);
+        await executeOnBingX(decision, payload);
 
         console.log("Alert + deterministic plan sent ✅", new Date().toISOString(), "| condition:", condition, "| score:", decision.scoreResult.rawScore, "/5");
       } catch (err) {
