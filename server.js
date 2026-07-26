@@ -186,12 +186,34 @@ function toBingXSymbol(symbol) {
 }
 
 function computeBingXSizing(confidence) {
-  // Confidence is always exactly "HIGH" or "MEDIUM" by this point (NO_TRADE
-  // signals never reach execution) — simple, deterministic, matches the
-  // same two-tier scaling pattern already used for leverage bands.
+  // Leverage lowered from the original 30x/40x bands to stay compatible
+  // with the new fixed 5% SL. Liquidation is roughly 100/leverage% —
+  // at the old 40x, that's ~2.5%, meaning a 5% stop would sit BEYOND
+  // liquidation and the position would get liquidated before the stop
+  // ever triggers, making the stop-loss purely theoretical. At 15x,
+  // liquidation is ~6.7% — genuinely beyond the 5% stop with a real
+  // safety margin, so the stop stays meaningful. Confidence is always
+  // exactly "HIGH" or "MEDIUM" by this point (NO_TRADE signals never
+  // reach execution).
   return confidence === "HIGH"
-    ? { marginUSDT: 2000, leverage: 40 }
-    : { marginUSDT: 900, leverage: 30 };
+    ? { marginUSDT: 2000, leverage: 15 }
+    : { marginUSDT: 900, leverage: 10 };
+}
+
+// ============================================================
+// CONFIDENCE-TIER EMOJI (new) — at-a-glance indicator, most useful on
+// the BingX execution confirmations specifically, since those fire for
+// EVERY trade regardless of tier (execution isn't gated by the
+// cleanest-tier Telegram filter), unlike the full reasoning card which
+// only ever shows for the cleanest tier anyway.
+// 🟢 = HIGH confidence, perfect 5/5 (the cleanest tier)
+// 🟠 = HIGH confidence, 4/5 (one point short of clean)
+// 🔴 = MEDIUM confidence (lowest tier that still executes)
+// ============================================================
+function confidenceEmoji(confidence, rawScore) {
+  if (confidence === "HIGH" && rawScore === 5) return "🟢";
+  if (confidence === "HIGH") return "🟠";
+  return "🔴";
 }
 
 async function executeOnBingX(decision, payload) {
@@ -278,7 +300,7 @@ async function executeOnBingX(decision, payload) {
       tpResults.push(`${tp.label}: ${res.code === 0 ? "placed" : JSON.stringify(res).slice(0, 100)}`);
     }
 
-    await sendTelegram(`✅ <b>BingX demo execution</b>\n${symbol} ${direction} │ ${marginUSDT} VST margin │ ${leverage}x\nQty: ${quantity}\n${tpResults.join("\n")}`);
+    await sendTelegram(`${confidenceEmoji(gated.confidence, scoreResult.rawScore)} <b>BingX demo execution</b>\n${symbol} ${direction} │ ${marginUSDT} VST margin │ ${leverage}x\nQty: ${quantity}\n${tpResults.join("\n")}`);
     console.log("BingX execution complete", symbol, direction, "| TP results:", tpResults);
   } catch (err) {
     console.error("BingX execution error (non-fatal):", err.message);
@@ -531,13 +553,19 @@ function applyRiskGates(payload, scoreResult, killzoneActive, isSwing = false) {
   }
 
   let confidence = rawScore >= 4 ? "HIGH" : "MEDIUM";
-  // Swing signals use a separate 30x-70x band per Krysie's stated preference
-  // (never below 30x for a swing trade, scaled up to 70x on full confidence).
-  // Non-swing (15M-only) signals keep the original scalp bands unchanged.
+  // Swing signals use a separate 30x-70x band, untouched — their SL
+  // formula (computeSwingLevels) wasn't changed, still OB-height-based.
+  // Non-swing (plain scalp) bands lowered from the old 10x-80x range
+  // because the SL is now a fixed 5% price distance (per Krysie's
+  // formula) instead of a structural OB-height stop. At the old 50x-80x,
+  // liquidation (~100/leverage%) sits well INSIDE a 5% stop, meaning
+  // the position would get liquidated before the stop-loss could ever
+  // trigger — making the stop purely theoretical. These bands keep
+  // liquidation genuinely beyond the 5% stop with real safety margin.
   let leverage = isSwing
     ? (confidence === "HIGH" ? (rawScore === 5 ? "50x-70x" : "30x-50x") : "30x-40x")
-    : (confidence === "HIGH" ? (rawScore === 5 ? "50x-80x" : "25x-50x") : "10x-25x");
-  const floorLeverage = isSwing ? "30x-40x" : "10x-25x";
+    : (confidence === "HIGH" ? (rawScore === 5 ? "12x-15x" : "8x-12x") : "5x-8x");
+  const floorLeverage = isSwing ? "30x-40x" : "5x-8x";
 
   const flags = [];
   const htfTrend  = payload.htfTrend || "Unknown";
@@ -665,14 +693,24 @@ function computeSwingLevels(payload, direction) {
   }
 }
 
+// Fixed stop-loss %, applied as a straight price distance regardless of
+// leverage — same rule at 2x or 40x, per Krysie's formula ("5% of your
+// leveraged amount" mathematically reduces to a flat 5% price move,
+// since leverage only changes how much of your margin that % represents,
+// not the price distance itself). Kept as a named constant since it's
+// referenced from more than one place (levels + leverage sizing).
+const FIXED_SL_PCT = 0.05;
+
 function computeOBLevels(payload, direction) {
   if (direction === "Short") {
     const obTop = num(payload.obTop), obBottom = num(payload.obBottom);
     const pobTop = num(payload.pobTop), pobBottom = num(payload.pobBottom);
     const swingLow = num(payload.swingLow);
-    const obHeight = obTop - obBottom;
-    const sl = obTop + obHeight * 1.5;
     const entryMid = (obTop + obBottom) / 2;
+    // Fixed 5% SL instead of OB-height × 1.5 — this is also why TP1/2/3
+    // now come out meaningfully wider: they're R-multiples of THIS risk,
+    // and a narrow OB used to make risk (and everything downstream) tiny.
+    const sl = entryMid * (1 + FIXED_SL_PCT);
     const risk = sl - entryMid;
     // R-multiples are the FLOOR (minimum distance), not a target to snap
     // toward loosely. A structural level only replaces the floor if it's
@@ -691,9 +729,8 @@ function computeOBLevels(payload, direction) {
     const obTop = num(payload.obTop), obBottom = num(payload.obBottom);
     const pobTop = num(payload.pobTop), pobBottom = num(payload.pobBottom);
     const swingHigh = num(payload.swingHigh);
-    const obHeight = pobTop - pobBottom;
-    const sl = pobBottom - obHeight * 1.5;
     const entryMid = (pobTop + pobBottom) / 2;
+    const sl = entryMid * (1 - FIXED_SL_PCT);
     const risk = entryMid - sl;
     const tp1Floor = entryMid + risk;
     const tp2Floor = entryMid + risk * 2;
@@ -760,7 +797,7 @@ function buildDecision(payload) {
     if (zoneCheck.isRepeat) {
       gated.confidence = "MEDIUM";
       const topOfBand = parseInt(gated.leverage.split("-")[1], 10);
-      if (topOfBand > 40) gated.leverage = isSwing ? "30x-40x" : "10x-25x";
+      if (topOfBand > 40) gated.leverage = floorLeverage;
       gated.flags.push(`Repeat signal on the same zone (attempt #${zoneCheck.count} within the cooldown window) — needing multiple retests to hold is a lower-conviction sign, confidence capped regardless of this bar's individual flags`);
     }
   }
