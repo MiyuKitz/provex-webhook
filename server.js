@@ -201,7 +201,13 @@ async function executeOnBingX(decision, payload) {
     const { scoreResult, gated, levels } = decision;
     const symbol = toBingXSymbol(payload.symbol);
     const direction = scoreResult.direction; // "Short" | "Long"
-    const positionSide = direction === "Short" ? "SHORT" : "LONG";
+    // positionSide is ALWAYS "BOTH" for a One-way mode account — LONG/SHORT
+    // values are only valid in Hedge Mode (which allows simultaneous long +
+    // short positions on the same symbol). In One-way mode, direction is
+    // controlled purely by "side" (BUY/SELL), which is exactly what the
+    // "In the One-way mode, the 'PositionSide' field can only be set to
+    // BOTH" rejection was telling us.
+    const positionSide = "BOTH";
     const entrySide = direction === "Short" ? "SELL" : "BUY";
     const exitSide = direction === "Short" ? "BUY" : "SELL"; // opposite side, reduceOnly, to close
 
