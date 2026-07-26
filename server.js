@@ -39,7 +39,7 @@ const BINGX_BASE_URL   = "https://open-api-vst.bingx.com"; // demo/VST only, nev
 // ============================================================
 const SIGNAL_LOG_FILE = path.join(__dirname, "signals.jsonl");
 
-function logSignal(decision, payload) {
+function logSignal(decision, payload, execResult) {
   try {
     const { type, scoreResult, gated, levels, isSwing } = decision;
     const entry = {
@@ -63,9 +63,17 @@ function logSignal(decision, payload) {
       btcTrend: payload.btcTrend || null,
       smtBias: payload.smtBias || null,
       killzone: bool(payload.killzone),
-      // Outcome fields — left null on purpose. This is where you'd fill
-      // in what actually happened once you match this against your real
-      // trade history, either by hand or with a future v2 matching step.
+      // Execution tracking — populated only if BingX execution actually
+      // succeeded and returned an order ID. This is what makes the
+      // outcome-polling step below possible at all; without a real order
+      // ID there's nothing to check back on.
+      bingxOrderId: execResult?.bingxOrderId || null,
+      bingxSymbol: execResult?.bingxSymbol || null,
+      bingxTpOrderIds: execResult?.tpOrderIds || null,
+      // Outcome fields — left null on purpose. Auto-filled by
+      // checkOpenPositions() below once the entry order + TP orders
+      // resolve, OR fillable by hand if you're cross-referencing your
+      // own trade history in the meantime.
       outcome: null,       // "TP1" | "TP2" | "TP3" | "SL" | "manual_close" | "not_taken"
       realizedR: null,     // actual R multiple achieved, if known
       notes: null,
@@ -86,6 +94,119 @@ function readSignalLog() {
   } catch {
     return [];
   }
+}
+
+function writeSignalLog(signals) {
+  try {
+    const lines = signals.map(s => JSON.stringify(s)).join("\n") + (signals.length ? "\n" : "");
+    fs.writeFileSync(SIGNAL_LOG_FILE, lines);
+  } catch (err) {
+    console.error("Failed to rewrite signal log (non-fatal):", err.message);
+  }
+}
+
+// ============================================================
+// CLOSING THE LOOP — checkOpenPositions (new)
+//
+// HONEST SCOPE: this checks back on real BingX orders (via order IDs
+// captured at execution time) and auto-fills the tracker's outcome
+// field when a TP order actually fills. This is genuinely new — before
+// tonight, nothing ever checked back on a trade after it fired.
+//
+// What this does NOT yet do: distinctly detect a stop-loss hit. The SL
+// is attached directly to the entry order as a conditional trigger, not
+// tracked as its own separately queryable order ID in the current code
+// — so if none of the TPs ever fill and the position later closes, that
+// most likely means SL was hit, but this version doesn't confirm that
+// automatically yet. That's the next real increment, not built tonight.
+//
+// Field paths for reading BingX's order-status response are a
+// best-informed guess, not confirmed against a real response yet —
+// expect this may need a debugging round the same way order placement
+// did, once it actually runs against live orders.
+// ============================================================
+async function checkOpenPositions() {
+  if (!BINGX_API_KEY || !BINGX_API_SECRET) return;
+  const signals = readSignalLog();
+  const openSignals = signals.filter(s => s.outcome === null && s.bingxOrderId && s.bingxSymbol);
+  if (!openSignals.length) return;
+
+  let anyUpdated = false;
+  for (const sig of openSignals) {
+    try {
+      // First confirm the entry itself actually filled — a signal whose
+      // entry never filled shouldn't be checked against TP orders at all
+      const entryCheck = await bingxRequest("GET", "/openApi/swap/v2/trade/order", {
+        symbol: sig.bingxSymbol, orderId: sig.bingxOrderId,
+      });
+      console.log(`Checked entry order ${sig.bingxOrderId} (${sig.bingxSymbol}):`, JSON.stringify(entryCheck).slice(0, 300));
+      const entryOrder = entryCheck.data?.order || entryCheck.data || entryCheck;
+      const entryStatus = entryOrder?.status;
+
+      if (entryStatus === "CANCELED" || entryStatus === "EXPIRED" || entryStatus === "FAILED") {
+        sig.outcome = "not_taken";
+        sig.notes = "Entry order never filled.";
+        anyUpdated = true;
+        continue;
+      }
+      if (entryStatus !== "FILLED") continue; // still pending, check again next cycle
+
+      // Entry confirmed filled — now check each TP order to see if any hit
+      if (sig.bingxTpOrderIds) {
+        for (const [label, orderId] of Object.entries(sig.bingxTpOrderIds)) {
+          const tpCheck = await bingxRequest("GET", "/openApi/swap/v2/trade/order", {
+            symbol: sig.bingxSymbol, orderId,
+          });
+          const tpOrder = tpCheck.data?.order || tpCheck.data || tpCheck;
+          if (tpOrder?.status === "FILLED") {
+            sig.outcome = label; // "TP1" | "TP2" | "TP3"
+            sig.notes = `${label} order confirmed filled via BingX. SL-vs-TP distinction for remaining unresolved signals still needs the next increment (see function comment).`;
+            anyUpdated = true;
+            break;
+          }
+        }
+      }
+    } catch (err) {
+      console.error(`Failed to check signal (order ${sig.bingxOrderId}):`, err.message);
+    }
+  }
+  if (anyUpdated) writeSignalLog(signals);
+}
+
+// ============================================================
+// STATS — aggregate breakdowns from whatever outcome data exists
+// (auto-filled by checkOpenPositions above, or hand-filled by you while
+// the fuller automation catches up). This is the actual "what does the
+// bot lack" answer — real counts, not guesses, though small sample
+// sizes early on mean don't over-read a handful of results yet.
+// ============================================================
+function computeStats(signals) {
+  const resolved = signals.filter(s => s.outcome && s.outcome !== "not_taken");
+  const withOutcome = (arr) => arr.filter(s => s.outcome);
+
+  function winRate(arr) {
+    const won = arr.filter(s => s.outcome === "TP1" || s.outcome === "TP2" || s.outcome === "TP3").length;
+    const lost = arr.filter(s => s.outcome === "SL").length;
+    const total = won + lost;
+    return { total, won, lost, winRatePct: total > 0 ? Number((won / total * 100).toFixed(1)) : null };
+  }
+
+  const htfOpposed = resolved.filter(s => (s.flags || []).some(f => f.includes("HTF trend") && f.includes("opposes")));
+  const htfAligned = resolved.filter(s => !(s.flags || []).some(f => f.includes("HTF trend") && f.includes("opposes")));
+  const btcOpposed = resolved.filter(s => (s.flags || []).some(f => f.includes("BTC trend opposes")));
+  const btcAligned = resolved.filter(s => !(s.flags || []).some(f => f.includes("BTC trend opposes")));
+  const repeatZone = resolved.filter(s => (s.flags || []).some(f => f.includes("Repeat signal on the same zone")));
+  const freshZone = resolved.filter(s => !(s.flags || []).some(f => f.includes("Repeat signal on the same zone")));
+
+  return {
+    totalLogged: signals.length,
+    totalResolved: resolved.length,
+    overall: winRate(resolved),
+    byHtfOpposition: { opposed: winRate(htfOpposed), aligned: winRate(htfAligned) },
+    byBtcOpposition: { opposed: winRate(btcOpposed), aligned: winRate(btcAligned) },
+    byZoneRepeat: { repeat: winRate(repeatZone), fresh: winRate(freshZone) },
+    note: "Small sample sizes early on will look noisy — this is descriptive, not statistically confirmed until each bucket has a real sample (see docs/HYPOTHESES.md).",
+  };
 }
 
 function signalsToCSV(signals) {
@@ -286,6 +407,7 @@ async function executeOnBingX(decision, payload) {
     ];
 
     const tpResults = [];
+    const tpOrderIds = {};
     for (const tp of tpTargets) {
       if (!tp.price || tp.price <= 0) { tpResults.push(`${tp.label}: skipped (no price)`); continue; }
       const res = await bingxRequest("POST", "/openApi/swap/v2/trade/order", {
@@ -298,13 +420,25 @@ async function executeOnBingX(decision, payload) {
         reduceOnly: true,
       });
       tpResults.push(`${tp.label}: ${res.code === 0 ? "placed" : JSON.stringify(res).slice(0, 100)}`);
+      // Capture the TP order's ID too — this is what makes it possible to
+      // later tell WHICH target actually got hit, not just whether the
+      // entry filled. Field path is a best guess pending confirmation
+      // against a real response (same caveat as the entry order ID below).
+      const tpOrderId = res.data?.order?.orderId ?? res.orderId ?? null;
+      if (tpOrderId) tpOrderIds[tp.label] = tpOrderId;
     }
 
     await sendTelegram(`${confidenceEmoji(gated.confidence, scoreResult.rawScore)} <b>BingX demo execution</b>\n${symbol} ${direction} │ ${marginUSDT} VST margin │ ${leverage}x\nQty: ${quantity}\n${tpResults.join("\n")}`);
     console.log("BingX execution complete", symbol, direction, "| TP results:", tpResults);
+    // Return the entry order's ID + BingX symbol so the tracker can log
+    // them — this is what actually makes checking back on the trade
+    // possible at all. Without this, execution and tracking were two
+    // completely disconnected systems with no way to reconnect them later.
+    return { bingxOrderId: entryRes.data?.order?.orderId ?? entryRes.orderId ?? null, bingxSymbol: symbol, tpOrderIds };
   } catch (err) {
     console.error("BingX execution error (non-fatal):", err.message);
     try { await sendTelegram(`⚠️ <b>BingX execution error:</b> ${err.message}`); } catch {}
+    return null;
   }
 }
 
@@ -1066,6 +1200,12 @@ const server = http.createServer(async (req, res) => {
     res.end(signalsToCSV(signals));
     return;
   }
+  if (req.method === "GET" && req.url === "/stats") {
+    const signals = readSignalLog();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(computeStats(signals), null, 2));
+    return;
+  }
 
   if (req.method === "POST" && req.url === "/webhook") {
     let body = "";
@@ -1150,8 +1290,8 @@ ${note}`);
           const planMsg = formatTradeSetup(decision, payload, reasoning);
           await sendTelegram(planMsg);
         }
-        logSignal(decision, payload);
-        await executeOnBingX(decision, payload);
+        const execResult = await executeOnBingX(decision, payload);
+        logSignal(decision, payload, execResult);
 
         console.log(isCleanestSignal ? "Clean signal — alert sent + executed ✅" : "Non-clean signal — silent (still logged + executed) 🔕", new Date().toISOString(), "| condition:", condition, "| score:", decision.scoreResult.rawScore, "/5", "| confidence:", decision.gated.confidence);
       } catch (err) {
@@ -1166,3 +1306,10 @@ ${note}`);
 });
 
 server.listen(PORT, () => console.log(`Server v10 running on port ${PORT}`));
+
+// Check open positions every 15 minutes — frequent enough to catch
+// outcomes reasonably promptly, infrequent enough not to hammer BingX's
+// API for what's likely a small number of open signals at any given time.
+setInterval(() => {
+  checkOpenPositions().catch(err => console.error("checkOpenPositions failed (non-fatal):", err.message));
+}, 15 * 60 * 1000);
