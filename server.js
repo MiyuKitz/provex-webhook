@@ -397,6 +397,22 @@ async function executeOnBingX(decision, payload) {
       return;
     }
 
+    // A signal already flagged as a same-zone REPEAT is explicitly lower
+    // conviction by design (that's the whole point of the flag) — it
+    // shouldn't be allowed to silently keep adding fresh capital to an
+    // already-open position just because the direction matches. Without
+    // this check, repeated re-tests of the same zone can quietly stack a
+    // position's real size and margin far beyond what any single
+    // signal's own confidence tier was ever sized for — exactly what
+    // happened with the SUIUSDT position that grew to 7 stacked entries
+    // and ~7x its intended per-signal margin.
+    const isRepeatZone = gated.flags.some(f => f.includes("Repeat signal on the same zone"));
+    if (isRepeatZone && positionCheck.existing) {
+      console.log(`Skipping ${symbol} ${direction} — repeat-zone signal, position already open (${positionCheck.existing.direction}, avoiding uncontrolled stacking)`);
+      await sendTelegram(`🔕 <b>BingX execution skipped</b>\nSymbol: ${symbol}\nSignal: ${direction} (repeat-zone, lower conviction) — a ${positionCheck.existing.direction} position is already open on this symbol. Not adding more capital to it; the repeat-zone flag exists precisely to avoid treating this as a fresh, independently-sized trade.`);
+      return;
+    }
+
     // positionSide is ALWAYS "BOTH" for a One-way mode account — LONG/SHORT
     // values are only valid in Hedge Mode (which allows simultaneous long +
     // short positions on the same symbol). In One-way mode, direction is
