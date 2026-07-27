@@ -1358,27 +1358,22 @@ ${note}`);
         // your phone as a "should I take this" decision, without hiding
         // them from the tracker or BingX.
         //
-        // "Cleanest tier" = HIGH confidence, perfect 5/5, zero opposition
-        // flags (no BTC/HTF/SMT disagreement, not a repeat-zone signal,
-        // inside kill zone). This is NOT a profit guarantee — it's just
-        // the setup with the fewest known reasons to distrust it right
-        // now. A clean signal can still lose.
-        const oppositionMarkers = ["opposes signal direction", "Repeat signal on the same zone", "early reversal warning", "Outside kill zone"];
-        const isCleanestSignal = decision.gated.confidence === "HIGH"
-          && decision.scoreResult.rawScore === 5
-          && !decision.gated.flags.some(f => oppositionMarkers.some(marker => f.includes(marker)));
-
+        // UPDATED per Krysie's request: send BOTH Medium and HIGH tier
+        // signals now, not just the cleanest tier. The card already
+        // shows the full checklist + risk flags clearly, so she can
+        // read those notes herself and decide whether to take each
+        // trade, rather than the bot silently pre-filtering. This is a
+        // deliberate reversal of the earlier "cleanest tier only"
+        // change — not a bug, a preference change.
         const reasoning = await explainDecision(decision, payload);
-        if (isCleanestSignal) {
-          const header = formatAlertHeader(payload);
-          await sendTelegram(header);
-          const planMsg = formatTradeSetup(decision, payload, reasoning);
-          await sendTelegram(planMsg);
-        }
+        const header = formatAlertHeader(payload);
+        await sendTelegram(header);
+        const planMsg = formatTradeSetup(decision, payload, reasoning);
+        await sendTelegram(planMsg);
         const execResult = await executeOnBingX(decision, payload);
         logSignal(decision, payload, execResult);
 
-        console.log(isCleanestSignal ? "Clean signal — alert sent + executed ✅" : "Non-clean signal — silent (still logged + executed) 🔕", new Date().toISOString(), "| condition:", condition, "| score:", decision.scoreResult.rawScore, "/5", "| confidence:", decision.gated.confidence);
+        console.log("Trade signal — alert sent + executed ✅", new Date().toISOString(), "| condition:", condition, "| score:", decision.scoreResult.rawScore, "/5", "| confidence:", decision.gated.confidence);
       } catch (err) {
         console.error("Error:", err.message);
         try { await sendTelegram(`⚠️ <b>Bot error:</b> ${err.message}`); } catch {}
