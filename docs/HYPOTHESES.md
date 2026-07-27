@@ -100,6 +100,44 @@ signals (attempt #2, #3+) on the same underlying zone.
 
 ---
 
+## H-005 — Market regime (Trending vs Choppy) mismatch reduces win rate
+
+**Claim:** An OB-rejection (mean-reversion) signal firing while ADX shows a
+Trending regime is weaker than one firing in a Choppy/ranging regime,
+since mean-reversion setups are fundamentally betting against sustained
+directional moves. Symmetrically, a breakout (trend-continuation) signal
+firing in a Choppy regime is weaker than one firing in a Trending regime,
+since continuation setups need real trend backing to work.
+
+**Currently enforced as:** NOT enforced — this is deliberately
+informational only. `applyRiskGates()` in server.js surfaces a flag
+(`payload.marketRegime` computed via ADX in the Pine script) but does
+NOT cap confidence or leverage based on it, unlike H-001 through H-004.
+
+**Why the different treatment:** H-001 through H-004 were carried-over
+ICT/SMC trading principles already held before the caps were coded — the
+code just enforced beliefs that already existed. This regime-mismatch
+idea is a NEW hypothesis introduced alongside the classifier itself, with
+zero prior track record behind it. Enforcing it as a hard cap before any
+real data exists would repeat the exact mistake flagged earlier tonight
+(inventing rules dressed up as validated principles). It stays
+informational until it earns its way to Confirmed the same way the
+others are supposed to.
+
+**Status:** Untested
+
+**Evidence:** None yet.
+
+**What would confirm/reject it:** Win rate for OB-rejection signals
+firing in Trending vs Choppy regimes, and separately for breakout
+signals firing in Choppy vs Trending regimes. If regime-aligned signals
+meaningfully outperform regime-mismatched ones, this should graduate
+from an informational flag to an actual confidence/leverage adjustment.
+If there's no meaningful difference, it should be removed entirely
+rather than left cluttering every signal with an unhelpful flag.
+
+---
+
 ## Adding new hypotheses
 
 When a new risk rule, filter, or scoring adjustment gets added to the code,
