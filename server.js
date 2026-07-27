@@ -337,6 +337,46 @@ function confidenceEmoji(confidence, rawScore) {
   return "🔴";
 }
 
+// ============================================================
+// OPPOSING-POSITION CHECK (new) — prevents the exact bug that broke
+// every ETH-USDT Short attempt tonight: opening a new trade while an
+// existing OPPOSITE-direction position is still open on the same
+// symbol. In One-way mode, the new order nets against the existing
+// position instead of opening cleanly, which made the TP orders (sized
+// for a fresh position) get rejected with "Reduce Only order can only
+// decrease the position." Rather than try to model every netting edge
+// case, the safe choice is: skip the new trade entirely if an opposing
+// position already exists, and log/notify why.
+//
+// FAILS CLOSED on purpose: if this check itself errors (network issue,
+// unexpected response shape), the trade is skipped rather than risking
+// a repeat of the exact bug this exists to prevent. A missed trade from
+// a transient hiccup is a much smaller cost than silently reintroducing
+// the failure this was built to catch.
+//
+// Field names for reading the position response are a best-informed
+// guess (same caveat as every other BingX integration piece tonight) —
+// expect this may need a small adjustment once it runs against a real
+// response, same pattern as order placement did.
+// ============================================================
+async function getOpenPosition(symbol) {
+  try {
+    const res = await bingxRequest("GET", "/openApi/swap/v2/user/positions", { symbol });
+    console.log(`BingX position check for ${symbol}:`, JSON.stringify(res).slice(0, 500));
+    const positions = Array.isArray(res.data) ? res.data : [];
+    const active = positions.find(p => {
+      const amt = parseFloat(p.positionAmt ?? p.positionAmount ?? 0);
+      return amt !== 0;
+    });
+    if (!active) return { checked: true, existing: null };
+    const amt = parseFloat(active.positionAmt ?? active.positionAmount ?? 0);
+    return { checked: true, existing: { direction: amt > 0 ? "Long" : "Short", amt } };
+  } catch (err) {
+    console.error(`Position check failed for ${symbol} (non-fatal, failing closed):`, err.message);
+    return { checked: false, existing: null };
+  }
+}
+
 async function executeOnBingX(decision, payload) {
   if (!BINGX_API_KEY || !BINGX_API_SECRET) return; // not configured — silent no-op, nothing else affected
 
@@ -344,6 +384,19 @@ async function executeOnBingX(decision, payload) {
     const { scoreResult, gated, levels } = decision;
     const symbol = toBingXSymbol(payload.symbol);
     const direction = scoreResult.direction; // "Short" | "Long"
+
+    // Check for an existing opposing position BEFORE doing anything else
+    const positionCheck = await getOpenPosition(symbol);
+    if (!positionCheck.checked) {
+      await sendTelegram(`⚠️ <b>BingX execution skipped</b>\nSymbol: ${symbol}\nCould not verify current position (failing closed to avoid the opposing-position bug) — trade not placed.`);
+      return;
+    }
+    if (positionCheck.existing && positionCheck.existing.direction !== direction) {
+      console.log(`Skipping ${symbol} ${direction} — existing opposing ${positionCheck.existing.direction} position open`);
+      await sendTelegram(`🔕 <b>BingX execution skipped</b>\nSymbol: ${symbol}\nSignal: ${direction}, but an existing ${positionCheck.existing.direction} position is already open on this symbol — opening now would net against it and break TP placement (the exact bug from earlier tonight). Skipped intentionally.`);
+      return;
+    }
+
     // positionSide is ALWAYS "BOTH" for a One-way mode account — LONG/SHORT
     // values are only valid in Hedge Mode (which allows simultaneous long +
     // short positions on the same symbol). In One-way mode, direction is
