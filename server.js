@@ -744,7 +744,7 @@ function checkRSIExhaustion(payload, direction) {
   return null;
 }
 
-function applyRiskGates(payload, scoreResult, killzoneActive, isSwing = false) {
+function applyRiskGates(payload, scoreResult, killzoneActive, isSwing = false, isBreakout = false) {
   const { rawScore, direction, mitigated, btcOpposes, structureOk } = scoreResult;
 
   if (mitigated) return { verdict: "NO_TRADE", reason: "OB mitigated — zone is dead, no exceptions" };
@@ -801,6 +801,21 @@ function applyRiskGates(payload, scoreResult, killzoneActive, isSwing = false) {
     flags.push(`Swing signal — 1H structure agreement confirmed, wider R-multiple targets apply (see TP ladder)`);
   }
   if (!killzoneActive) flags.push("Outside kill zone — fakeout risk elevated");
+
+  // Market regime check (v14, new) — INFORMATIONAL ONLY, does not cap
+  // confidence or leverage. Unlike BTC/HTF/SMT opposition (carried-over
+  // principles already held before tonight), this is a NEW hypothesis
+  // (see docs/HYPOTHESES.md H-005) — it gets surfaced for you to see and
+  // for the tracker to eventually check against real outcomes, but it
+  // does not get to silently change trade sizing until real data
+  // actually confirms it matters.
+  const regime = payload.marketRegime || "Unknown";
+  if (!isBreakout && regime === "Trending") {
+    flags.push(`Market regime: Trending (ADX ${payload.adxValue || "?"}) — this is a mean-reversion (OB) setup firing against a strong trend, informational only (H-005, unvalidated)`);
+  }
+  if (isBreakout && regime === "Choppy") {
+    flags.push(`Market regime: Choppy (ADX ${payload.adxValue || "?"}) — breakout/continuation setups are more prone to failure without real trend backing, informational only (H-005, unvalidated)`);
+  }
 
   // Parse the top of whichever band got assigned dynamically, instead of
   // hardcoding every possible string — works for both scalp and swing bands
@@ -985,7 +1000,8 @@ function buildDecision(payload) {
     ? scoreOB(payload, direction)
     : scoreBreakout(payload, direction);
 
-  const gated = applyRiskGates(payload, scoreResult, killzoneActive, isSwing);
+  const isBreakout = type.startsWith("BREAKOUT_");
+  const gated = applyRiskGates(payload, scoreResult, killzoneActive, isSwing, isBreakout);
   if (gated.verdict === "NO_TRADE") return { verdict: "NO_TRADE", reason: gated.reason, type, scoreResult };
 
   // -- Zone cooldown check (new) — only applies to OB-based types, since
