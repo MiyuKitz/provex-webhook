@@ -391,6 +391,21 @@ async function executeOnBingX(decision, payload) {
       await sendTelegram(`⚠️ <b>BingX execution skipped</b>\nSymbol: ${symbol}\nCould not verify current position (failing closed to avoid the opposing-position bug) — trade not placed.`);
       return;
     }
+
+    // ============================================================
+    // ONE-POSITION-PER-SYMBOL RULE (hard stop) — ANY existing position
+    // on this symbol, regardless of direction or zone freshness, blocks
+    // a new order. This is the actual safeguard against stacking — the
+    // opposing-direction and repeat-zone checks below are now redundant
+    // in practice but left in place for clearer logging on WHY a skip
+    // happened, since they're more specific than this one.
+    // ============================================================
+    if (positionCheck.existing) {
+      console.log(`Skipping ${symbol} ${direction} — position already open (${positionCheck.existing.direction}), one-position-per-symbol rule`);
+      await sendTelegram(`🔕 <b>BingX execution skipped</b>\nSymbol: ${symbol}\nSignal: ${direction}, but a ${positionCheck.existing.direction} position is already open on this symbol. One-position-per-symbol rule — not adding to it regardless of direction or zone.`);
+      return;
+    }
+
     if (positionCheck.existing && positionCheck.existing.direction !== direction) {
       console.log(`Skipping ${symbol} ${direction} — existing opposing ${positionCheck.existing.direction} position open`);
       await sendTelegram(`🔕 <b>BingX execution skipped</b>\nSymbol: ${symbol}\nSignal: ${direction}, but an existing ${positionCheck.existing.direction} position is already open on this symbol — opening now would net against it and break TP placement (the exact bug from earlier tonight). Skipped intentionally.`);
@@ -1016,7 +1031,8 @@ function buildDecision(payload) {
     if (zoneCheck.isRepeat) {
       gated.confidence = "MEDIUM";
       const topOfBand = parseInt(gated.leverage.split("-")[1], 10);
-      if (topOfBand > 40) gated.leverage = floorLeverage;
+     const localFloorLeverage = isSwing ? "30x-40x" : "5x-8x";
+      if (topOfBand > 40) gated.leverage = localFloorLeverage;
       gated.flags.push(`Repeat signal on the same zone (attempt #${zoneCheck.count} within the cooldown window) — needing multiple retests to hold is a lower-conviction sign, confidence capped regardless of this bar's individual flags`);
     }
   }
