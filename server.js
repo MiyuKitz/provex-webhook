@@ -98,7 +98,7 @@ async function checkOpenPositions() {
       }
       if (entryStatus !== "FILLED") continue;
 
-      if (sig.bingxTpOrderIds) {
+     if (sig.bingxTpOrderIds) {
         for (const [label, orderId] of Object.entries(sig.bingxTpOrderIds)) {
           const tpCheck = await bingxRequest("GET", "/openApi/swap/v2/trade/order", {
             symbol: sig.bingxSymbol, orderId,
@@ -106,10 +106,27 @@ async function checkOpenPositions() {
           const tpOrder = tpCheck.data?.order || tpCheck.data || tpCheck;
           if (tpOrder?.status === "FILLED") {
             sig.outcome = label;
-            sig.notes = `${label} order confirmed filled via BingX. SL-vs-TP distinction for remaining unresolved signals still needs the next increment (see function comment).`;
+            sig.notes = `${label} order confirmed filled via BingX.`;
             anyUpdated = true;
             break;
           }
+        }
+      }
+
+      // SL DETECTION (new) — BingX's SL is a conditional trigger attached
+      // to the entry order, not a separately trackable order ID, so it
+      // can't be polled directly like TP orders above. Instead: if entry
+      // filled, no TP filled, but the position itself is now flat, the
+      // only remaining explanation is the SL triggered. This is an
+      // INFERENCE, not a direct confirmation — a manual close would also
+      // produce this same signature. Best available signal given BingX's
+      // API structure.
+      if (!sig.outcome) {
+        const posCheck = await getOpenPosition(sig.bingxSymbol);
+        if (posCheck.checked && !posCheck.existing) {
+          sig.outcome = "SL";
+          sig.notes = "Position closed with no TP fill detected — inferred SL hit (BingX doesn't expose SL as a separately trackable order ID; a manual close would look identical).";
+          anyUpdated = true;
         }
       }
     } catch (err) {
