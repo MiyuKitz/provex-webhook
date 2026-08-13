@@ -175,6 +175,56 @@ function signalsToCSV(signals) {
   }).join(","));
   return header.join(",") + "\n" + rows.join("\n") + "\n";
 }
+// ============================================================
+// AUTO-BACKUP TO TELEGRAM (new) — since Railway's filesystem is
+// ephemeral and a persistent Volume isn't available on this
+// plan/UI (confirmed 2026-08-12), this sends a CSV snapshot of the
+// signal log to Telegram on a schedule. Worst case with this in
+// place: a redeploy can only ever lose the current day's un-backed-up
+// data, not the whole history. This does NOT replace the /signals.csv
+// endpoint — that's still there for on-demand pulls.
+// ============================================================
+async function sendSignalBackupToTelegram() {
+  const signals = readSignalLog();
+  if (!signals.length) {
+    console.log("Backup skipped — no signals logged yet.");
+    return;
+  }
+  const csv = signalsToCSV(signals);
+  const boundary = "----ProveXBackup" + Date.now();
+  const filename = `signals-backup-${new Date().toISOString().slice(0, 10)}.csv`;
+
+  const parts = [
+    `--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${TELEGRAM_CHAT_ID}\r\n`,
+    `--${boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n📦 Daily signal log backup — ${signals.length} total signals\r\n`,
+    `--${boundary}\r\nContent-Disposition: form-data; name="document"; filename="${filename}"\r\nContent-Type: text/csv\r\n\r\n${csv}\r\n`,
+    `--${boundary}--\r\n`,
+  ];
+  const body = parts.join("");
+
+  return new Promise((resolve) => {
+    const req = https.request(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendDocument`, {
+      method: "POST",
+      headers: {
+        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+        "Content-Length": Buffer.byteLength(body),
+      },
+    }, (res) => {
+      let data = "";
+      res.on("data", (c) => (data += c));
+      res.on("end", () => {
+        console.log("Signal backup sent to Telegram:", res.statusCode);
+        resolve();
+      });
+    });
+    req.on("error", (err) => {
+      console.error("Signal backup failed (non-fatal):", err.message);
+      resolve();
+    });
+    req.write(body);
+    req.end();
+  });
+}
 
 function bingxSign(queryString) {
   return require("crypto").createHmac("sha256", BINGX_API_SECRET).update(queryString).digest("hex");
@@ -1029,3 +1079,13 @@ server.listen(PORT, () => console.log(`Server v10 running on port ${PORT}`));
 setInterval(() => {
   checkOpenPositions().catch(err => console.error("checkOpenPositions failed (non-fatal):", err.message));
 }, 15 * 60 * 1000);
+// Daily backup of the signal log to Telegram — 24 hours. Also fires
+// once shortly after startup so a backup exists even if the service
+// restarts/redeploys multiple times in one day.
+setInterval(() => {
+  sendSignalBackupToTelegram().catch(err => console.error("Backup interval failed (non-fatal):", err.message));
+}, 24 * 60 * 60 * 1000);
+
+setTimeout(() => {
+  sendSignalBackupToTelegram().catch(err => console.error("Startup backup failed (non-fatal):", err.message));
+}, 60 * 1000);
