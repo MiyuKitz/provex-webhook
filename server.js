@@ -163,6 +163,86 @@ function computeStats(signals) {
     note: "Small sample sizes early on will look noisy — this is descriptive, not statistically confirmed until each bucket has a real sample (see docs/HYPOTHESES.md).",
   };
 }
+// ============================================================
+// CHECKLIST ANALYSIS (new) — the actual "reflect and evaluate" layer.
+// Breaks down win rate PER checklist point (not just overall) and per
+// risk flag, so you can see which individual pieces of the 5-point
+// checklist are actually predictive vs which aren't, using real
+// resolved outcomes. Deliberately does NOT auto-adjust anything —
+// scoring stays deterministic and human-reviewed. This surfaces the
+// data; a human (you) decides whether a pattern is real enough to act
+// on. Minimum sample size gate exists specifically to avoid mistaking
+// noise for signal on 2-3 resolved trades.
+// ============================================================
+const MIN_SAMPLE_FOR_INSIGHT = 8; // below this, a win rate is noise, not a pattern
+
+function computeChecklistAnalysis(signals) {
+  const resolved = signals.filter(s => s.outcome && s.outcome !== "not_taken" && s.checklist);
+
+  function winRateOf(arr) {
+    const won = arr.filter(s => s.outcome === "TP1" || s.outcome === "TP2" || s.outcome === "TP3").length;
+    const lost = arr.filter(s => s.outcome === "SL").length;
+    const total = won + lost;
+    return {
+      total, won, lost,
+      winRatePct: total > 0 ? Number((won / total * 100).toFixed(1)) : null,
+      reliable: total >= MIN_SAMPLE_FOR_INSIGHT,
+    };
+  }
+
+  // Per checklist point — did THIS specific point pass or fail, and how
+  // did trades with that point passing perform vs trades where it failed
+  const checklistLabels = [...new Set(resolved.flatMap(s => (s.checklist || []).map(c => c.label)))];
+  const byChecklistPoint = {};
+  for (const label of checklistLabels) {
+    const passed = resolved.filter(s => (s.checklist || []).some(c => c.label === label && c.pass === 1));
+    const failed = resolved.filter(s => (s.checklist || []).some(c => c.label === label && c.pass === 0));
+    byChecklistPoint[label] = { whenPassed: winRateOf(passed), whenFailed: winRateOf(failed) };
+  }
+
+  // Per risk flag category — same idea, but on the flags array (partial
+  // string match since flag text includes dynamic values like RSI level)
+  const flagCategories = [
+    "BTC trend opposes", "HTF trend", "SMT divergence", "RSI already at",
+    "Repeat signal on the same zone", "Outside kill zone", "Market regime",
+  ];
+  const byFlag = {};
+  for (const cat of flagCategories) {
+    const withFlag = resolved.filter(s => (s.flags || []).some(f => f.includes(cat)));
+    const withoutFlag = resolved.filter(s => !(s.flags || []).some(f => f.includes(cat)));
+    byFlag[cat] = { withFlag: winRateOf(withFlag), withoutFlag: winRateOf(withoutFlag) };
+  }
+
+  // Only surface a suggestion when BOTH sides of a comparison have
+  // enough sample AND the gap is large enough to plausibly be real
+  // (not just noise) — 20 percentage points is a deliberately high bar
+  const suggestions = [];
+  for (const [label, data] of Object.entries(byChecklistPoint)) {
+    if (data.whenPassed.reliable && data.whenFailed.reliable) {
+      const gap = data.whenPassed.winRatePct - data.whenFailed.winRatePct;
+      if (Math.abs(gap) >= 20) {
+        suggestions.push(`Checklist point "${label}": ${gap > 0 ? "passing" : "failing"} this point correlates with a ${Math.abs(gap).toFixed(1)}pt higher win rate (${data.whenPassed.winRatePct}% vs ${data.whenFailed.winRatePct}%, n=${data.whenPassed.total}/${data.whenFailed.total}) — worth reviewing whether this point should carry more weight.`);
+      }
+    }
+  }
+  for (const [cat, data] of Object.entries(byFlag)) {
+    if (data.withFlag.reliable && data.withoutFlag.reliable) {
+      const gap = data.withoutFlag.winRatePct - data.withFlag.winRatePct;
+      if (Math.abs(gap) >= 20) {
+        suggestions.push(`Flag "${cat}": signals WITH this flag win ${data.withFlag.winRatePct}% vs ${data.withoutFlag.winRatePct}% without (n=${data.withFlag.total}/${data.withoutFlag.total}) — ${gap > 0 ? "supports current caution treatment" : "flag may be over-cautious, worth reviewing"}.`);
+      }
+    }
+  }
+
+  return {
+    totalResolved: resolved.length,
+    minSampleForInsight: MIN_SAMPLE_FOR_INSIGHT,
+    byChecklistPoint,
+    byFlag,
+    suggestions: suggestions.length ? suggestions : [`Not enough resolved signals yet for reliable insight — need at least ${MIN_SAMPLE_FOR_INSIGHT} outcomes per bucket before patterns are trustworthy. Currently ${resolved.length} total resolved.`],
+    note: "This is descriptive analysis, not automatic adjustment. Scoring logic stays deterministic and manually reviewed — treat suggestions as hypotheses to evaluate, not instructions to follow blindly.",
+  };
+}
 
 function signalsToCSV(signals) {
   if (!signals.length) return "loggedAt,symbol,type,direction,rawScore,confidence,leverage,entryZone,stopLoss,tp1,tp2,tp3,htfTrend,btcTrend,smtBias,killzone,outcome,realizedR\n";
@@ -997,6 +1077,12 @@ const server = http.createServer(async (req, res) => {
     const signals = readSignalLog();
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(computeStats(signals), null, 2));
+    return;
+  }
+  if (req.method === "GET" && req.url === "/analysis") {
+    const signals = readSignalLog();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(computeChecklistAnalysis(signals), null, 2));
     return;
   }
 
