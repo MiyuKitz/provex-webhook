@@ -578,6 +578,7 @@ function applyRiskGates(payload, scoreResult, killzoneActive, isSwing = false, i
 
   if (mitigated) return { verdict: "NO_TRADE", reason: "OB mitigated — zone is dead, no exceptions" };
   if (!structureOk) return { verdict: "NO_TRADE", reason: "Missing structural data — cannot place a real stop" };
+  if (btcOpposes) return { verdict: "NO_TRADE", reason: "BTC trend opposes signal direction — blocked entirely (hard rule, per Krysie's decision after the 2026-08-13 SUI/ETH shorts both went against BTC trend and moved into loss)" };
 
   const threshold = killzoneActive ? 3.5 : 4;
   if (rawScore < threshold) {
@@ -590,15 +591,10 @@ function applyRiskGates(payload, scoreResult, killzoneActive, isSwing = false, i
     : (confidence === "HIGH" ? (rawScore === 5 ? "12x-15x" : "8x-12x") : "5x-8x");
   const floorLeverage = isSwing ? "30x-40x" : "5x-8x";
 
-  const flags = [];
+const flags = [];
   const htfTrend  = payload.htfTrend || "Unknown";
   const htfOpposes = (direction === "Short" && htfTrend === "Bullish") || (direction === "Long" && htfTrend === "Bearish");
 
-  if (btcOpposes) {
-    confidence = "MEDIUM";
-    leverage = floorLeverage;
-    flags.push("BTC trend opposes signal direction — HIGH RISK");
-  }
   if (htfOpposes) {
     confidence = "MEDIUM";
     if (leverage !== floorLeverage) leverage = floorLeverage;
