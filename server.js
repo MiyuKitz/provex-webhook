@@ -90,6 +90,17 @@ async function checkOpenPositions() {
       const entryOrder = entryCheck.data?.order || entryCheck.data || entryCheck;
       const entryStatus = entryOrder?.status;
 
+            // FIXED (2026-08-24): BingX returns {"code":109421,"msg":"order not
+      // exist"} for orders that were manually closed/cleared on the
+      // exchange — this doesn't match CANCELED/EXPIRED/FAILED, so
+      // entryStatus comes back undefined and the old code would retry
+      // this same failed lookup forever, never resolving the signal.
+      if (entryCheck.code === 109421 || entryOrder === undefined) {
+        sig.outcome = "not_taken";
+        sig.notes = "Order no longer exists on BingX (code 109421) — likely manually closed outside the bot's tracking. Cannot confirm TP/SL outcome.";
+        anyUpdated = true;
+        continue;
+      }
       if (entryStatus === "CANCELED" || entryStatus === "EXPIRED" || entryStatus === "FAILED") {
         sig.outcome = "not_taken";
         sig.notes = "Entry order never filled.";
@@ -97,6 +108,7 @@ async function checkOpenPositions() {
         continue;
       }
       if (entryStatus !== "FILLED") continue;
+
 
      if (sig.bingxTpOrderIds) {
         for (const [label, orderId] of Object.entries(sig.bingxTpOrderIds)) {
