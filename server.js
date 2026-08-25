@@ -8,13 +8,9 @@ const TELEGRAM_CHAT_ID  = process.env.TELEGRAM_CHAT_ID;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const PORT = process.env.PORT || 3000;
 
-// BingX demo (VST) execution — optional. If these aren't set, execution
-// is silently skipped and everything else (Telegram, tracker) keeps
-// working exactly as before. Demo base URL is a genuinely separate
-// sandbox from live trading — confirmed via BingX's own API structure.
 const BINGX_API_KEY    = process.env.BINGX_API_KEY;
 const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
-const BINGX_BASE_URL   = "https://open-api-vst.bingx.com"; // demo/VST only, never live
+const BINGX_BASE_URL   = "https://open-api-vst.bingx.com";
 
 const SIGNAL_LOG_FILE = path.join(__dirname, "signals.jsonl");
 
@@ -74,6 +70,100 @@ function writeSignalLog(signals) {
   }
 }
 
+const LESSONS_LOG_FILE = path.join(__dirname, "lessons.jsonl");
+
+const POSTMORTEM_SYSTEM_PROMPT = `You are writing a structured post-mortem for one resolved crypto futures trade signal. You are NOT deciding anything and NOT allowed to suggest specific numeric changes to scoring, leverage, or thresholds — only Krysie (the trader) makes that decision, later, using accumulated data across many trades.
+
+You MUST separate your answer into exactly these four labeled sections, in this order:
+
+FACT: State only what is directly verifiable from the data given (entry price, SL/TP prices, actual outcome, direction). 1 sentence.
+
+OBSERVATION: Note any contextual detail from the checklist/flags that was present at signal time, without yet claiming it caused anything. 1-2 sentences.
+
+HYPOTHESIS: Your inferred explanation for why this trade won or lost. Be explicit this is a guess, not proof. Explicitly consider whether this was a SIGNAL problem (the thesis was wrong) versus a RISK MANAGEMENT problem (SL too tight, entry too late, TP too far) — these require different fixes and must not be conflated. 2-3 sentences.
+
+KNOWLEDGE GAP: State plainly if there isn't enough similar historical data yet to know whether this hypothesis is a real pattern or a one-off. Do not overstate confidence from a single trade.
+
+Output ONLY these four labeled sections. No preamble, no summary, no recommendations.`;
+
+async function generatePostmortem(signal) {
+  const userMessage = `Signal type: ${signal.type}
+Symbol: ${signal.symbol}
+Direction: ${signal.direction}
+Checklist: ${(signal.checklist || []).map(c => `[${c.pass ? "PASS" : "FAIL"}] ${c.label}`).join(" | ")}
+Confidence: ${signal.confidence}, Raw score: ${signal.rawScore}/5
+Risk flags at signal time: ${(signal.flags || []).join("; ") || "none"}
+Entry: ${signal.entryZone}, SL: ${signal.stopLoss}, TP1: ${signal.tp1}, TP2: ${signal.tp2}, TP3: ${signal.tp3}
+Outcome: ${signal.outcome}
+HTF trend: ${signal.htfTrend}, BTC trend: ${signal.btcTrend}, SMT bias: ${signal.smtBias}
+
+Write the four-section post-mortem now.`;
+
+  const body = JSON.stringify({
+    model: "claude-sonnet-4-6",
+    max_tokens: 400,
+    system: POSTMORTEM_SYSTEM_PROMPT,
+    messages: [{ role: "user", content: userMessage }],
+  });
+
+  return new Promise((resolve) => {
+    const req = https.request("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "Content-Length": Buffer.byteLength(body),
+      },
+    }, (res) => {
+      let data = "";
+      res.on("data", (c) => (data += c));
+      res.on("end", () => {
+        try {
+          const parsed = JSON.parse(data);
+          resolve((parsed.content?.[0]?.text || "").trim() || null);
+        } catch {
+          resolve(null);
+        }
+      });
+    });
+    req.on("error", () => resolve(null));
+    req.write(body);
+    req.end();
+  });
+}
+
+function readLessonsLog() {
+  try {
+    if (!fs.existsSync(LESSONS_LOG_FILE)) return [];
+    const lines = fs.readFileSync(LESSONS_LOG_FILE, "utf8").split("\n").filter(Boolean);
+    return lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+async function logPostmortem(signal) {
+  try {
+    const postmortem = await generatePostmortem(signal);
+    if (!postmortem) return;
+    const entry = {
+      loggedAt: new Date().toISOString(),
+      symbol: signal.symbol,
+      direction: signal.direction,
+      outcome: signal.outcome,
+      rawScore: signal.rawScore,
+      confidence: signal.confidence,
+      postmortem,
+      status: "unreviewed",
+    };
+    fs.appendFileSync(LESSONS_LOG_FILE, JSON.stringify(entry) + "\n");
+    await sendTelegram(`🧠 <b>Post-mortem: ${signal.symbol} ${signal.direction} — ${signal.outcome}</b>\n\n${postmortem}`);
+  } catch (err) {
+    console.error("Post-mortem generation failed (non-fatal):", err.message);
+  }
+}
+
 async function checkOpenPositions() {
   if (!BINGX_API_KEY || !BINGX_API_SECRET) return;
   const signals = readSignalLog();
@@ -90,17 +180,13 @@ async function checkOpenPositions() {
       const entryOrder = entryCheck.data?.order || entryCheck.data || entryCheck;
       const entryStatus = entryOrder?.status;
 
-            // FIXED (2026-08-24): BingX returns {"code":109421,"msg":"order not
-      // exist"} for orders that were manually closed/cleared on the
-      // exchange — this doesn't match CANCELED/EXPIRED/FAILED, so
-      // entryStatus comes back undefined and the old code would retry
-      // this same failed lookup forever, never resolving the signal.
       if (entryCheck.code === 109421 || entryOrder === undefined) {
         sig.outcome = "not_taken";
         sig.notes = "Order no longer exists on BingX (code 109421) — likely manually closed outside the bot's tracking. Cannot confirm TP/SL outcome.";
         anyUpdated = true;
         continue;
       }
+
       if (entryStatus === "CANCELED" || entryStatus === "EXPIRED" || entryStatus === "FAILED") {
         sig.outcome = "not_taken";
         sig.notes = "Entry order never filled.";
@@ -109,8 +195,7 @@ async function checkOpenPositions() {
       }
       if (entryStatus !== "FILLED") continue;
 
-
-     if (sig.bingxTpOrderIds) {
+      if (sig.bingxTpOrderIds) {
         for (const [label, orderId] of Object.entries(sig.bingxTpOrderIds)) {
           const tpCheck = await bingxRequest("GET", "/openApi/swap/v2/trade/order", {
             symbol: sig.bingxSymbol, orderId,
@@ -120,25 +205,19 @@ async function checkOpenPositions() {
             sig.outcome = label;
             sig.notes = `${label} order confirmed filled via BingX.`;
             anyUpdated = true;
+            logPostmortem(sig).catch(err => console.error("logPostmortem failed (non-fatal):", err.message));
             break;
           }
         }
       }
 
-      // SL DETECTION (new) — BingX's SL is a conditional trigger attached
-      // to the entry order, not a separately trackable order ID, so it
-      // can't be polled directly like TP orders above. Instead: if entry
-      // filled, no TP filled, but the position itself is now flat, the
-      // only remaining explanation is the SL triggered. This is an
-      // INFERENCE, not a direct confirmation — a manual close would also
-      // produce this same signature. Best available signal given BingX's
-      // API structure.
       if (!sig.outcome) {
         const posCheck = await getOpenPosition(sig.bingxSymbol);
         if (posCheck.checked && !posCheck.existing) {
           sig.outcome = "SL";
           sig.notes = "Position closed with no TP fill detected — inferred SL hit (BingX doesn't expose SL as a separately trackable order ID; a manual close would look identical).";
           anyUpdated = true;
+          logPostmortem(sig).catch(err => console.error("logPostmortem failed (non-fatal):", err.message));
         }
       }
     } catch (err) {
@@ -175,18 +254,8 @@ function computeStats(signals) {
     note: "Small sample sizes early on will look noisy — this is descriptive, not statistically confirmed until each bucket has a real sample (see docs/HYPOTHESES.md).",
   };
 }
-// ============================================================
-// CHECKLIST ANALYSIS (new) — the actual "reflect and evaluate" layer.
-// Breaks down win rate PER checklist point (not just overall) and per
-// risk flag, so you can see which individual pieces of the 5-point
-// checklist are actually predictive vs which aren't, using real
-// resolved outcomes. Deliberately does NOT auto-adjust anything —
-// scoring stays deterministic and human-reviewed. This surfaces the
-// data; a human (you) decides whether a pattern is real enough to act
-// on. Minimum sample size gate exists specifically to avoid mistaking
-// noise for signal on 2-3 resolved trades.
-// ============================================================
-const MIN_SAMPLE_FOR_INSIGHT = 8; // below this, a win rate is noise, not a pattern
+
+const MIN_SAMPLE_FOR_INSIGHT = 8;
 
 function computeChecklistAnalysis(signals) {
   const resolved = signals.filter(s => s.outcome && s.outcome !== "not_taken" && s.checklist);
@@ -202,8 +271,6 @@ function computeChecklistAnalysis(signals) {
     };
   }
 
-  // Per checklist point — did THIS specific point pass or fail, and how
-  // did trades with that point passing perform vs trades where it failed
   const checklistLabels = [...new Set(resolved.flatMap(s => (s.checklist || []).map(c => c.label)))];
   const byChecklistPoint = {};
   for (const label of checklistLabels) {
@@ -212,8 +279,6 @@ function computeChecklistAnalysis(signals) {
     byChecklistPoint[label] = { whenPassed: winRateOf(passed), whenFailed: winRateOf(failed) };
   }
 
-  // Per risk flag category — same idea, but on the flags array (partial
-  // string match since flag text includes dynamic values like RSI level)
   const flagCategories = [
     "BTC trend opposes", "HTF trend", "SMT divergence", "RSI already at",
     "Repeat signal on the same zone", "Outside kill zone", "Market regime",
@@ -225,9 +290,6 @@ function computeChecklistAnalysis(signals) {
     byFlag[cat] = { withFlag: winRateOf(withFlag), withoutFlag: winRateOf(withoutFlag) };
   }
 
-  // Only surface a suggestion when BOTH sides of a comparison have
-  // enough sample AND the gap is large enough to plausibly be real
-  // (not just noise) — 20 percentage points is a deliberately high bar
   const suggestions = [];
   for (const [label, data] of Object.entries(byChecklistPoint)) {
     if (data.whenPassed.reliable && data.whenFailed.reliable) {
@@ -267,15 +329,7 @@ function signalsToCSV(signals) {
   }).join(","));
   return header.join(",") + "\n" + rows.join("\n") + "\n";
 }
-// ============================================================
-// AUTO-BACKUP TO TELEGRAM (new) — since Railway's filesystem is
-// ephemeral and a persistent Volume isn't available on this
-// plan/UI (confirmed 2026-08-12), this sends a CSV snapshot of the
-// signal log to Telegram on a schedule. Worst case with this in
-// place: a redeploy can only ever lose the current day's un-backed-up
-// data, not the whole history. This does NOT replace the /signals.csv
-// endpoint — that's still there for on-demand pulls.
-// ============================================================
+
 async function sendSignalBackupToTelegram() {
   const signals = readSignalLog();
   if (!signals.length) {
@@ -390,12 +444,6 @@ async function getOpenPosition(symbol) {
     });
     if (!active) return { checked: true, existing: null };
     const amt = parseFloat(active.positionAmt ?? active.positionAmount ?? 0);
-    // FIXED (2026-08-09): positionAmt from BingX is UNSIGNED — confirmed
-    // against real Railway logs where an actual Short position returned
-    // "positionAmt":"4.695" (positive) with "positionSide":"SHORT". The
-    // old sign-based inference (amt > 0 ? Long : Short) always returned
-    // "Long" regardless of real direction. Direction now read directly
-    // from positionSide.
     const direction = active.positionSide === "SHORT" ? "Short" : "Long";
     return { checked: true, existing: { direction, amt } };
   } catch (err) {
@@ -437,7 +485,7 @@ async function executeOnBingX(decision, payload) {
       return;
     }
 
-    const positionSide = "BOTH";
+    const positionSide = direction === "Short" ? "SHORT" : "LONG";
     const entrySide = direction === "Short" ? "SELL" : "BUY";
     const exitSide = direction === "Short" ? "BUY" : "SELL";
 
@@ -683,7 +731,7 @@ function applyRiskGates(payload, scoreResult, killzoneActive, isSwing = false, i
     : (confidence === "HIGH" ? (rawScore === 5 ? "12x-15x" : "8x-12x") : "5x-8x");
   const floorLeverage = isSwing ? "30x-40x" : "5x-8x";
 
-const flags = [];
+  const flags = [];
   const htfTrend  = payload.htfTrend || "Unknown";
   const htfOpposes = (direction === "Short" && htfTrend === "Bullish") || (direction === "Long" && htfTrend === "Bearish");
 
@@ -1097,6 +1145,12 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify(computeChecklistAnalysis(signals), null, 2));
     return;
   }
+  if (req.method === "GET" && req.url === "/lessons") {
+    const lessons = readLessonsLog();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ count: lessons.length, lessons }, null, 2));
+    return;
+  }
 
   if (req.method === "POST" && req.url === "/webhook") {
     let body = "";
@@ -1173,9 +1227,7 @@ server.listen(PORT, () => console.log(`Server v10 running on port ${PORT}`));
 setInterval(() => {
   checkOpenPositions().catch(err => console.error("checkOpenPositions failed (non-fatal):", err.message));
 }, 15 * 60 * 1000);
-// Daily backup of the signal log to Telegram — 24 hours. Also fires
-// once shortly after startup so a backup exists even if the service
-// restarts/redeploys multiple times in one day.
+
 setInterval(() => {
   sendSignalBackupToTelegram().catch(err => console.error("Backup interval failed (non-fatal):", err.message));
 }, 24 * 60 * 60 * 1000);
