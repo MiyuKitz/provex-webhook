@@ -44,6 +44,7 @@ function logSignal(decision, payload, execResult) {
       outcome: null,
       realizedR: null,
       notes: null,
+      isPaperTrade: false,
     };
     fs.appendFileSync(SIGNAL_LOG_FILE, JSON.stringify(entry) + "\n");
   } catch (err) {
@@ -74,9 +75,11 @@ const LESSONS_LOG_FILE = path.join(__dirname, "lessons.jsonl");
 
 const POSTMORTEM_SYSTEM_PROMPT = `You are writing a structured post-mortem for one resolved crypto futures trade signal. You are NOT deciding anything and NOT allowed to suggest specific numeric changes to scoring, leverage, or thresholds — only Krysie (the trader) makes that decision, later, using accumulated data across many trades.
 
+If the signal is marked as a PAPER TRADE, explicitly note that this was never a real executed order — it was skipped by the bot's own position rules, and the outcome is inferred from current price versus logged levels, not a real fill confirmation. Treat paper trade conclusions as weaker evidence than real trade evidence.
+
 You MUST separate your answer into exactly these four labeled sections, in this order:
 
-FACT: State only what is directly verifiable from the data given (entry price, SL/TP prices, actual outcome, direction). 1 sentence.
+FACT: State only what is directly verifiable from the data given (entry price, SL/TP prices, actual outcome, direction, whether this was a real trade or paper trade). 1 sentence.
 
 OBSERVATION: Note any contextual detail from the checklist/flags that was present at signal time, without yet claiming it caused anything. 1-2 sentences.
 
@@ -90,6 +93,7 @@ async function generatePostmortem(signal) {
   const userMessage = `Signal type: ${signal.type}
 Symbol: ${signal.symbol}
 Direction: ${signal.direction}
+Trade type: ${signal.isPaperTrade ? "PAPER TRADE (never executed, skipped by position rules)" : "REAL EXECUTED TRADE"}
 Checklist: ${(signal.checklist || []).map(c => `[${c.pass ? "PASS" : "FAIL"}] ${c.label}`).join(" | ")}
 Confidence: ${signal.confidence}, Raw score: ${signal.rawScore}/5
 Risk flags at signal time: ${(signal.flags || []).join("; ") || "none"}
@@ -154,11 +158,13 @@ async function logPostmortem(signal) {
       outcome: signal.outcome,
       rawScore: signal.rawScore,
       confidence: signal.confidence,
+      isPaperTrade: !!signal.isPaperTrade,
       postmortem,
       status: "unreviewed",
     };
     fs.appendFileSync(LESSONS_LOG_FILE, JSON.stringify(entry) + "\n");
-    await sendTelegram(`🧠 <b>Post-mortem: ${signal.symbol} ${signal.direction} — ${signal.outcome}</b>\n\n${postmortem}`);
+    const tag = signal.isPaperTrade ? " (PAPER)" : "";
+    await sendTelegram(`🧠 <b>Post-mortem${tag}: ${signal.symbol} ${signal.direction} — ${signal.outcome}</b>\n\n${postmortem}`);
   } catch (err) {
     console.error("Post-mortem generation failed (non-fatal):", err.message);
   }
@@ -227,8 +233,77 @@ async function checkOpenPositions() {
   if (anyUpdated) writeSignalLog(signals);
 }
 
-function computeStats(signals) {
-  const resolved = signals.filter(s => s.outcome && s.outcome !== "not_taken");
+// ============================================================
+// PAPER-TRADE RESOLUTION (new) — signals that got skipped by
+// one-position-per-symbol (or opposing-direction/repeat-zone rules)
+// never receive a bingxOrderId, which means checkOpenPositions's
+// bingxOrderId filter permanently excludes them from ever resolving.
+// Confirmed via real backup data 2026-08-26: 121 signals logged over
+// 10 days, ZERO had outcomes, because the vast majority were skipped
+// executions sitting behind long-held existing positions.
+//
+// HONEST LIMITATION: this checks skipped signals against CURRENT price
+// only, not the historic price path since the signal fired. It can
+// only detect "price is currently past this signal's TP/SL level right
+// now" — it cannot know if price hit TP1 first then reversed into SL
+// later, or vice versa. This makes paper outcomes structurally less
+// reliable than real executed-trade outcomes (which use actual BingX
+// fill confirmations). Paper outcomes are tagged isPaperTrade: true
+// and MUST be kept separate from real trade stats, never silently
+// blended into the same win-rate pool.
+// ============================================================
+async function resolvePaperTrades() {
+  if (!BINGX_API_KEY || !BINGX_API_SECRET) return;
+  const signals = readSignalLog();
+  const paperCandidates = signals.filter(s => s.outcome === null && !s.bingxOrderId);
+  if (!paperCandidates.length) return;
+
+  let anyUpdated = false;
+  for (const sig of paperCandidates) {
+    try {
+      const symbol = toBingXSymbol(sig.symbol);
+      const tickerRes = await bingxRequest("GET", "/openApi/swap/v2/quote/price", { symbol });
+      const currentPrice = parseFloat(tickerRes.data?.price ?? tickerRes.price);
+      if (!currentPrice || isNaN(currentPrice)) continue;
+
+      const parsePrice = (str) => parseFloat(String(str).replace(/[^0-9.]/g, ""));
+      const sl = parsePrice(sig.stopLoss);
+      const tp1 = parsePrice(sig.tp1);
+      const tp2 = parsePrice(sig.tp2);
+      const tp3 = parsePrice(sig.tp3);
+      const isShort = sig.direction === "Short";
+
+      let outcome = null;
+      if (isShort) {
+        if (currentPrice >= sl) outcome = "SL";
+        else if (currentPrice <= tp3) outcome = "TP3";
+        else if (currentPrice <= tp2) outcome = "TP2";
+        else if (currentPrice <= tp1) outcome = "TP1";
+      } else {
+        if (currentPrice <= sl) outcome = "SL";
+        else if (currentPrice >= tp3) outcome = "TP3";
+        else if (currentPrice >= tp2) outcome = "TP2";
+        else if (currentPrice >= tp1) outcome = "TP1";
+      }
+
+      if (outcome) {
+        sig.outcome = outcome;
+        sig.notes = `PAPER TRADE (never executed on BingX — skipped by position rules). Resolved via current-price check against logged levels, not real fill confirmation. Current price ${currentPrice} vs entry ${sig.entryZone}.`;
+        sig.isPaperTrade = true;
+        anyUpdated = true;
+        logPostmortem(sig).catch(err => console.error("logPostmortem (paper) failed (non-fatal):", err.message));
+      }
+    } catch (err) {
+      console.error(`Paper trade check failed for ${sig.symbol}:`, err.message);
+    }
+  }
+  if (anyUpdated) writeSignalLog(signals);
+}
+
+function computeStats(signals, options = {}) {
+  const { realOnly = false } = options;
+  const base = realOnly ? signals.filter(s => !s.isPaperTrade) : signals;
+  const resolved = base.filter(s => s.outcome && s.outcome !== "not_taken");
 
   function winRate(arr) {
     const won = arr.filter(s => s.outcome === "TP1" || s.outcome === "TP2" || s.outcome === "TP3").length;
@@ -244,21 +319,29 @@ function computeStats(signals) {
   const repeatZone = resolved.filter(s => (s.flags || []).some(f => f.includes("Repeat signal on the same zone")));
   const freshZone = resolved.filter(s => !(s.flags || []).some(f => f.includes("Repeat signal on the same zone")));
 
+  const realCount = base.filter(s => !s.isPaperTrade).length;
+  const paperCount = base.filter(s => s.isPaperTrade).length;
+
   return {
     totalLogged: signals.length,
     totalResolved: resolved.length,
+    realTradeCount: realCount,
+    paperTradeCount: paperCount,
+    filterApplied: realOnly ? "real trades only" : "real + paper combined",
     overall: winRate(resolved),
     byHtfOpposition: { opposed: winRate(htfOpposed), aligned: winRate(htfAligned) },
     byBtcOpposition: { opposed: winRate(btcOpposed), aligned: winRate(btcAligned) },
     byZoneRepeat: { repeat: winRate(repeatZone), fresh: winRate(freshZone) },
-    note: "Small sample sizes early on will look noisy — this is descriptive, not statistically confirmed until each bucket has a real sample (see docs/HYPOTHESES.md).",
+    note: "Small sample sizes early on will look noisy — this is descriptive, not statistically confirmed until each bucket has a real sample (see docs/HYPOTHESES.md). Paper trades are resolved via current-price checks only, not real fill confirmations — treat as weaker evidence than real trades. Use ?real=true to exclude paper trades entirely.",
   };
 }
 
 const MIN_SAMPLE_FOR_INSIGHT = 8;
 
-function computeChecklistAnalysis(signals) {
-  const resolved = signals.filter(s => s.outcome && s.outcome !== "not_taken" && s.checklist);
+function computeChecklistAnalysis(signals, options = {}) {
+  const { realOnly = false } = options;
+  const base = realOnly ? signals.filter(s => !s.isPaperTrade) : signals;
+  const resolved = base.filter(s => s.outcome && s.outcome !== "not_taken" && s.checklist);
 
   function winRateOf(arr) {
     const won = arr.filter(s => s.outcome === "TP1" || s.outcome === "TP2" || s.outcome === "TP3").length;
@@ -310,17 +393,18 @@ function computeChecklistAnalysis(signals) {
 
   return {
     totalResolved: resolved.length,
+    filterApplied: realOnly ? "real trades only" : "real + paper combined",
     minSampleForInsight: MIN_SAMPLE_FOR_INSIGHT,
     byChecklistPoint,
     byFlag,
     suggestions: suggestions.length ? suggestions : [`Not enough resolved signals yet for reliable insight — need at least ${MIN_SAMPLE_FOR_INSIGHT} outcomes per bucket before patterns are trustworthy. Currently ${resolved.length} total resolved.`],
-    note: "This is descriptive analysis, not automatic adjustment. Scoring logic stays deterministic and manually reviewed — treat suggestions as hypotheses to evaluate, not instructions to follow blindly.",
+    note: "This is descriptive analysis, not automatic adjustment. Scoring logic stays deterministic and manually reviewed — treat suggestions as hypotheses to evaluate, not instructions to follow blindly. Use ?real=true to exclude paper trades.",
   };
 }
 
 function signalsToCSV(signals) {
-  if (!signals.length) return "loggedAt,symbol,type,direction,rawScore,confidence,leverage,entryZone,stopLoss,tp1,tp2,tp3,htfTrend,btcTrend,smtBias,killzone,outcome,realizedR\n";
-  const header = ["loggedAt","symbol","type","direction","rawScore","confidence","leverage","entryZone","stopLoss","tp1","tp2","tp3","htfTrend","btcTrend","smtBias","killzone","outcome","realizedR"];
+  const header = ["loggedAt","symbol","type","direction","rawScore","confidence","leverage","entryZone","stopLoss","tp1","tp2","tp3","htfTrend","btcTrend","smtBias","killzone","outcome","realizedR","bingxOrderId","isPaperTrade"];
+  if (!signals.length) return header.join(",") + "\n";
   const rows = signals.map(s => header.map(h => {
     const v = s[h];
     if (v === null || v === undefined) return "";
@@ -1117,42 +1201,46 @@ ${checklistLines}${flagLines}
 }
 
 const server = http.createServer(async (req, res) => {
-  if (req.method === "GET" && req.url === "/") {
+  const urlObj = new URL(req.url, `http://${req.headers.host}`);
+  const pathname = urlObj.pathname;
+  const realOnly = urlObj.searchParams.get("real") === "true";
+
+  if (req.method === "GET" && pathname === "/") {
     res.writeHead(200); res.end("Trade alert server v10 — deterministic scoring, Claude explains only, signal-only (no execution) ✅"); return;
   }
 
-  if (req.method === "GET" && req.url === "/signals") {
+  if (req.method === "GET" && pathname === "/signals") {
     const signals = readSignalLog();
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ count: signals.length, signals }, null, 2));
     return;
   }
-  if (req.method === "GET" && req.url === "/signals.csv") {
+  if (req.method === "GET" && pathname === "/signals.csv") {
     const signals = readSignalLog();
     res.writeHead(200, { "Content-Type": "text/csv", "Content-Disposition": "attachment; filename=signals.csv" });
     res.end(signalsToCSV(signals));
     return;
   }
-  if (req.method === "GET" && req.url === "/stats") {
+  if (req.method === "GET" && pathname === "/stats") {
     const signals = readSignalLog();
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(computeStats(signals), null, 2));
+    res.end(JSON.stringify(computeStats(signals, { realOnly }), null, 2));
     return;
   }
-  if (req.method === "GET" && req.url === "/analysis") {
+  if (req.method === "GET" && pathname === "/analysis") {
     const signals = readSignalLog();
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(computeChecklistAnalysis(signals), null, 2));
+    res.end(JSON.stringify(computeChecklistAnalysis(signals, { realOnly }), null, 2));
     return;
   }
-  if (req.method === "GET" && req.url === "/lessons") {
+  if (req.method === "GET" && pathname === "/lessons") {
     const lessons = readLessonsLog();
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ count: lessons.length, lessons }, null, 2));
     return;
   }
 
-  if (req.method === "POST" && req.url === "/webhook") {
+  if (req.method === "POST" && pathname === "/webhook") {
     let body = "";
     req.on("data", (c) => (body += c));
     req.on("end", async () => {
@@ -1226,6 +1314,7 @@ server.listen(PORT, () => console.log(`Server v10 running on port ${PORT}`));
 
 setInterval(() => {
   checkOpenPositions().catch(err => console.error("checkOpenPositions failed (non-fatal):", err.message));
+  resolvePaperTrades().catch(err => console.error("resolvePaperTrades failed (non-fatal):", err.message));
 }, 15 * 60 * 1000);
 
 setInterval(() => {
