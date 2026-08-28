@@ -12,7 +12,13 @@ const BINGX_API_KEY    = process.env.BINGX_API_KEY;
 const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = "https://open-api-vst.bingx.com";
 
-const SIGNAL_LOG_FILE = path.join(__dirname, "signals.jsonl");
+// FIXED (2026-08-28): all three log files now write to a persistent
+// Railway Volume (mounted at /data, set via DATA_DIR env var) instead of
+// __dirname (the app code directory, which is wiped on every redeploy).
+// Falls back to __dirname if DATA_DIR isn't set, so this doesn't break
+// local/dev runs without a volume attached.
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+const SIGNAL_LOG_FILE = path.join(DATA_DIR, "signals.jsonl");
 
 function logSignal(decision, payload, execResult) {
   try {
@@ -71,20 +77,7 @@ function writeSignalLog(signals) {
   }
 }
 
-// ============================================================
-// MISSED-SIGNAL LOGGING (new) — currently, any signal that scores below
-// threshold, gets BTC-blocked, or fails structure checks is discarded
-// with zero record ("console.log then return"). This means there is
-// NO WAY to ever check "did the bot correctly reject weak setups, or
-// is the threshold too strict and missing real winners?" — a real gap
-// named explicitly in review of tonight's work. This logs every
-// recognized-but-rejected structural signal (mitigated OB, below
-// threshold, BTC-opposed, missing structure) with the HYPOTHETICAL
-// entry/SL/TP levels it would have used, computed the same way a real
-// trade would, purely for later comparison against what price actually
-// did. Never executes anything — logging only.
-// ============================================================
-const MISSED_SIGNAL_LOG_FILE = path.join(__dirname, "missed_signals.jsonl");
+const MISSED_SIGNAL_LOG_FILE = path.join(DATA_DIR, "missed_signals.jsonl");
 
 function computeHypotheticalLevels(payload, direction, type) {
   try {
@@ -104,7 +97,7 @@ function computeHypotheticalLevels(payload, direction, type) {
 function logMissedSignal(decision, payload) {
   try {
     const { type, scoreResult, reason } = decision;
-    if (!type || !scoreResult) return; // UNRECOGNIZED signals aren't real setups, nothing to learn from
+    if (!type || !scoreResult) return;
     const direction = scoreResult.direction;
     const levels = computeHypotheticalLevels(payload, direction, type);
     const entry = {
@@ -125,7 +118,7 @@ function logMissedSignal(decision, payload) {
       hypotheticalTp1: levels?.tp1 || null,
       hypotheticalTp2: levels?.tp2 || null,
       hypotheticalTp3: levels?.tp3 || null,
-      outcome: null, // filled in later by resolveMissedSignals: "WOULD_HAVE_WON" | "WOULD_HAVE_LOST" | null
+      outcome: null,
       isMissedSignal: true,
     };
     fs.appendFileSync(MISSED_SIGNAL_LOG_FILE, JSON.stringify(entry) + "\n");
@@ -153,11 +146,6 @@ function writeMissedSignalLog(signals) {
   }
 }
 
-// Resolves missed (rejected) signals against CURRENT price only — same
-// honest limitation as resolvePaperTrades: this cannot know the true
-// intraday sequence (did it hit TP first then reverse to SL, or vice
-// versa), only "where is price right now relative to the hypothetical
-// levels." Treat as directional evidence, not precise backtesting.
 async function resolveMissedSignals() {
   if (!BINGX_API_KEY || !BINGX_API_SECRET) return;
   const signals = readMissedSignalLog();
@@ -197,7 +185,7 @@ async function resolveMissedSignals() {
   if (anyUpdated) writeMissedSignalLog(signals);
 }
 
-const LESSONS_LOG_FILE = path.join(__dirname, "lessons.jsonl");
+const LESSONS_LOG_FILE = path.join(DATA_DIR, "lessons.jsonl");
 
 const POSTMORTEM_SYSTEM_PROMPT = `You are writing a structured post-mortem for one resolved crypto futures trade signal. You are NOT deciding anything and NOT allowed to suggest specific numeric changes to scoring, leverage, or thresholds — only Krysie (the trader) makes that decision, later, using accumulated data across many trades.
 
@@ -365,6 +353,15 @@ async function checkOpenPositions() {
   if (anyUpdated) writeSignalLog(signals);
 }
 
+// FIXED (2026-08-28): paper-trade resolution notes now explicitly state
+// the methodology limitation inline on every resolved paper signal, per
+// HYPOTHESES.md issue #5 — real trades resolve via actual BingX order
+// fill status checked individually per TP tier; this resolves via a
+// single current-price snapshot only, which cannot detect the true
+// intraday sequence (e.g. TP1 hit then reversed to SL later would look
+// identical to "SL" here if checked after the reversal). This does NOT
+// change which signals get resolved or how — only makes the weaker
+// methodology impossible to miss when reading the data later.
 async function resolvePaperTrades() {
   if (!BINGX_API_KEY || !BINGX_API_SECRET) return;
   const signals = readSignalLog();
@@ -401,7 +398,7 @@ async function resolvePaperTrades() {
 
       if (outcome) {
         sig.outcome = outcome;
-        sig.notes = `PAPER TRADE (never executed on BingX — skipped by position rules). Resolved via current-price check against logged levels, not real fill confirmation. Current price ${currentPrice} vs entry ${sig.entryZone}.`;
+        sig.notes = `PAPER TRADE — WEAKER METHODOLOGY THAN REAL TRADES (see HYPOTHESES.md issue #5): resolved via a single current-price snapshot check against logged levels, NOT a real BingX fill confirmation. Cannot detect true intraday sequencing (e.g. could show TP3 simply because price is currently past that level, even if the real path spiked through and reversed, or would have hit SL first). Current price ${currentPrice} vs entry ${sig.entryZone}. Never executed on BingX — skipped by position rules.`;
         sig.isPaperTrade = true;
         anyUpdated = true;
         logPostmortem(sig).catch(err => console.error("logPostmortem (paper) failed (non-fatal):", err.message));
@@ -413,9 +410,18 @@ async function resolvePaperTrades() {
   if (anyUpdated) writeSignalLog(signals);
 }
 
+// FIXED (2026-08-28): default behavior flipped per HYPOTHESES.md issue
+// #5. Previously defaulted to blending real + paper trades into one
+// win rate, with ?real=true as an opt-in filter to exclude paper. Given
+// paper-trade resolution uses a structurally weaker methodology than
+// real trades, the safer default is real-only, with paper trades now
+// requiring explicit opt-in via ?includePaper=true. This prevents any
+// future consumer of this endpoint (human or automated) from
+// accidentally reading a contaminated blended number without asking
+// for it directly.
 function computeStats(signals, options = {}) {
-  const { realOnly = false } = options;
-  const base = realOnly ? signals.filter(s => !s.isPaperTrade) : signals;
+  const { includePaper = false } = options;
+  const base = includePaper ? signals : signals.filter(s => !s.isPaperTrade);
   const resolved = base.filter(s => s.outcome && s.outcome !== "not_taken");
 
   function winRate(arr) {
@@ -432,28 +438,31 @@ function computeStats(signals, options = {}) {
   const repeatZone = resolved.filter(s => (s.flags || []).some(f => f.includes("Repeat signal on the same zone")));
   const freshZone = resolved.filter(s => !(s.flags || []).some(f => f.includes("Repeat signal on the same zone")));
 
-  const realCount = base.filter(s => !s.isPaperTrade).length;
-  const paperCount = base.filter(s => s.isPaperTrade).length;
+  const realCount = signals.filter(s => !s.isPaperTrade).length;
+  const paperCount = signals.filter(s => s.isPaperTrade).length;
 
   return {
     totalLogged: signals.length,
     totalResolved: resolved.length,
     realTradeCount: realCount,
     paperTradeCount: paperCount,
-    filterApplied: realOnly ? "real trades only" : "real + paper combined",
+    filterApplied: includePaper ? "real + paper combined" : "real trades only (default — safer, see HYPOTHESES.md issue #5)",
+    ...(includePaper ? {
+      warning: "⚠️ PAPER TRADES INCLUDED — these use a weaker, single-price-snapshot resolution methodology, not real BingX fill confirmations. Do NOT treat this blended win rate as equivalent to real-trade performance. Use default (no ?includePaper=true) for trustworthy numbers.",
+    } : {}),
     overall: winRate(resolved),
     byHtfOpposition: { opposed: winRate(htfOpposed), aligned: winRate(htfAligned) },
     byBtcOpposition: { opposed: winRate(btcOpposed), aligned: winRate(btcAligned) },
     byZoneRepeat: { repeat: winRate(repeatZone), fresh: winRate(freshZone) },
-    note: "Small sample sizes early on will look noisy — this is descriptive, not statistically confirmed until each bucket has a real sample (see docs/HYPOTHESES.md). Paper trades are resolved via current-price checks only, not real fill confirmations — treat as weaker evidence than real trades. Use ?real=true to exclude paper trades entirely.",
+    note: "Small sample sizes early on will look noisy — this is descriptive, not statistically confirmed until each bucket has a real sample (see docs/HYPOTHESES.md). Add ?includePaper=true to include paper trades (not recommended for trustworthy stats).",
   };
 }
 
 const MIN_SAMPLE_FOR_INSIGHT = 8;
 
 function computeChecklistAnalysis(signals, options = {}) {
-  const { realOnly = false } = options;
-  const base = realOnly ? signals.filter(s => !s.isPaperTrade) : signals;
+  const { includePaper = false } = options;
+  const base = includePaper ? signals : signals.filter(s => !s.isPaperTrade);
   const resolved = base.filter(s => s.outcome && s.outcome !== "not_taken" && s.checklist);
 
   function winRateOf(arr) {
@@ -506,12 +515,15 @@ function computeChecklistAnalysis(signals, options = {}) {
 
   return {
     totalResolved: resolved.length,
-    filterApplied: realOnly ? "real trades only" : "real + paper combined",
+    filterApplied: includePaper ? "real + paper combined" : "real trades only (default — safer, see HYPOTHESES.md issue #5)",
+    ...(includePaper ? {
+      warning: "⚠️ PAPER TRADES INCLUDED — suggestions below may be based on contaminated data. Do not act on suggestions generated with this filter without cross-checking against real-only results.",
+    } : {}),
     minSampleForInsight: MIN_SAMPLE_FOR_INSIGHT,
     byChecklistPoint,
     byFlag,
     suggestions: suggestions.length ? suggestions : [`Not enough resolved signals yet for reliable insight — need at least ${MIN_SAMPLE_FOR_INSIGHT} outcomes per bucket before patterns are trustworthy. Currently ${resolved.length} total resolved.`],
-    note: "This is descriptive analysis, not automatic adjustment. Scoring logic stays deterministic and manually reviewed — treat suggestions as hypotheses to evaluate, not instructions to follow blindly. Use ?real=true to exclude paper trades.",
+    note: "This is descriptive analysis, not automatic adjustment. Scoring logic stays deterministic and manually reviewed — treat suggestions as hypotheses to evaluate, not instructions to follow blindly. Add ?includePaper=true to include paper trades (not recommended for real decisions).",
   };
 }
 
@@ -1330,7 +1342,7 @@ ${checklistLines}${flagLines}
 const server = http.createServer(async (req, res) => {
   const urlObj = new URL(req.url, `http://${req.headers.host}`);
   const pathname = urlObj.pathname;
-  const realOnly = urlObj.searchParams.get("real") === "true";
+  const includePaper = urlObj.searchParams.get("includePaper") === "true";
 
   if (req.method === "GET" && pathname === "/") {
     res.writeHead(200); res.end("Trade alert server v10 — deterministic scoring, Claude explains only, signal-only (no execution) ✅"); return;
@@ -1351,13 +1363,13 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && pathname === "/stats") {
     const signals = readSignalLog();
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(computeStats(signals, { realOnly }), null, 2));
+    res.end(JSON.stringify(computeStats(signals, { includePaper }), null, 2));
     return;
   }
   if (req.method === "GET" && pathname === "/analysis") {
     const signals = readSignalLog();
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(computeChecklistAnalysis(signals, { realOnly }), null, 2));
+    res.end(JSON.stringify(computeChecklistAnalysis(signals, { includePaper }), null, 2));
     return;
   }
   if (req.method === "GET" && pathname === "/lessons") {
