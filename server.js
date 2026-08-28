@@ -12,11 +12,6 @@ const BINGX_API_KEY    = process.env.BINGX_API_KEY;
 const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = "https://open-api-vst.bingx.com";
 
-// FIXED (2026-08-28): all three log files now write to a persistent
-// Railway Volume (mounted at /data, set via DATA_DIR env var) instead of
-// __dirname (the app code directory, which is wiped on every redeploy).
-// Falls back to __dirname if DATA_DIR isn't set, so this doesn't break
-// local/dev runs without a volume attached.
 const DATA_DIR = process.env.DATA_DIR || __dirname;
 const SIGNAL_LOG_FILE = path.join(DATA_DIR, "signals.jsonl");
 
@@ -353,15 +348,6 @@ async function checkOpenPositions() {
   if (anyUpdated) writeSignalLog(signals);
 }
 
-// FIXED (2026-08-28): paper-trade resolution notes now explicitly state
-// the methodology limitation inline on every resolved paper signal, per
-// HYPOTHESES.md issue #5 — real trades resolve via actual BingX order
-// fill status checked individually per TP tier; this resolves via a
-// single current-price snapshot only, which cannot detect the true
-// intraday sequence (e.g. TP1 hit then reversed to SL later would look
-// identical to "SL" here if checked after the reversal). This does NOT
-// change which signals get resolved or how — only makes the weaker
-// methodology impossible to miss when reading the data later.
 async function resolvePaperTrades() {
   if (!BINGX_API_KEY || !BINGX_API_SECRET) return;
   const signals = readSignalLog();
@@ -398,7 +384,7 @@ async function resolvePaperTrades() {
 
       if (outcome) {
         sig.outcome = outcome;
-        sig.notes = `PAPER TRADE — WEAKER METHODOLOGY THAN REAL TRADES (see HYPOTHESES.md issue #5): resolved via a single current-price snapshot check against logged levels, NOT a real BingX fill confirmation. Cannot detect true intraday sequencing (e.g. could show TP3 simply because price is currently past that level, even if the real path spiked through and reversed, or would have hit SL first). Current price ${currentPrice} vs entry ${sig.entryZone}. Never executed on BingX — skipped by position rules.`;
+        sig.notes = `PAPER TRADE — WEAKER METHODOLOGY THAN REAL TRADES (see HYPOTHESES.md issue #5): resolved via a single current-price snapshot check against logged levels, NOT a real BingX fill confirmation. Cannot detect true intraday sequencing. Current price ${currentPrice} vs entry ${sig.entryZone}. Never executed on BingX — skipped by position rules.`;
         sig.isPaperTrade = true;
         anyUpdated = true;
         logPostmortem(sig).catch(err => console.error("logPostmortem (paper) failed (non-fatal):", err.message));
@@ -410,15 +396,6 @@ async function resolvePaperTrades() {
   if (anyUpdated) writeSignalLog(signals);
 }
 
-// FIXED (2026-08-28): default behavior flipped per HYPOTHESES.md issue
-// #5. Previously defaulted to blending real + paper trades into one
-// win rate, with ?real=true as an opt-in filter to exclude paper. Given
-// paper-trade resolution uses a structurally weaker methodology than
-// real trades, the safer default is real-only, with paper trades now
-// requiring explicit opt-in via ?includePaper=true. This prevents any
-// future consumer of this endpoint (human or automated) from
-// accidentally reading a contaminated blended number without asking
-// for it directly.
 function computeStats(signals, options = {}) {
   const { includePaper = false } = options;
   const base = includePaper ? signals : signals.filter(s => !s.isPaperTrade);
@@ -630,6 +607,52 @@ function toBingXSymbol(symbol) {
   return symbol;
 }
 
+// ============================================================
+// SYMBOL PRECISION LOOKUP (new) — replaces the previous hardcoded
+// .toFixed(3) quantity rounding used for EVERY coin regardless of
+// symbol. That worked for ETH/SUI by coincidence, but is not safe in
+// general: BingX requires different quantity precision per symbol, and
+// an incorrect precision causes the real order to be silently REJECTED
+// by BingX — not caught by any of the bot's own safety rules, just a
+// formatting mismatch. This matters now that SOLUSDT has been added,
+// and will matter for any future coin. Queries BingX's real contract
+// specs once per symbol and caches the result in memory, so this stays
+// correct automatically without needing a manual code change every
+// time a new coin is added to the Pine Script alerts.
+//
+// FAILS SAFE: if the lookup fails for any reason (network issue,
+// symbol not found, unexpected response shape), falls back to the
+// previous hardcoded 3-decimal behavior rather than blocking execution
+// entirely — same fail-safe philosophy as getOpenPosition's failing-
+// closed pattern elsewhere in this file, but here failing OPEN with a
+// logged warning, since a slightly-wrong quantity precision on an
+// unfamiliar symbol is a much smaller risk than silently never trading
+// a coin at all due to a lookup hiccup.
+// ============================================================
+const symbolPrecisionCache = new Map(); // bingxSymbol -> quantityPrecision (integer)
+
+async function getQuantityPrecision(symbol) {
+  if (symbolPrecisionCache.has(symbol)) return symbolPrecisionCache.get(symbol);
+  try {
+    const res = await bingxRequest("GET", "/openApi/swap/v2/quote/contracts", {});
+    const contracts = Array.isArray(res.data) ? res.data : [];
+    const match = contracts.find(c => c.symbol === symbol);
+    if (match && match.quantityPrecision !== undefined && match.quantityPrecision !== null) {
+      const precision = parseInt(match.quantityPrecision, 10);
+      if (!isNaN(precision)) {
+        symbolPrecisionCache.set(symbol, precision);
+        console.log(`Quantity precision for ${symbol}: ${precision} decimals (fetched from BingX contract specs)`);
+        return precision;
+      }
+    }
+    console.error(`Could not find valid contract spec for ${symbol} — falling back to 3-decimal precision (may be incorrect for this specific symbol, watch for rejected orders in logs)`);
+    return 3;
+  } catch (err) {
+    console.error(`Failed to fetch quantity precision for ${symbol} (non-fatal, falling back to 3-decimal default):`, err.message);
+    return 3;
+  }
+}
+
 function computeBingXSizing(confidence) {
   return confidence === "HIGH"
     ? { marginUSDT: 2000, leverage: 15 }
@@ -705,7 +728,12 @@ async function executeOnBingX(decision, payload) {
       return;
     }
     const notional = marginUSDT * leverage;
-    const quantity = Number((notional / entryPrice).toFixed(3));
+
+    // FIXED (2026-08-28): quantity precision now looked up per-symbol
+    // from BingX's real contract specs instead of hardcoded to 3
+    // decimals for every coin — see getQuantityPrecision comment above.
+    const qtyPrecision = await getQuantityPrecision(symbol);
+    const quantity = Number((notional / entryPrice).toFixed(qtyPrecision));
 
     const leverageRes = await bingxRequest("POST", "/openApi/swap/v2/trade/leverage", {
       symbol, side: positionSide, leverage,
@@ -727,9 +755,9 @@ async function executeOnBingX(decision, payload) {
       return;
     }
 
-    const tp1Qty = Number((quantity * 0.4).toFixed(3));
-    const tp2Qty = Number((quantity * 0.3).toFixed(3));
-    const tp3Qty = Number((quantity - tp1Qty - tp2Qty).toFixed(3));
+    const tp1Qty = Number((quantity * 0.4).toFixed(qtyPrecision));
+    const tp2Qty = Number((quantity * 0.3).toFixed(qtyPrecision));
+    const tp3Qty = Number((quantity - tp1Qty - tp2Qty).toFixed(qtyPrecision));
 
     const tpTargets = [
       { price: levels.tp1Raw ?? null, qty: tp1Qty, label: "TP1" },
