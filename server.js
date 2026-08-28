@@ -71,6 +71,132 @@ function writeSignalLog(signals) {
   }
 }
 
+// ============================================================
+// MISSED-SIGNAL LOGGING (new) — currently, any signal that scores below
+// threshold, gets BTC-blocked, or fails structure checks is discarded
+// with zero record ("console.log then return"). This means there is
+// NO WAY to ever check "did the bot correctly reject weak setups, or
+// is the threshold too strict and missing real winners?" — a real gap
+// named explicitly in review of tonight's work. This logs every
+// recognized-but-rejected structural signal (mitigated OB, below
+// threshold, BTC-opposed, missing structure) with the HYPOTHETICAL
+// entry/SL/TP levels it would have used, computed the same way a real
+// trade would, purely for later comparison against what price actually
+// did. Never executes anything — logging only.
+// ============================================================
+const MISSED_SIGNAL_LOG_FILE = path.join(__dirname, "missed_signals.jsonl");
+
+function computeHypotheticalLevels(payload, direction, type) {
+  try {
+    const isSwing = type.startsWith("OB_SWING_");
+    const levels = isSwing
+      ? computeSwingLevels(payload, direction)
+      : type.startsWith("OB_")
+        ? computeOBLevels(payload, direction)
+        : computeBreakoutLevels(payload, direction);
+    if (!levels.entryMidRaw || levels.entryMidRaw <= 0 || isNaN(levels.entryMidRaw)) return null;
+    return levels;
+  } catch {
+    return null;
+  }
+}
+
+function logMissedSignal(decision, payload) {
+  try {
+    const { type, scoreResult, reason } = decision;
+    if (!type || !scoreResult) return; // UNRECOGNIZED signals aren't real setups, nothing to learn from
+    const direction = scoreResult.direction;
+    const levels = computeHypotheticalLevels(payload, direction, type);
+    const entry = {
+      loggedAt: new Date().toISOString(),
+      symbol: payload.symbol || "—",
+      condition: payload.condition || "",
+      type,
+      direction,
+      rawScore: scoreResult.rawScore,
+      rejectionReason: reason,
+      checklist: scoreResult.points ? scoreResult.points.map(p => ({ label: p.label, pass: p.pass })) : null,
+      htfTrend: payload.htfTrend || null,
+      btcTrend: payload.btcTrend || null,
+      smtBias: payload.smtBias || null,
+      killzone: bool(payload.killzone),
+      hypotheticalEntryZone: levels?.entryZone || null,
+      hypotheticalStopLoss: levels?.stopLoss || null,
+      hypotheticalTp1: levels?.tp1 || null,
+      hypotheticalTp2: levels?.tp2 || null,
+      hypotheticalTp3: levels?.tp3 || null,
+      outcome: null, // filled in later by resolveMissedSignals: "WOULD_HAVE_WON" | "WOULD_HAVE_LOST" | null
+      isMissedSignal: true,
+    };
+    fs.appendFileSync(MISSED_SIGNAL_LOG_FILE, JSON.stringify(entry) + "\n");
+  } catch (err) {
+    console.error("Missed-signal logging failed (non-fatal):", err.message);
+  }
+}
+
+function readMissedSignalLog() {
+  try {
+    if (!fs.existsSync(MISSED_SIGNAL_LOG_FILE)) return [];
+    const lines = fs.readFileSync(MISSED_SIGNAL_LOG_FILE, "utf8").split("\n").filter(Boolean);
+    return lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function writeMissedSignalLog(signals) {
+  try {
+    const lines = signals.map(s => JSON.stringify(s)).join("\n") + (signals.length ? "\n" : "");
+    fs.writeFileSync(MISSED_SIGNAL_LOG_FILE, lines);
+  } catch (err) {
+    console.error("Failed to rewrite missed-signal log (non-fatal):", err.message);
+  }
+}
+
+// Resolves missed (rejected) signals against CURRENT price only — same
+// honest limitation as resolvePaperTrades: this cannot know the true
+// intraday sequence (did it hit TP first then reverse to SL, or vice
+// versa), only "where is price right now relative to the hypothetical
+// levels." Treat as directional evidence, not precise backtesting.
+async function resolveMissedSignals() {
+  if (!BINGX_API_KEY || !BINGX_API_SECRET) return;
+  const signals = readMissedSignalLog();
+  const candidates = signals.filter(s => s.outcome === null && s.hypotheticalEntryZone);
+  if (!candidates.length) return;
+
+  let anyUpdated = false;
+  for (const sig of candidates) {
+    try {
+      const symbol = toBingXSymbol(sig.symbol);
+      const tickerRes = await bingxRequest("GET", "/openApi/swap/v2/quote/price", { symbol });
+      const currentPrice = parseFloat(tickerRes.data?.price ?? tickerRes.price);
+      if (!currentPrice || isNaN(currentPrice)) continue;
+
+      const parsePrice = (str) => parseFloat(String(str).replace(/[^0-9.]/g, ""));
+      const sl = parsePrice(sig.hypotheticalStopLoss);
+      const tp1 = parsePrice(sig.hypotheticalTp1);
+      const isShort = sig.direction === "Short";
+
+      let outcome = null;
+      if (isShort) {
+        if (currentPrice >= sl) outcome = "WOULD_HAVE_LOST";
+        else if (currentPrice <= tp1) outcome = "WOULD_HAVE_WON";
+      } else {
+        if (currentPrice <= sl) outcome = "WOULD_HAVE_LOST";
+        else if (currentPrice >= tp1) outcome = "WOULD_HAVE_WON";
+      }
+
+      if (outcome) {
+        sig.outcome = outcome;
+        anyUpdated = true;
+      }
+    } catch (err) {
+      console.error(`Missed-signal resolution failed for ${sig.symbol}:`, err.message);
+    }
+  }
+  if (anyUpdated) writeMissedSignalLog(signals);
+}
+
 const LESSONS_LOG_FILE = path.join(__dirname, "lessons.jsonl");
 
 const POSTMORTEM_SYSTEM_PROMPT = `You are writing a structured post-mortem for one resolved crypto futures trade signal. You are NOT deciding anything and NOT allowed to suggest specific numeric changes to scoring, leverage, or thresholds — only Krysie (the trader) makes that decision, later, using accumulated data across many trades.
@@ -104,7 +230,7 @@ HTF trend: ${signal.htfTrend}, BTC trend: ${signal.btcTrend}, SMT bias: ${signal
 Write the four-section post-mortem now.`;
 
   const body = JSON.stringify({
-    model: "claude-sonnet-4-6",
+    model: "claude-sonnet-5",
     max_tokens: 400,
     system: POSTMORTEM_SYSTEM_PROMPT,
     messages: [{ role: "user", content: userMessage }],
@@ -125,13 +251,19 @@ Write the four-section post-mortem now.`;
       res.on("end", () => {
         try {
           const parsed = JSON.parse(data);
-          resolve((parsed.content?.[0]?.text || "").trim() || null);
-        } catch {
+          const text = (parsed.content?.[0]?.text || "").trim();
+          if (!text) console.error("generatePostmortem: empty/unexpected response:", data.slice(0, 300));
+          resolve(text || null);
+        } catch (err) {
+          console.error("generatePostmortem: response parse failed. Raw response:", data.slice(0, 300));
           resolve(null);
         }
       });
     });
-    req.on("error", () => resolve(null));
+    req.on("error", (err) => {
+      console.error("generatePostmortem: API call failed:", err.message);
+      resolve(null);
+    });
     req.write(body);
     req.end();
   });
@@ -233,25 +365,6 @@ async function checkOpenPositions() {
   if (anyUpdated) writeSignalLog(signals);
 }
 
-// ============================================================
-// PAPER-TRADE RESOLUTION (new) — signals that got skipped by
-// one-position-per-symbol (or opposing-direction/repeat-zone rules)
-// never receive a bingxOrderId, which means checkOpenPositions's
-// bingxOrderId filter permanently excludes them from ever resolving.
-// Confirmed via real backup data 2026-08-26: 121 signals logged over
-// 10 days, ZERO had outcomes, because the vast majority were skipped
-// executions sitting behind long-held existing positions.
-//
-// HONEST LIMITATION: this checks skipped signals against CURRENT price
-// only, not the historic price path since the signal fired. It can
-// only detect "price is currently past this signal's TP/SL level right
-// now" — it cannot know if price hit TP1 first then reversed into SL
-// later, or vice versa. This makes paper outcomes structurally less
-// reliable than real executed-trade outcomes (which use actual BingX
-// fill confirmations). Paper outcomes are tagged isPaperTrade: true
-// and MUST be kept separate from real trade stats, never silently
-// blended into the same win-rate pool.
-// ============================================================
 async function resolvePaperTrades() {
   if (!BINGX_API_KEY || !BINGX_API_SECRET) return;
   const signals = readSignalLog();
@@ -1042,7 +1155,7 @@ SMT bias: ${payload.smtBias}, RSI: ${payload.rsi}, HTF trend: ${payload.htfTrend
 Write the 1-2 sentence reasoning now.`;
 
   const body = JSON.stringify({
-    model: "claude-sonnet-4-6",
+    model: "claude-sonnet-5",
     max_tokens: 300,
     system: EXPLAIN_SYSTEM_PROMPT,
     messages: [{ role: "user", content: userMessage }],
@@ -1063,13 +1176,19 @@ Write the 1-2 sentence reasoning now.`;
       res.on("end", () => {
         try {
           const parsed = JSON.parse(data);
-          resolve((parsed.content?.[0]?.text || "").trim() || "Deterministic checklist cleared threshold — see score breakdown above.");
-        } catch {
+          const text = (parsed.content?.[0]?.text || "").trim();
+          if (!text) console.error("explainDecision: empty/unexpected response:", data.slice(0, 300));
+          resolve(text || "Deterministic checklist cleared threshold — see score breakdown above.");
+        } catch (err) {
+          console.error("explainDecision: response parse failed. Raw response:", data.slice(0, 300));
           resolve("Deterministic checklist cleared threshold — see score breakdown above.");
         }
       });
     });
-    req.on("error", () => resolve("Deterministic checklist cleared threshold — see score breakdown above."));
+    req.on("error", (err) => {
+      console.error("explainDecision: API call failed:", err.message);
+      resolve("Deterministic checklist cleared threshold — see score breakdown above.");
+    });
     req.write(body);
     req.end();
   });
@@ -1081,7 +1200,7 @@ async function generateLegacyNote(payload) {
   const userMessage = `Manual level crossed. Condition: ${payload.condition}. Symbol: ${payload.symbol}. Price: $${payload.price}. RSI: ${payload.rsi}. Cumulative Delta: ${payload.cumDelta}. Session: ${payload.session}. Kill zone active: ${payload.killzone}.`;
 
   const body = JSON.stringify({
-    model: "claude-sonnet-4-6",
+    model: "claude-sonnet-5",
     max_tokens: 300,
     system: LEGACY_SYSTEM_PROMPT,
     messages: [{ role: "user", content: userMessage }],
@@ -1102,11 +1221,19 @@ async function generateLegacyNote(payload) {
       res.on("end", () => {
         try {
           const parsed = JSON.parse(data);
-          resolve((parsed.content?.[0]?.text || "").trim() || "No commentary available.");
-        } catch { resolve("No commentary available."); }
+          const text = (parsed.content?.[0]?.text || "").trim();
+          if (!text) console.error("generateLegacyNote: empty/unexpected response:", data.slice(0, 300));
+          resolve(text || "No commentary available.");
+        } catch (err) {
+          console.error("generateLegacyNote: response parse failed. Raw response:", data.slice(0, 300));
+          resolve("No commentary available.");
+        }
       });
     });
-    req.on("error", () => resolve("No commentary available."));
+    req.on("error", (err) => {
+      console.error("generateLegacyNote: API call failed:", err.message);
+      resolve("No commentary available.");
+    });
     req.write(body);
     req.end();
   });
@@ -1239,6 +1366,12 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ count: lessons.length, lessons }, null, 2));
     return;
   }
+  if (req.method === "GET" && pathname === "/missed-signals") {
+    const missed = readMissedSignalLog();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ count: missed.length, missed }, null, 2));
+    return;
+  }
 
   if (req.method === "POST" && pathname === "/webhook") {
     let body = "";
@@ -1287,6 +1420,7 @@ ${note}`);
 
         if (decision.verdict === "NO_TRADE") {
           console.log("No trade (deterministic) — complete silence ⏭️", new Date().toISOString(), "| condition:", condition, "| reason:", decision.reason);
+          logMissedSignal(decision, payload);
           return;
         }
 
@@ -1315,6 +1449,7 @@ server.listen(PORT, () => console.log(`Server v10 running on port ${PORT}`));
 setInterval(() => {
   checkOpenPositions().catch(err => console.error("checkOpenPositions failed (non-fatal):", err.message));
   resolvePaperTrades().catch(err => console.error("resolvePaperTrades failed (non-fatal):", err.message));
+  resolveMissedSignals().catch(err => console.error("resolveMissedSignals failed (non-fatal):", err.message));
 }, 15 * 60 * 1000);
 
 setInterval(() => {
