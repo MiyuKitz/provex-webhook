@@ -24,6 +24,8 @@ function logSignal(decision, payload, execResult) {
       condition: payload.condition || "",
       type,
       isSwing: !!isSwing,
+            zoneAttempt: payload._zoneAttempt || 1,
+      isRepeatZone: payload._isRepeatZone || false,
       direction: scoreResult.direction,
       rawScore: scoreResult.rawScore,
       confidence: gated.confidence,
@@ -1143,6 +1145,8 @@ function buildDecision(payload) {
 
   if (type.startsWith("OB_")) {
     const zoneCheck = checkZoneCooldown(payload, direction);
+        payload._zoneAttempt = zoneCheck.count;
+    payload._isRepeatZone = zoneCheck.isRepeat;
     if (zoneCheck.isRepeat) {
       gated.confidence = "MEDIUM";
       const topOfBand = parseInt(gated.leverage.split("-")[1], 10);
