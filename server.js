@@ -1408,6 +1408,14 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify(computeChecklistAnalysis(signals, { includePaper }), null, 2));
     return;
   }
+    if (req.method === "GET" && pathname === "/report") {
+    const days = parseInt(urlObj.searchParams.get("days") || "7", 10);
+    const r = buildPerformanceReport(days);
+    if (urlObj.searchParams.get("send") === "true") sendPerformanceReport(days);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(r, null, 2));
+    return;
+  }
   if (req.method === "GET" && pathname === "/lessons") {
     const lessons = readLessonsLog();
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -1541,3 +1549,195 @@ setInterval(() => {
 setTimeout(() => {
   sendSignalBackupToTelegram().catch(err => console.error("Startup backup failed (non-fatal):", err.message));
 }, 60 * 1000);
+
+// ============================================================
+// PERFORMANCE REPORT (added 2026-09-04)
+//
+// Produces a period performance summary for Telegram + /report.
+//
+// Deliberate design choices, so the numbers mean something:
+//  - Deduplicates by SETUP, not by raw signal. The same OB re-alerting
+//    as price lingers inflates counts ~1.93x. Reports the deduped
+//    figure as primary and raw as secondary.
+//  - Keeps REAL and PAPER trades in separate columns and never blends
+//    them into one headline win rate.
+//  - Reports R-multiples, not percentage returns. Summing leveraged
+//    percentage returns across differently-sized positions produces a
+//    meaningless total; R is comparable across trades.
+//  - States sample size next to every win rate, and says plainly when
+//    the sample is too small to mean anything.
+// ============================================================
+
+const MIN_SAMPLE_FOR_CONFIDENCE = 20;
+
+function isWin(outcome) { return outcome === "TP1" || outcome === "TP2" || outcome === "TP3"; }
+function isLoss(outcome) { return outcome === "SL"; }
+function isClosed(outcome) { return isWin(outcome) || isLoss(outcome); }
+
+function dedupeBySetup(signals) {
+  const seen = new Map();
+  for (const s of signals) {
+    const key = [s.symbol, s.direction, s.entryZone, s.stopLoss].join("|");
+    if (!seen.has(key)) seen.set(key, { ...s, _dupCount: 1 });
+    else seen.get(key)._dupCount += 1;
+  }
+  return [...seen.values()];
+}
+
+function bucketStats(arr) {
+  const wins = arr.filter(s => isWin(s.outcome)).length;
+  const losses = arr.filter(s => isLoss(s.outcome)).length;
+  const total = wins + losses;
+  const r = arr.reduce((a, s) => a + (Number(s.realizedR) || 0), 0);
+  return {
+    wins, losses, total,
+    winRate: total > 0 ? Number((wins / total * 100).toFixed(1)) : null,
+    totalR: Number(r.toFixed(2)),
+  };
+}
+
+function groupBy(arr, keyFn) {
+  const m = {};
+  for (const s of arr) {
+    const k = keyFn(s) ?? "unknown";
+    (m[k] = m[k] || []).push(s);
+  }
+  return m;
+}
+
+function pad(str, len) {
+  const s = String(str ?? "");
+  return s.length >= len ? s.slice(0, len) : s + " ".repeat(len - s.length);
+}
+function padL(str, len) {
+  const s = String(str ?? "");
+  return s.length >= len ? s.slice(0, len) : " ".repeat(len - s.length) + s;
+}
+
+function buildPerformanceReport(days = 7) {
+  const all = readSignalLog();
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+  const inPeriod = all.filter(s => {
+    const t = Date.parse(s.loggedAt);
+    return !isNaN(t) && t >= cutoff;
+  });
+
+  const rawCount = inPeriod.length;
+  const setups = dedupeBySetup(inPeriod);
+  const inflation = setups.length > 0 ? (rawCount / setups.length) : 1;
+
+  const real = setups.filter(s => !s.isPaperTrade);
+  const paper = setups.filter(s => s.isPaperTrade);
+  const realClosed = real.filter(s => isClosed(s.outcome));
+  const paperClosed = paper.filter(s => isClosed(s.outcome));
+  const pending = setups.filter(s => !s.outcome);
+  const notTaken = setups.filter(s => s.outcome === "not_taken");
+
+  const realStats = bucketStats(realClosed);
+  const paperStats = bucketStats(paperClosed);
+
+  const closedAll = [...realClosed, ...paperClosed];
+  const byDirection = groupBy(closedAll, s => s.direction);
+  const bySymbol = groupBy(closedAll, s => s.symbol);
+  const byConfidence = groupBy(closedAll, s => s.confidence);
+  const byKillzone = groupBy(closedAll, s => (s.killzone ? "In kill zone" : "Outside"));
+
+  const missed = readMissedSignalLog().filter(s => {
+    const t = Date.parse(s.loggedAt);
+    return !isNaN(t) && t >= cutoff;
+  });
+  const missedWouldWin = missed.filter(s => s.outcome === "WOULD_HAVE_WON").length;
+  const missedWouldLose = missed.filter(s => s.outcome === "WOULD_HAVE_LOST").length;
+
+  return {
+    days, rawCount, setupCount: setups.length, inflation: Number(inflation.toFixed(2)),
+    realCount: real.length, paperCount: paper.length,
+    pendingCount: pending.length, notTakenCount: notTaken.length,
+    realStats, paperStats,
+    byDirection: Object.fromEntries(Object.entries(byDirection).map(([k, v]) => [k, bucketStats(v)])),
+    bySymbol: Object.fromEntries(Object.entries(bySymbol).map(([k, v]) => [k, bucketStats(v)])),
+    byConfidence: Object.fromEntries(Object.entries(byConfidence).map(([k, v]) => [k, bucketStats(v)])),
+    byKillzone: Object.fromEntries(Object.entries(byKillzone).map(([k, v]) => [k, bucketStats(v)])),
+    missed: { total: missed.length, wouldHaveWon: missedWouldWin, wouldHaveLost: missedWouldLose },
+    sampleAdequate: realStats.total >= MIN_SAMPLE_FOR_CONFIDENCE,
+    minSampleForConfidence: MIN_SAMPLE_FOR_CONFIDENCE,
+  };
+}
+
+function formatReportForTelegram(r) {
+  const rate = (b) => b.winRate === null ? "  —  " : padL(b.winRate + "%", 5);
+  const line = (label, b) => `${pad(label, 13)}${padL(b.wins, 3)}${padL(b.losses, 4)}${rate(b)}${padL(b.totalR.toFixed(1) + "R", 7)}`;
+
+  let out = `📈 <b>ProveX Bot — ${r.days}-Day Performance</b>\n`;
+  out += `<i>${new Date().toLocaleString("en-AU", { timeZone: "Australia/Melbourne", dateStyle: "medium", timeStyle: "short" })} AEDT</i>\n\n`;
+
+  out += `<b>SIGNAL VOLUME</b>\n<pre>`;
+  out += `Raw alerts     ${padL(r.rawCount, 5)}\n`;
+  out += `Unique setups  ${padL(r.setupCount, 5)}   (${r.inflation}x dup)\n`;
+  out += `Still pending  ${padL(r.pendingCount, 5)}\n`;
+  out += `Not taken      ${padL(r.notTakenCount, 5)}\n`;
+  out += `</pre>\n`;
+
+  out += `<b>OUTCOMES</b>  <i>(deduped setups)</i>\n<pre>`;
+  out += `${pad("", 13)}${padL("W", 3)}${padL("L", 4)}${padL("Rate", 5)}${padL("Total", 7)}\n`;
+  out += line("REAL fills", r.realStats) + `\n`;
+  out += line("PAPER only", r.paperStats) + `\n`;
+  out += `</pre>\n`;
+
+  const sections = [
+    ["BY DIRECTION", r.byDirection],
+    ["BY SYMBOL", r.bySymbol],
+    ["BY CONFIDENCE", r.byConfidence],
+    ["BY SESSION", r.byKillzone],
+  ];
+  for (const [title, data] of sections) {
+    const entries = Object.entries(data).filter(([, b]) => b.total > 0);
+    if (!entries.length) continue;
+    out += `<b>${title}</b>\n<pre>`;
+    for (const [k, b] of entries) out += line(k, b) + `\n`;
+    out += `</pre>\n`;
+  }
+
+  if (r.missed.total) {
+    out += `<b>BLOCKED SIGNALS</b>\n<pre>`;
+    out += `Rejected       ${padL(r.missed.total, 5)}\n`;
+    out += `Would've won   ${padL(r.missed.wouldHaveWon, 5)}\n`;
+    out += `Would've lost  ${padL(r.missed.wouldHaveLost, 5)}\n`;
+    out += `</pre>\n`;
+  }
+
+  out += `\n<b>READ THIS BEFORE TRUSTING THE NUMBERS</b>\n`;
+  if (!r.sampleAdequate) {
+    out += `⚠️ Only ${r.realStats.total} real closed trade(s). Nothing here is statistically meaningful below ~${r.minSampleForConfidence}. Treat every rate above as noise.\n`;
+  }
+  if (r.paperStats.total > 0) {
+    out += `⚠️ Paper trades are resolved by price snapshot, not real fills — no entry gate, no intraday sequencing. Weaker evidence, kept in a separate row deliberately.\n`;
+  }
+  if (r.inflation > 1.2) {
+    out += `ℹ️ ${r.rawCount} raw alerts collapsed to ${r.setupCount} setups (${r.inflation}x). Same OB re-alerting; deduped figures are the honest ones.\n`;
+  }
+  out += `ℹ️ Results are shown in R-multiples, not % return. Summing leveraged percentages across different position sizes gives a meaningless total.`;
+
+  return out;
+}
+
+async function sendPerformanceReport(days = 7) {
+  try {
+    const r = buildPerformanceReport(days);
+    await sendTelegram(formatReportForTelegram(r));
+    console.log(`Performance report sent (${days}d): ${r.setupCount} setups, ${r.realStats.total} real closed`);
+  } catch (err) {
+    console.error("Performance report failed (non-fatal):", err.message);
+  }
+}
+
+// Daily report at ~08:00 AEDT. Checks hourly, fires once per day.
+let lastReportDay = null;
+setInterval(() => {
+  const nowAEDT = new Date().toLocaleString("en-AU", { timeZone: "Australia/Melbourne", hour: "2-digit", hour12: false });
+  const dayKey = new Date().toLocaleDateString("en-AU", { timeZone: "Australia/Melbourne" });
+  if (parseInt(nowAEDT, 10) === 8 && lastReportDay !== dayKey) {
+    lastReportDay = dayKey;
+    sendPerformanceReport(7).catch(err => console.error("Daily report failed:", err.message));
+  }
+}, 60 * 60 * 1000);
