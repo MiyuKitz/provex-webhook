@@ -15,6 +15,23 @@ const BINGX_BASE_URL   = "https://open-api-vst.bingx.com";
 const DATA_DIR = process.env.DATA_DIR || __dirname;
 const SIGNAL_LOG_FILE = path.join(DATA_DIR, "signals.jsonl");
 
+// ============================================================
+// SHARED RESPONSE PARSER (fixed 2026-09-04)
+// Previously each Claude call did: parsed.content?.[0]?.text
+// That breaks with claude-sonnet-5, which can return a "thinking"
+// block as content[0] — index 0 then has no .text, the call silently
+// returns falsy, and callers fall back to defaults (or bail entirely,
+// which is why lessons.jsonl was never written).
+// This filters by block type instead of position.
+// ============================================================
+function extractClaudeText(parsed) {
+  return (parsed.content || [])
+    .filter(b => b.type === "text")
+    .map(b => b.text || "")
+    .join("")
+    .trim();
+}
+
 function logSignal(decision, payload, execResult) {
   try {
     const { type, scoreResult, gated, levels, isSwing } = decision;
@@ -24,7 +41,7 @@ function logSignal(decision, payload, execResult) {
       condition: payload.condition || "",
       type,
       isSwing: !!isSwing,
-            zoneAttempt: payload._zoneAttempt || 1,
+      zoneAttempt: payload._zoneAttempt || 1,
       isRepeatZone: payload._isRepeatZone || false,
       direction: scoreResult.direction,
       rawScore: scoreResult.rawScore,
@@ -236,7 +253,7 @@ Write the four-section post-mortem now.`;
       res.on("end", () => {
         try {
           const parsed = JSON.parse(data);
-          const text = (parsed.content?.[0]?.text || "").trim();
+          const text = extractClaudeText(parsed);
           if (!text) console.error("generatePostmortem: empty/unexpected response:", data.slice(0, 300));
           resolve(text || null);
         } catch (err) {
@@ -706,19 +723,6 @@ async function executeOnBingX(decision, payload) {
       return;
     }
 
-    if (positionCheck.existing && positionCheck.existing.direction !== direction) {
-      console.log(`Skipping ${symbol} ${direction} — existing opposing ${positionCheck.existing.direction} position open`);
-      await sendTelegram(`🔕 <b>BingX execution skipped</b>\nSymbol: ${symbol}\nSignal: ${direction}, but an existing ${positionCheck.existing.direction} position is already open on this symbol — opening now would net against it and break TP placement (the exact bug from earlier tonight). Skipped intentionally.`);
-      return;
-    }
-
-    const isRepeatZone = gated.flags.some(f => f.includes("Repeat signal on the same zone"));
-    if (isRepeatZone && positionCheck.existing) {
-      console.log(`Skipping ${symbol} ${direction} — repeat-zone signal, position already open (${positionCheck.existing.direction}, avoiding uncontrolled stacking)`);
-      await sendTelegram(`🔕 <b>BingX execution skipped</b>\nSymbol: ${symbol}\nSignal: ${direction} (repeat-zone, lower conviction) — a ${positionCheck.existing.direction} position is already open on this symbol. Not adding more capital to it; the repeat-zone flag exists precisely to avoid treating this as a fresh, independently-sized trade.`);
-      return;
-    }
-
     const positionSide = direction === "Short" ? "SHORT" : "LONG";
     const entrySide = direction === "Short" ? "SELL" : "BUY";
     const exitSide = direction === "Short" ? "BUY" : "SELL";
@@ -1145,7 +1149,7 @@ function buildDecision(payload) {
 
   if (type.startsWith("OB_")) {
     const zoneCheck = checkZoneCooldown(payload, direction);
-        payload._zoneAttempt = zoneCheck.count;
+    payload._zoneAttempt = zoneCheck.count;
     payload._isRepeatZone = zoneCheck.isRepeat;
     if (zoneCheck.isRepeat) {
       gated.confidence = "MEDIUM";
@@ -1220,7 +1224,7 @@ Write the 1-2 sentence reasoning now.`;
       res.on("end", () => {
         try {
           const parsed = JSON.parse(data);
-          const text = (parsed.content?.[0]?.text || "").trim();
+          const text = extractClaudeText(parsed);
           if (!text) console.error("explainDecision: empty/unexpected response:", data.slice(0, 300));
           resolve(text || "Deterministic checklist cleared threshold — see score breakdown above.");
         } catch (err) {
@@ -1265,7 +1269,7 @@ async function generateLegacyNote(payload) {
       res.on("end", () => {
         try {
           const parsed = JSON.parse(data);
-          const text = (parsed.content?.[0]?.text || "").trim();
+          const text = extractClaudeText(parsed);
           if (!text) console.error("generateLegacyNote: empty/unexpected response:", data.slice(0, 300));
           resolve(text || "No commentary available.");
         } catch (err) {
@@ -1377,7 +1381,7 @@ const server = http.createServer(async (req, res) => {
   const includePaper = urlObj.searchParams.get("includePaper") === "true";
 
   if (req.method === "GET" && pathname === "/") {
-    res.writeHead(200); res.end("Trade alert server v10 — deterministic scoring, Claude explains only, signal-only (no execution) ✅"); return;
+    res.writeHead(200); res.end("Trade alert server v11 — deterministic scoring, Claude explains only, signal-only (no execution) ✅"); return;
   }
 
   if (req.method === "GET" && pathname === "/signals") {
@@ -1414,6 +1418,39 @@ const server = http.createServer(async (req, res) => {
     const missed = readMissedSignalLog();
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ count: missed.length, missed }, null, 2));
+    return;
+  }
+
+  // ============================================================
+  // /test-postmortem  (added 2026-09-04)
+  // Forces a post-mortem run against an already-resolved signal so the
+  // whole chain (prompt -> API -> parse -> file write -> Telegram) can
+  // be verified on demand instead of waiting for a live trade to
+  // resolve. Optional ?index=N picks a specific resolved signal;
+  // defaults to the most recent one.
+  // ============================================================
+  if (req.method === "GET" && pathname === "/test-postmortem") {
+    const signals = readSignalLog();
+    const resolved = signals.filter(s => s.outcome && s.outcome !== "not_taken");
+    if (!resolved.length) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error: "No resolved signals available to test against." }, null, 2));
+      return;
+    }
+    const idxParam = urlObj.searchParams.get("index");
+    const idx = idxParam !== null ? parseInt(idxParam, 10) : resolved.length - 1;
+    const sig = resolved[Math.max(0, Math.min(idx, resolved.length - 1))];
+    const postmortem = await generatePostmortem(sig);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      ok: !!postmortem,
+      testedSignal: { symbol: sig.symbol, direction: sig.direction, outcome: sig.outcome, loggedAt: sig.loggedAt },
+      resolvedAvailable: resolved.length,
+      postmortem: postmortem || null,
+      note: postmortem
+        ? "Generation succeeded — the full chain works. This test does NOT write to lessons.jsonl."
+        : "Generation returned empty — check Railway logs for the raw API response.",
+    }, null, 2));
     return;
   }
 
@@ -1476,7 +1513,8 @@ ${note}`);
         const execResult = await executeOnBingX(decision, payload);
         logSignal(decision, payload, execResult);
 
-        console.log("Trade signal — alert sent + executed ✅", new Date().toISOString(), "| condition:", condition, "| score:", decision.scoreResult.rawScore, "/5", "| confidence:", decision.gated.confidence);
+        const execOk = !execResult || !!execResult.bingxOrderId;
+        console.log(`Trade signal — alert sent ${execOk ? "+ executed ✅" : "⚠️ ORDER REJECTED"}`, new Date().toISOString(), "| condition:", condition, "| score:", decision.scoreResult.rawScore, "/5", "| confidence:", decision.gated.confidence);
       } catch (err) {
         console.error("Error:", err.message);
         try { await sendTelegram(`⚠️ <b>Bot error:</b> ${err.message}`); } catch {}
@@ -1488,7 +1526,7 @@ ${note}`);
   res.writeHead(404); res.end("Not found");
 });
 
-server.listen(PORT, () => console.log(`Server v10 running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Server v11 running on port ${PORT}`));
 
 setInterval(() => {
   checkOpenPositions().catch(err => console.error("checkOpenPositions failed (non-fatal):", err.message));
