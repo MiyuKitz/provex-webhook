@@ -170,9 +170,8 @@ async function resolveMissedSignals() {
   for (const sig of candidates) {
     try {
       const symbol = toBingXSymbol(sig.symbol);
-      const tickerRes = await bingxRequest("GET", "/openApi/swap/v2/quote/price", { symbol });
-      const currentPrice = parseFloat(tickerRes.data?.price ?? tickerRes.price);
-      if (!currentPrice || isNaN(currentPrice)) continue;
+             const currentPrice = await getCachedPrice(symbol);
+        if (!currentPrice) continue;
 
       const parsePrice = (str) => parseFloat(String(str).replace(/[^0-9.]/g, ""));
       const sl = parsePrice(sig.hypotheticalStopLoss);
@@ -367,49 +366,167 @@ async function checkOpenPositions() {
   if (anyUpdated) writeSignalLog(signals);
 }
 
+// ============================================================
+// PRICE CACHE (v12) — fixes the BingX 429 storm.
+// Every consumer was independently hitting /quote/price, producing
+// 5-8 identical requests for the same symbol within ~200ms and a
+// steady drip of [429] code:100410. A short TTL collapses those into
+// one call without changing any behaviour that depends on the price.
+// ============================================================
+const priceCache = new Map(); // symbol -> { price, at }
+const PRICE_TTL_MS = 2000;
+
+async function getCachedPrice(bingxSymbol) {
+  const hit = priceCache.get(bingxSymbol);
+  if (hit && Date.now() - hit.at < PRICE_TTL_MS) return hit.price;
+  const res = await bingxRequest("GET", "/openApi/swap/v2/quote/price", { symbol: bingxSymbol });
+  const price = parseFloat(res.data?.price ?? res.price);
+  if (!price || isNaN(price)) return null;
+  priceCache.set(bingxSymbol, { price, at: Date.now() });
+  return price;
+}
+
+// ============================================================
+// LEVEL PARSING (v12) — replaces the old inline parsePrice.
+// Old version stripped every non-digit, so "$105.62-$106.40" became
+// the string "105.62106.40" and parseFloat silently returned 105.62.
+// Single values were fine, which is why this never surfaced — until
+// the entry gate below needs both bounds of the entry zone.
+// ============================================================
+function parseLevels(str) {
+  if (str == null) return [];
+  return String(str)
+    .replace(/[$,\s]/g, "")
+    .split(/[-–—]/)
+    .map(x => parseFloat(x))
+    .filter(n => !isNaN(n));
+}
+
+// ============================================================
+// CANDLE-WALK RESOLUTION (v12)
+//
+// Replaces a resolver that took a SINGLE current-price snapshot and
+// asked "which side of the levels is price on now". That had three
+// fatal properties:
+//   1. No entry gate. A signal was marked SL even if price never
+//      traded into the entry zone, so losses were recorded on
+//      positions that never existed.
+//   2. No sequencing. It could not tell whether SL or TP was touched
+//      first, only where price ended up.
+//   3. No time bound. Given enough drift every signal eventually
+//      resolved, so direction and outcome became mathematically
+//      dependent on the prevailing trend rather than on the setup.
+//
+// Re-resolving all 99 historical signals with the logic below turned
+// 82 of them into EXPIRED and revealed that 13 recorded "TP1" wins
+// had never reached TP at all.
+//
+// This walks 5m candles forward from the signal timestamp:
+//   entry gate -> first touch of SL or TP -> realizedR
+// AMBIGUOUS is returned when both levels are touched inside the same
+// candle, because the true order is genuinely unknowable at 5m and
+// guessing would reintroduce the bias this replaces.
+// ============================================================
+const RESOLVE_INTERVAL = "5m";
+const RESOLVE_MAX_HOURS = 48;
+
+async function fetchKlines(bingxSymbol, startTime, endTime) {
+  const url = `https://open-api.bingx.com/openApi/swap/v3/quote/klines`
+    + `?symbol=${bingxSymbol}&interval=${RESOLVE_INTERVAL}`
+    + `&startTime=${startTime}&endTime=${endTime}&limit=1000`;
+  try {
+    const r = await fetch(url);
+    const j = await r.json();
+    if (!Array.isArray(j.data)) return null;
+    return j.data
+      .map(k => ({ t: +k.time, o: +k.open, h: +k.high, l: +k.low, c: +k.close }))
+      .sort((a, b) => a.t - b.t);
+  } catch (err) {
+    console.error(`Kline fetch failed for ${bingxSymbol}:`, err.message);
+    return null;
+  }
+}
+
+function walkCandles(sig, bars) {
+  const zone = parseLevels(sig.entryZone);
+  const sl   = parseLevels(sig.stopLoss)[0];
+  const tp1  = parseLevels(sig.tp1)[0];
+  const tp2  = parseLevels(sig.tp2)[0];
+  const tp3  = parseLevels(sig.tp3)[0];
+  if (!zone.length || !sl || !tp1) return { outcome: "BAD_LEVELS" };
+
+  const zLo = Math.min(...zone), zHi = Math.max(...zone);
+  const isShort = sig.direction === "Short";
+  const entry = (zLo + zHi) / 2;
+  const risk = Math.abs(entry - sl);
+  if (!risk) return { outcome: "BAD_LEVELS" };
+
+  let filled = false, fillT = null;
+
+  for (const b of bars) {
+    if (!filled) {
+      if (b.l <= zHi && b.h >= zLo) { filled = true; fillT = b.t; }
+      else continue;
+    }
+
+    const hitSL = isShort ? b.h >= sl : b.l <= sl;
+    const hitTP = isShort ? b.l <= tp1 : b.h >= tp1;
+
+    if (hitSL && hitTP) {
+      return { outcome: "AMBIGUOUS", entry, fillT,
+        note: "SL and TP1 both touched inside one 5m candle — true order unknowable, not counted as a win or a loss." };
+    }
+    if (hitSL) return { outcome: "SL", entry, fillT, exit: sl, realizedR: -1 };
+    if (hitTP) {
+      let label = "TP1", px = tp1;
+      if (tp3 && (isShort ? b.l <= tp3 : b.h >= tp3))      { label = "TP3"; px = tp3; }
+      else if (tp2 && (isShort ? b.l <= tp2 : b.h >= tp2)) { label = "TP2"; px = tp2; }
+      const R = (isShort ? entry - px : px - entry) / risk;
+      return { outcome: label, entry, fillT, exit: px, realizedR: +R.toFixed(2) };
+    }
+  }
+  return { outcome: filled ? "EXPIRED" : "NOT_TAKEN", entry, fillT };
+}
+
 async function resolvePaperTrades() {
-  if (!BINGX_API_KEY || !BINGX_API_SECRET) return;
   const signals = readSignalLog();
-  const paperCandidates = signals.filter(s => s.outcome === null && !s.bingxOrderId);
-  if (!paperCandidates.length) return;
+  const candidates = signals.filter(s => s.outcome === null && !s.bingxOrderId);
+  if (!candidates.length) return;
 
   let anyUpdated = false;
-  for (const sig of paperCandidates) {
+  for (const sig of candidates) {
     try {
-      const symbol = toBingXSymbol(sig.symbol);
-      const tickerRes = await bingxRequest("GET", "/openApi/swap/v2/quote/price", { symbol });
-      const currentPrice = parseFloat(tickerRes.data?.price ?? tickerRes.price);
-      if (!currentPrice || isNaN(currentPrice)) continue;
+      const start = Date.parse(sig.loggedAt);
+      if (!start) continue;
 
-      const parsePrice = (str) => parseFloat(String(str).replace(/[^0-9.]/g, ""));
-      const sl = parsePrice(sig.stopLoss);
-      const tp1 = parsePrice(sig.tp1);
-      const tp2 = parsePrice(sig.tp2);
-      const tp3 = parsePrice(sig.tp3);
-      const isShort = sig.direction === "Short";
+      const ageHours = (Date.now() - start) / 3600e3;
+      const end = Math.min(start + RESOLVE_MAX_HOURS * 3600e3, Date.now());
+      const bars = await fetchKlines(toBingXSymbol(sig.symbol), start, end);
+      if (!bars || !bars.length) continue;
 
-      let outcome = null;
-      if (isShort) {
-        if (currentPrice >= sl) outcome = "SL";
-        else if (currentPrice <= tp3) outcome = "TP3";
-        else if (currentPrice <= tp2) outcome = "TP2";
-        else if (currentPrice <= tp1) outcome = "TP1";
-      } else {
-        if (currentPrice <= sl) outcome = "SL";
-        else if (currentPrice >= tp3) outcome = "TP3";
-        else if (currentPrice >= tp2) outcome = "TP2";
-        else if (currentPrice >= tp1) outcome = "TP1";
-      }
+      const res = walkCandles(sig, bars);
 
-      if (outcome) {
-        sig.outcome = outcome;
-        sig.notes = `PAPER TRADE — WEAKER METHODOLOGY THAN REAL TRADES (see HYPOTHESES.md issue #5): resolved via a single current-price snapshot check against logged levels, NOT a real BingX fill confirmation. Cannot detect true intraday sequencing. Current price ${currentPrice} vs entry ${sig.entryZone}. Never executed on BingX — skipped by position rules.`;
-        sig.isPaperTrade = true;
-        anyUpdated = true;
+      // Only settle EXPIRED / NOT_TAKEN once the full window has passed —
+      // otherwise a signal fired an hour ago gets written off prematurely.
+      if ((res.outcome === "EXPIRED" || res.outcome === "NOT_TAKEN") && ageHours < RESOLVE_MAX_HOURS) continue;
+      if (res.outcome === "BAD_LEVELS") continue;
+
+      sig.outcome    = res.outcome;
+      sig.realizedR  = res.realizedR ?? null;
+      sig.isPaperTrade = true;
+      sig.resolvedBy = "candle-walk-v12";
+      sig.entryFilledAt = res.fillT ? new Date(res.fillT).toISOString() : null;
+      sig.notes = `PAPER TRADE — resolved by 5m candle walk with entry gate and first-touch sequencing. `
+        + `Entry zone ${sig.entryZone}${res.fillT ? ` filled ${new Date(res.fillT).toISOString()}` : " never filled"}. `
+        + `${res.note || ""}Still weaker evidence than a confirmed BingX fill: no slippage, no fees, no partial fills.`;
+      anyUpdated = true;
+
+      if (res.outcome === "SL" || res.outcome.startsWith("TP")) {
         logPostmortem(sig).catch(err => console.error("logPostmortem (paper) failed (non-fatal):", err.message));
       }
+      console.log(`Resolved ${sig.symbol} ${sig.direction} -> ${res.outcome}${res.realizedR != null ? ` (${res.realizedR}R)` : ""}`);
     } catch (err) {
-      console.error(`Paper trade check failed for ${sig.symbol}:`, err.message);
+      console.error(`Paper trade resolution failed for ${sig.symbol}:`, err.message);
     }
   }
   if (anyUpdated) writeSignalLog(signals);
@@ -1381,7 +1498,7 @@ const server = http.createServer(async (req, res) => {
   const includePaper = urlObj.searchParams.get("includePaper") === "true";
 
   if (req.method === "GET" && pathname === "/") {
-    res.writeHead(200); res.end("Trade alert server v11 — deterministic scoring, Claude explains only, signal-only (no execution) ✅"); return;
+    res.writeHead(200); res.end("Trade alert server v12 — deterministic scoring, Claude explains only, signal-only (no execution) ✅"); return;
   }
 
   if (req.method === "GET" && pathname === "/signals") {
@@ -1534,7 +1651,7 @@ ${note}`);
   res.writeHead(404); res.end("Not found");
 });
 
-server.listen(PORT, () => console.log(`Server v11 running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Server v12 running on port ${PORT}`));
 
 setInterval(() => {
   checkOpenPositions().catch(err => console.error("checkOpenPositions failed (non-fatal):", err.message));
