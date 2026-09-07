@@ -463,29 +463,88 @@ function walkCandles(sig, bars) {
 
   let filled = false, fillT = null;
 
+  // ============================================================
+  // MFE / MAE (v13)
+  //
+  // MFE = Maximum Favourable Excursion: the best unrealised R the
+  //       trade ever reached before it closed.
+  // MAE = Maximum Adverse Excursion: the worst unrealised R it went
+  //       through before it closed.
+  //
+  // Both are measured from the moment the entry zone actually filled,
+  // not from signal time — price movement before the fill is not
+  // something the position experienced.
+  //
+  // Why this matters more than the outcome label:
+  //   - Losses that show MAE near -1R and MFE near 0R mean the thesis
+  //     was simply wrong.
+  //   - Losses with MFE of +1.5R mean the thesis was RIGHT and the
+  //     exit was wrong — a completely different problem needing a
+  //     completely different fix.
+  //   - EXPIRED trades with MFE around +0.8R mean targets sit just
+  //     beyond where price actually travels; EXPIRED with MFE near
+  //     0.2R means the setups genuinely do not move.
+  //
+  // Without this the bot can only say "it lost". With it, the bot can
+  // say WHY, which is the difference between guessing at parameters
+  // and diagnosing them.
+  // ============================================================
+  let mfeR = 0;   // best R seen while in the position
+  let maeR = 0;   // worst R seen while in the position (negative)
+  let barsHeld = 0;
+  let mfeBarsIn = null;  // how many bars until MFE was reached
+
   for (const b of bars) {
     if (!filled) {
       if (b.l <= zHi && b.h >= zLo) { filled = true; fillT = b.t; }
       else continue;
     }
 
+    barsHeld += 1;
+
+    // Excursion in R terms. For a long the favourable extreme is the
+    // bar high and the adverse extreme is the bar low; inverted for a
+    // short. Using high/low rather than close is deliberate — a stop
+    // or target is hit by the wick, not by the close.
+    const favR = (isShort ? entry - b.l : b.h - entry) / risk;
+    const advR = (isShort ? entry - b.h : b.l - entry) / risk;
+    if (favR > mfeR) { mfeR = favR; mfeBarsIn = barsHeld; }
+    if (advR < maeR) { maeR = advR; }
+
     const hitSL = isShort ? b.h >= sl : b.l <= sl;
     const hitTP = isShort ? b.l <= tp1 : b.h >= tp1;
 
+    const excursion = {
+      mfeR: +mfeR.toFixed(2),
+      maeR: +maeR.toFixed(2),
+      barsHeld,
+      barsToMfe: mfeBarsIn,
+      minutesHeld: barsHeld * 5,
+    };
+
     if (hitSL && hitTP) {
-      return { outcome: "AMBIGUOUS", entry, fillT,
+      return { outcome: "AMBIGUOUS", entry, fillT, ...excursion,
         note: "SL and TP1 both touched inside one 5m candle — true order unknowable, not counted as a win or a loss." };
     }
-    if (hitSL) return { outcome: "SL", entry, fillT, exit: sl, realizedR: -1 };
+    if (hitSL) return { outcome: "SL", entry, fillT, exit: sl, realizedR: -1, ...excursion };
     if (hitTP) {
       let label = "TP1", px = tp1;
       if (tp3 && (isShort ? b.l <= tp3 : b.h >= tp3))      { label = "TP3"; px = tp3; }
       else if (tp2 && (isShort ? b.l <= tp2 : b.h >= tp2)) { label = "TP2"; px = tp2; }
       const R = (isShort ? entry - px : px - entry) / risk;
-      return { outcome: label, entry, fillT, exit: px, realizedR: +R.toFixed(2) };
+      return { outcome: label, entry, fillT, exit: px, realizedR: +R.toFixed(2), ...excursion };
     }
   }
-  return { outcome: filled ? "EXPIRED" : "NOT_TAKEN", entry, fillT };
+
+  return {
+    outcome: filled ? "EXPIRED" : "NOT_TAKEN",
+    entry, fillT,
+    mfeR: +mfeR.toFixed(2),
+    maeR: +maeR.toFixed(2),
+    barsHeld,
+    barsToMfe: mfeBarsIn,
+    minutesHeld: barsHeld * 5,
+  };
 }
 
 async function resolvePaperTrades() {
@@ -514,8 +573,12 @@ async function resolvePaperTrades() {
       sig.outcome    = res.outcome;
       sig.realizedR  = res.realizedR ?? null;
       sig.isPaperTrade = true;
-      sig.resolvedBy = "candle-walk-v12";
+      sig.resolvedBy = "candle-walk-v13-mfe";
       sig.entryFilledAt = res.fillT ? new Date(res.fillT).toISOString() : null;
+            sig.mfeR = res.mfeR ?? null;
+      sig.maeR = res.maeR ?? null;
+      sig.barsHeld = res.barsHeld ?? null;
+      sig.minutesHeld = res.minutesHeld ?? null;
       sig.notes = `PAPER TRADE — resolved by 5m candle walk with entry gate and first-touch sequencing. `
         + `Entry zone ${sig.entryZone}${res.fillT ? ` filled ${new Date(res.fillT).toISOString()}` : " never filled"}. `
         + `${res.note || ""}Still weaker evidence than a confirmed BingX fill: no slippage, no fees, no partial fills.`;
@@ -1498,7 +1561,7 @@ const server = http.createServer(async (req, res) => {
   const includePaper = urlObj.searchParams.get("includePaper") === "true";
 
   if (req.method === "GET" && pathname === "/") {
-    res.writeHead(200); res.end("Trade alert server v12 — deterministic scoring, Claude explains only, signal-only (no execution) ✅"); return;
+    res.writeHead(200); res.end("Trade alert server v13 — deterministic scoring, Claude explains only, signal-only (no execution) ✅"); return;
   }
 
   if (req.method === "GET" && pathname === "/signals") {
@@ -1651,7 +1714,7 @@ ${note}`);
   res.writeHead(404); res.end("Not found");
 });
 
-server.listen(PORT, () => console.log(`Server v12 running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Server v13 running on port ${PORT}`));
 
 setInterval(() => {
   checkOpenPositions().catch(err => console.error("checkOpenPositions failed (non-fatal):", err.message));
