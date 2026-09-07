@@ -39,7 +39,8 @@ function logSignal(decision, payload, execResult) {
       loggedAt: new Date().toISOString(),
       symbol: payload.symbol || "—",
       condition: payload.condition || "",
-      type,
+            type,
+      strategy: decision.strategy || "OB_SMC",
       isSwing: !!isSwing,
       zoneAttempt: payload._zoneAttempt || 1,
       isRepeatZone: payload._isRepeatZone || false,
@@ -1313,6 +1314,7 @@ function computeBreakoutLevels(payload, direction) {
 
 function buildDecision(payload) {
   const condition = payload.condition || "";
+    if (condition.startsWith("FIB_SR_")) return buildFibDecision(payload);
   const type = classifySignal(condition);
   if (!type) return { verdict: "UNRECOGNIZED" };
 
@@ -1561,7 +1563,7 @@ const server = http.createServer(async (req, res) => {
   const includePaper = urlObj.searchParams.get("includePaper") === "true";
 
   if (req.method === "GET" && pathname === "/") {
-    res.writeHead(200); res.end("Trade alert server v13 — deterministic scoring, Claude explains only, signal-only (no execution) ✅"); return;
+    res.writeHead(200); res.end("Trade alert server v14 — deterministic scoring, Claude explains only, signal-only (no execution) ✅"); return;
   }
 
   if (req.method === "GET" && pathname === "/signals") {
@@ -1714,7 +1716,7 @@ ${note}`);
   res.writeHead(404); res.end("Not found");
 });
 
-server.listen(PORT, () => console.log(`Server v13 running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Server v14 running on port ${PORT}`));
 
 setInterval(() => {
   checkOpenPositions().catch(err => console.error("checkOpenPositions failed (non-fatal):", err.message));
@@ -1921,3 +1923,170 @@ setInterval(() => {
     sendPerformanceReport(7).catch(err => console.error("Daily report failed:", err.message));
   }
 }, 60 * 60 * 1000);
+// ============================================================
+// FIB_SR STRATEGY — server-side scoring (v14)
+//
+// The second independent strategy. Deliberately does NOT reuse
+// scoreOB/applyRiskGates: the two strategies are separate experiments,
+// and sharing a scoring path would mean a change made for one silently
+// alters the evidence for the other.
+//
+// Division of labour, same as the OB engine:
+//   Pine   — detects structure, fires the alert, sends raw context
+//   Server — scores deterministically, applies gates, computes levels
+// Pine never decides a trade. If the two ever disagree, the server is
+// authoritative, because the server is what actually executes.
+//
+// The one thing shared is scoreBTC(). That rule was validated on real
+// backtest evidence (block ON: PF 1.33 / DD 18.32%, block OFF: PF 1.19
+// / DD 22.76%) and applies to any directional setup regardless of how
+// the setup was found.
+// ============================================================
+
+const FIB_MIN_TOUCHES = 3;        // matches the Pine default
+const FIB_SL_ATR_MULT = 1.5;
+const FIB_MAX_ZONE_ATR = 2.0;     // a zone wider than this is a poor entry
+const FIB_THRESHOLD_KZ = 3.5;
+const FIB_THRESHOLD_NO_KZ = 4.0;
+
+function scoreFib(payload, direction) {
+  const touches   = num(payload.touches);
+  const zoneTop   = num(payload.zoneTop);
+  const zoneBottom = num(payload.zoneBottom);
+  const atr       = num(payload.atr);
+  const htfTrend  = payload.htfTrend || "Unknown";
+  const zoneWidth = zoneTop - zoneBottom;
+  const hasStructure = zoneTop > 0 && zoneBottom > 0 && zoneWidth > 0;
+
+  const points = [];
+
+  // 1 — Zone quality. Backtest evidence (SUI, Feb-Sep 2026): raising the
+  // minimum from 2 to 3 touches moved PF 0.756 -> 1.181 and halved
+  // drawdown. A level respected three times is a level; twice is a
+  // coincidence.
+  const p1 = touches >= FIB_MIN_TOUCHES;
+  points.push({ n: 1, label: "Zone quality", pass: p1 ? 1 : 0,
+    detail: `${touches} confirmed touches (min ${FIB_MIN_TOUCHES})` });
+
+  // 2 — HTF trend agreement. Pine already gates on this, but the server
+  // re-checks rather than trusting the alert: if the Pine filter is ever
+  // misconfigured the server still refuses.
+  const p2 = (direction === "Long" && htfTrend === "Bullish") || (direction === "Short" && htfTrend === "Bearish");
+  points.push({ n: 2, label: "4H trend agreement", pass: p2 ? 1 : 0,
+    detail: `HTF ${htfTrend} vs ${direction}` });
+
+  // 3 — BTC confirmation. Shared with the OB engine; validated rule.
+  const btc = scoreBTC(payload, direction);
+  points.push({ n: 3, label: "BTC confirmation", pass: btc.score, detail: btc.detail });
+
+  // 4 — Fib / S/R confluence actually present. The Pine control experiment
+  // showed confluence roughly halves drawdown (ETH out-of-sample: 21.35%
+  // -> 7.12% at the same profit factor), so its presence is scored rather
+  // than assumed.
+  const p4 = hasStructure && touches > 0;
+  points.push({ n: 4, label: "Fib/SR confluence", pass: p4 ? 1 : 0,
+    detail: p4 ? `Overlap zone $${zoneBottom}-$${zoneTop}` : "No qualifying S/R zone at the Fib level" });
+
+  // 5 — Entry precision. A confluence zone several ATR wide gives a vague
+  // entry and a stop that has to sit far away to respect it, which wrecks
+  // the R-multiple before the trade even starts.
+  const p5 = hasStructure && atr > 0 && zoneWidth <= atr * FIB_MAX_ZONE_ATR;
+  points.push({ n: 5, label: "Entry precision", pass: p5 ? 1 : 0,
+    detail: atr > 0 ? `Zone width ${(zoneWidth / atr).toFixed(2)} ATR (max ${FIB_MAX_ZONE_ATR})` : "ATR unavailable" });
+
+  const rawScore = points.reduce((s, p) => s + p.pass, 0);
+  return { points, rawScore, direction, btcOpposes: btc.opposes, structureOk: hasStructure, touches };
+}
+
+function applyFibGates(payload, scoreResult, killzoneActive) {
+  const { rawScore, direction, btcOpposes, structureOk, touches } = scoreResult;
+
+  if (!structureOk) return { verdict: "NO_TRADE", reason: "Missing zone structure — cannot place a real stop" };
+  if (btcOpposes)   return { verdict: "NO_TRADE", reason: "BTC trend opposes signal direction — blocked entirely (validated across the OB backtests; removing it worsened profit factor, win rate and drawdown together)" };
+  if (touches < FIB_MIN_TOUCHES) {
+    return { verdict: "NO_TRADE", reason: `Zone has only ${touches} touches, below the ${FIB_MIN_TOUCHES} minimum (2-touch zones lost money in backtest)` };
+  }
+
+  const threshold = killzoneActive ? FIB_THRESHOLD_KZ : FIB_THRESHOLD_NO_KZ;
+  if (rawScore < threshold) {
+    return { verdict: "NO_TRADE", reason: `Score ${rawScore}/5 below ${threshold} threshold (killzone active: ${killzoneActive})` };
+  }
+
+  // FIB_SR is sized more conservatively than OB. Its out-of-sample
+  // drawdown ranged 4.68%-24.08% depending on configuration, and the
+  // ProveX evaluation caps drawdown at 10% — so this deliberately does
+  // not offer the high-leverage bands the OB swing setups do.
+  let confidence = rawScore >= 4.5 ? "HIGH" : "MEDIUM";
+  let leverage = confidence === "HIGH" ? "5x-8x" : "3x-5x";
+
+  const flags = [];
+  if (!killzoneActive) flags.push("Outside kill zone — fakeout risk elevated");
+  if (touches >= 5) flags.push(`Zone respected ${touches} times — higher-conviction level`);
+
+  const smtCheck = checkSMT(payload, direction);
+  if (smtCheck) {
+    if (smtCheck.severity === "caution") {
+      confidence = "MEDIUM";
+      leverage = "3x-5x";
+    }
+    flags.push(smtCheck.text);
+  }
+
+  const rsiCaution = checkRSIExhaustion(payload, direction);
+  if (rsiCaution) flags.push(rsiCaution);
+
+  flags.push("FIB_SR strategy — independent from the OB engine. Its evidence base is separate and must not be pooled with OB results.");
+
+  return { verdict: "TRADE", confidence, leverage, flags, rawScore };
+}
+
+function computeFibLevels(payload, direction) {
+  const price = num(payload.price);
+  const atr   = num(payload.atr);
+  const zoneTop = num(payload.zoneTop);
+  const zoneBottom = num(payload.zoneBottom);
+
+  // ATR stop, not a fixed percentage. The OB engine's flat 5% stop
+  // produced a returns distribution with losses piled at -5% to -6%,
+  // meaning the stop — not the structure — was deciding every exit.
+  const entryMid = price;
+  const slDist = atr > 0 ? atr * FIB_SL_ATR_MULT : price * 0.02;
+  const sl = direction === "Long" ? entryMid - slDist : entryMid + slDist;
+  const risk = Math.abs(entryMid - sl);
+
+  const tp1 = direction === "Long" ? entryMid + risk * 1 : entryMid - risk * 1;
+  const tp2 = direction === "Long" ? entryMid + risk * 2 : entryMid - risk * 2;
+  const tp3 = direction === "Long" ? entryMid + risk * 3 : entryMid - risk * 3;
+
+  return {
+    entryZone: `${fmt(Math.min(zoneBottom, entryMid))}-${fmt(Math.max(zoneTop, entryMid))}`,
+    stopLoss: fmt(sl), tp1: fmt(tp1), tp2: fmt(tp2), tp3: fmt(tp3),
+    entryMidRaw: entryMid, slRaw: sl, tp1Raw: tp1, tp2Raw: tp2, tp3Raw: tp3, riskRaw: risk,
+  };
+}
+
+function buildFibDecision(payload) {
+  const condition = payload.condition || "";
+  const direction = condition.includes("LONG") ? "Long" : "Short";
+  const killzoneActive = bool(payload.killzone);
+
+  const scoreResult = scoreFib(payload, direction);
+  const gated = applyFibGates(payload, scoreResult, killzoneActive);
+  if (gated.verdict === "NO_TRADE") {
+    return { verdict: "NO_TRADE", reason: gated.reason, type: "FIB_" + direction.toUpperCase(), scoreResult };
+  }
+
+  const levels = computeFibLevels(payload, direction);
+  if (!levels.entryMidRaw || levels.riskRaw <= 0) {
+    return { verdict: "NO_TRADE", reason: "Invalid entry or zero risk distance", type: "FIB_" + direction.toUpperCase(), scoreResult };
+  }
+
+  const slDistPct = levels.riskRaw / levels.entryMidRaw * 100;
+  const maxLeverage = parseInt(gated.leverage.split("-")[1], 10);
+  const estLiqPct = 100 / maxLeverage;
+  if (slDistPct >= estLiqPct * 0.9) {
+    gated.flags.push(`⚠️ At ${maxLeverage}x, estimated liquidation distance (~${estLiqPct.toFixed(2)}%) is close to this trade's stop distance (${slDistPct.toFixed(2)}%) — you may be liquidated before the SL executes. Approximate; verify against the exchange's own calculator.`);
+  }
+
+  return { verdict: "TRADE", type: "FIB_" + direction.toUpperCase(), scoreResult, gated, levels, isSwing: false, strategy: "FIB_SR" };
+}
