@@ -1563,7 +1563,7 @@ const server = http.createServer(async (req, res) => {
   const includePaper = urlObj.searchParams.get("includePaper") === "true";
 
   if (req.method === "GET" && pathname === "/") {
-    res.writeHead(200); res.end("Trade alert server v14 — deterministic scoring, Claude explains only, signal-only (no execution) ✅"); return;
+    res.writeHead(200); res.end("Trade alert server v15 — deterministic scoring, Claude explains only, signal-only (no execution) ✅"); return;
   }
 
   if (req.method === "GET" && pathname === "/signals") {
@@ -1596,6 +1596,13 @@ const server = http.createServer(async (req, res) => {
     if (urlObj.searchParams.get("send") === "true") sendPerformanceReport(days);
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(r, null, 2));
+    return;
+  }
+    if (req.method === "GET" && pathname === "/challenge") {
+    const c = buildChallengeReport();
+    if (urlObj.searchParams.get("send") === "true") sendChallengeReport();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(c, null, 2));
     return;
   }
   if (req.method === "GET" && pathname === "/lessons") {
@@ -1716,7 +1723,7 @@ ${note}`);
   res.writeHead(404); res.end("Not found");
 });
 
-server.listen(PORT, () => console.log(`Server v14 running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Server v15 running on port ${PORT}`));
 
 setInterval(() => {
   checkOpenPositions().catch(err => console.error("checkOpenPositions failed (non-fatal):", err.message));
@@ -1921,6 +1928,7 @@ setInterval(() => {
   if (parseInt(nowAEDT, 10) === 8 && lastReportDay !== dayKey) {
     lastReportDay = dayKey;
     sendPerformanceReport(7).catch(err => console.error("Daily report failed:", err.message));
+        sendChallengeReport().catch(err => console.error("Challenge report failed:", err.message));
   }
 }, 60 * 60 * 1000);
 // ============================================================
@@ -2089,4 +2097,186 @@ function buildFibDecision(payload) {
   }
 
   return { verdict: "TRADE", type: "FIB_" + direction.toUpperCase(), scoreResult, gated, levels, isSwing: false, strategy: "FIB_SR" };
+}
+// ============================================================
+// 7-DAY CHALLENGE TRACKER (v15)
+//
+// Two grades, deliberately separate, because they answer different
+// questions and conflating them is how a lucky week gets mistaken for
+// an edge:
+//
+//   PERFORMANCE — did P&L cross the target? A fact about one week.
+//   EVIDENCE    — did the data demonstrate a repeatable edge? The
+//                 only output that survives past Sunday.
+//
+// EVIDENCE returns INSUFFICIENT below the minimum sample no matter how
+// large the P&L. Two lucky trades cannot grade themselves.
+//
+// Nothing here can change the bot's behaviour. It reads the signal log
+// and reports. Sizing, leverage, thresholds and gates are frozen for
+// the duration by design — a tracker that could tighten risk to chase
+// a target would be measuring itself.
+// ============================================================
+
+const CHALLENGE_TARGET_VST = 30000;
+const CHALLENGE_DAYS = 7;
+const CHALLENGE_MIN_SAMPLE = 30;
+const CHALLENGE_MAX_DD_PCT = 10;
+const CHALLENGE_START = process.env.CHALLENGE_START || null; // ISO date, e.g. "2026-09-11"
+
+// Realised VST per R. Derived from the bot's own sizing so the number
+// tracks reality rather than a hardcoded guess: HIGH = 2000 margin at
+// 15x, MEDIUM = 900 at 10x, with a 5% stop distance.
+function vstPerR(sig) {
+  const margin = sig.confidence === "HIGH" ? 2000 : 900;
+  const lev = sig.confidence === "HIGH" ? 15 : 10;
+  return margin * lev * FIXED_SL_PCT;
+}
+
+function buildChallengeReport() {
+  const all = readSignalLog();
+
+  const start = CHALLENGE_START
+    ? Date.parse(CHALLENGE_START + "T00:00:00+10:00")
+    : Date.now() - CHALLENGE_DAYS * 864e5;
+  const end = start + CHALLENGE_DAYS * 864e5;
+  const now = Date.now();
+  const dayNum = Math.min(CHALLENGE_DAYS, Math.max(1, Math.ceil((now - start) / 864e5)));
+  const complete = now >= end;
+
+  const inWindow = all.filter(s => {
+    const t = Date.parse(s.loggedAt);
+    return !isNaN(t) && t >= start && t < end;
+  });
+
+  const setups = dedupeBySetup(inWindow);
+  const closed = setups.filter(s => isClosed(s.outcome));
+  const real = closed.filter(s => !s.isPaperTrade);
+  const paper = closed.filter(s => s.isPaperTrade);
+
+  // P&L in VST, real fills only. Paper trades are not money.
+  const netVST = real.reduce((a, s) => a + (Number(s.realizedR) || 0) * vstPerR(s), 0);
+
+  // Expectancy across everything resolved, since paper trades are
+  // still evidence about the setup even though they are not P&L.
+  const rs = closed.map(s => Number(s.realizedR) || 0);
+  const expectancy = rs.length ? rs.reduce((a, b) => a + b, 0) / rs.length : null;
+
+  // Peak-to-trough on the cumulative R curve, in order.
+  const ordered = [...closed].sort((a, b) => Date.parse(a.loggedAt) - Date.parse(b.loggedAt));
+  let cum = 0, peak = 0, maxDDR = 0;
+  for (const s of ordered) {
+    cum += Number(s.realizedR) || 0;
+    if (cum > peak) peak = cum;
+    const dd = peak - cum;
+    if (dd > maxDDR) maxDDR = dd;
+  }
+  const avgVstPerR = real.length ? real.reduce((a, s) => a + vstPerR(s), 0) / real.length : 3000;
+  const maxDDPct = (maxDDR * avgVstPerR) / 96437 * 100;
+
+  const wins = closed.filter(s => isWin(s.outcome)).length;
+  const losses = closed.filter(s => isLoss(s.outcome)).length;
+  const symbols = [...new Set(closed.map(s => s.symbol))];
+  const expired = setups.filter(s => s.outcome === "EXPIRED").length;
+
+  // ---- PERFORMANCE: a fact, not a judgement ----
+  const performance = {
+    netVST: Number(netVST.toFixed(2)),
+    target: CHALLENGE_TARGET_VST,
+    pctOfTarget: Number((netVST / CHALLENGE_TARGET_VST * 100).toFixed(1)),
+    status: complete
+      ? (netVST >= CHALLENGE_TARGET_VST ? "HIT" : "MISSED")
+      : (netVST >= CHALLENGE_TARGET_VST ? "HIT (early)" : "IN PROGRESS"),
+  };
+
+  // ---- EVIDENCE: the grade that actually matters ----
+  // Sample gate comes first and is absolute. A large P&L on six trades
+  // is not weak evidence, it is no evidence, and saying so plainly is
+  // the whole point of grading these separately.
+  let verdict, note;
+  if (closed.length < CHALLENGE_MIN_SAMPLE) {
+    verdict = "INSUFFICIENT";
+    note = `${closed.length}/${CHALLENGE_MIN_SAMPLE} resolved trades. No verdict is possible below the minimum sample regardless of P&L — a handful of winners is luck until proven otherwise.`;
+  } else if (expectancy > 0.15 && maxDDPct < CHALLENGE_MAX_DD_PCT && symbols.length >= 2) {
+    verdict = "STRONG";
+    note = `Positive expectancy (${expectancy.toFixed(2)}R) across ${symbols.length} symbols with drawdown inside the cap. This is the result worth extending — run it again on a fresh window before trusting it.`;
+  } else if (expectancy > 0) {
+    verdict = "PROMISING";
+    note = `Expectancy is positive (${expectancy.toFixed(2)}R) but ${maxDDPct >= CHALLENGE_MAX_DD_PCT ? "drawdown breached the cap" : "the result rests on too few symbols"}. Worth another window, not worth sizing up.`;
+  } else {
+    verdict = "NEGATIVE";
+    note = `Expectancy is ${expectancy.toFixed(2)}R over ${closed.length} trades. That is a real answer: this configuration does not have an edge.`;
+  }
+
+  const evidence = {
+    resolvedTrades: closed.length,
+    minSample: CHALLENGE_MIN_SAMPLE,
+    realFills: real.length,
+    paperTrades: paper.length,
+    wins, losses,
+    winRatePct: (wins + losses) ? Number((wins / (wins + losses) * 100).toFixed(1)) : null,
+    expectancyR: expectancy !== null ? Number(expectancy.toFixed(3)) : null,
+    maxDrawdownPct: Number(maxDDPct.toFixed(2)),
+    maxDrawdownCapPct: CHALLENGE_MAX_DD_PCT,
+    symbolsTraded: symbols,
+    expiredCount: expired,
+    verdict, note,
+  };
+
+  return {
+    day: dayNum, of: CHALLENGE_DAYS, complete,
+    windowStart: new Date(start).toISOString(),
+    windowEnd: new Date(end).toISOString(),
+    performance,
+    evidence,
+    frozen: [
+      "position sizing", "leverage bands", "score thresholds",
+      "risk gates", "symbol set", "strategy logic",
+    ],
+    readThis: "PERFORMANCE and EVIDENCE are graded separately on purpose. Crossing the P&L target does not validate the strategy, and missing it does not refute one — a week of good expectancy that lands under target is a better outcome than a large number from three trades. Nothing in this report can alter the bot's behaviour; every parameter above is frozen for the duration, which is what makes the result mean anything.",
+  };
+}
+
+function formatChallengeForTelegram(c) {
+  const e = c.evidence, p = c.performance;
+  const bar = (pct) => {
+    const n = Math.max(0, Math.min(20, Math.round(pct / 5)));
+    return "█".repeat(n) + "░".repeat(20 - n);
+  };
+
+  let out = `🎯 <b>7-DAY CHALLENGE — Day ${c.day}/${c.of}</b>\n\n`;
+
+  out += `<b>PERFORMANCE</b>\n<pre>`;
+  out += `${bar(p.pctOfTarget)} ${p.pctOfTarget}%\n`;
+  out += `Net      ${padL(p.netVST.toFixed(0), 9)} VST\n`;
+  out += `Target   ${padL(p.target, 9)} VST\n`;
+  out += `Status   ${p.status}\n`;
+  out += `</pre>\n`;
+
+  out += `<b>EVIDENCE</b>\n<pre>`;
+  out += `Resolved    ${padL(e.resolvedTrades + "/" + e.minSample, 10)}\n`;
+  out += `Real fills  ${padL(e.realFills, 10)}\n`;
+  out += `W / L       ${padL(e.wins + " / " + e.losses, 10)}\n`;
+  out += `Expectancy  ${padL(e.expectancyR !== null ? e.expectancyR + "R" : "—", 10)}\n`;
+  out += `Max DD      ${padL(e.maxDrawdownPct + "%", 10)}  (cap ${e.maxDrawdownCapPct}%)\n`;
+  out += `Symbols     ${padL(e.symbolsTraded.length, 10)}\n`;
+  out += `Expired     ${padL(e.expiredCount, 10)}\n`;
+  out += `</pre>\n`;
+
+  const icon = { STRONG: "🟢", PROMISING: "🟡", NEGATIVE: "🔴", INSUFFICIENT: "⚪" }[e.verdict];
+  out += `<b>VERDICT: ${icon} ${e.verdict}</b>\n<i>${e.note}</i>\n\n`;
+  out += `🔒 Frozen: ${c.frozen.join(", ")}.\n`;
+  out += `<i>P&L crossing the target is not the same as the strategy working. The verdict above is the one that carries past Sunday.</i>`;
+
+  return out;
+}
+
+async function sendChallengeReport() {
+  try {
+    const c = buildChallengeReport();
+    await sendTelegram(formatChallengeForTelegram(c));
+    console.log(`Challenge report sent — day ${c.day}/${c.of}, ${c.evidence.verdict}`);
+  } catch (err) {
+    console.error("Challenge report failed (non-fatal):", err.message);
+  }
 }
