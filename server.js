@@ -283,6 +283,7 @@ function readLessonsLog() {
 
 async function logPostmortem(signal) {
   try {
+        if (signal.isPaperTrade) return;
     const postmortem = await generatePostmortem(signal);
     if (!postmortem) return;
     const entry = {
@@ -297,8 +298,6 @@ async function logPostmortem(signal) {
       status: "unreviewed",
     };
     fs.appendFileSync(LESSONS_LOG_FILE, JSON.stringify(entry) + "\n");
-    const tag = signal.isPaperTrade ? " (PAPER)" : "";
-    await sendTelegram(`🧠 <b>Post-mortem${tag}: ${signal.symbol} ${signal.direction} — ${signal.outcome}</b>\n\n${postmortem}`);
   } catch (err) {
     console.error("Post-mortem generation failed (non-fatal):", err.message);
   }
@@ -1671,11 +1670,6 @@ const server = http.createServer(async (req, res) => {
         if (condition === "WATCH_HTF_RESISTANCE_NEARBY" || condition === "WATCH_HTF_SUPPORT_NEARBY") {
           const zoneType = condition === "WATCH_HTF_RESISTANCE_NEARBY" ? "resistance" : "support";
           const htfLevel = condition === "WATCH_HTF_RESISTANCE_NEARBY" ? payload.htfSwingHigh : payload.htfSwingLow;
-          await sendTelegram(`👀 <b>WATCH — HTF ${zoneType} nearby</b>
-Symbol: ${payload.symbol || "—"}
-Price: $${payload.price} approaching HTF ${zoneType} at $${htfLevel}
-HTF Trend: ${payload.htfTrend || "Unknown"}
-This is a heads-up only, not a trade plan — watch for an actual 15M rejection/confirmation before acting.`);
           console.log("HTF watch alert sent 👀", new Date().toISOString(), "| condition:", condition);
           return;
         }
