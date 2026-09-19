@@ -39,7 +39,7 @@ function logSignal(decision, payload, execResult) {
       loggedAt: new Date().toISOString(),
       symbol: payload.symbol || "—",
       condition: payload.condition || "",
-            type,
+      type,
       strategy: decision.strategy || "OB_SMC",
       isSwing: !!isSwing,
       zoneAttempt: payload._zoneAttempt || 1,
@@ -283,7 +283,7 @@ function readLessonsLog() {
 
 async function logPostmortem(signal) {
   try {
-        if (signal.isPaperTrade) return;
+    if (signal.isPaperTrade) return;
     const postmortem = await generatePostmortem(signal);
     if (!postmortem) return;
     const entry = {
@@ -463,32 +463,6 @@ function walkCandles(sig, bars) {
 
   let filled = false, fillT = null;
 
-  // ============================================================
-  // MFE / MAE (v13)
-  //
-  // MFE = Maximum Favourable Excursion: the best unrealised R the
-  //       trade ever reached before it closed.
-  // MAE = Maximum Adverse Excursion: the worst unrealised R it went
-  //       through before it closed.
-  //
-  // Both are measured from the moment the entry zone actually filled,
-  // not from signal time — price movement before the fill is not
-  // something the position experienced.
-  //
-  // Why this matters more than the outcome label:
-  //   - Losses that show MAE near -1R and MFE near 0R mean the thesis
-  //     was simply wrong.
-  //   - Losses with MFE of +1.5R mean the thesis was RIGHT and the
-  //     exit was wrong — a completely different problem needing a
-  //     completely different fix.
-  //   - EXPIRED trades with MFE around +0.8R mean targets sit just
-  //     beyond where price actually travels; EXPIRED with MFE near
-  //     0.2R means the setups genuinely do not move.
-  //
-  // Without this the bot can only say "it lost". With it, the bot can
-  // say WHY, which is the difference between guessing at parameters
-  // and diagnosing them.
-  // ============================================================
   let mfeR = 0;   // best R seen while in the position
   let maeR = 0;   // worst R seen while in the position (negative)
   let barsHeld = 0;
@@ -502,10 +476,6 @@ function walkCandles(sig, bars) {
 
     barsHeld += 1;
 
-    // Excursion in R terms. For a long the favourable extreme is the
-    // bar high and the adverse extreme is the bar low; inverted for a
-    // short. Using high/low rather than close is deliberate — a stop
-    // or target is hit by the wick, not by the close.
     const favR = (isShort ? entry - b.l : b.h - entry) / risk;
     const advR = (isShort ? entry - b.h : b.l - entry) / risk;
     if (favR > mfeR) { mfeR = favR; mfeBarsIn = barsHeld; }
@@ -565,8 +535,6 @@ async function resolvePaperTrades() {
 
       const res = walkCandles(sig, bars);
 
-      // Only settle EXPIRED / NOT_TAKEN once the full window has passed —
-      // otherwise a signal fired an hour ago gets written off prematurely.
       if ((res.outcome === "EXPIRED" || res.outcome === "NOT_TAKEN") && ageHours < RESOLVE_MAX_HOURS) continue;
       if (res.outcome === "BAD_LEVELS") continue;
 
@@ -575,7 +543,7 @@ async function resolvePaperTrades() {
       sig.isPaperTrade = true;
       sig.resolvedBy = "candle-walk-v13-mfe";
       sig.entryFilledAt = res.fillT ? new Date(res.fillT).toISOString() : null;
-            sig.mfeR = res.mfeR ?? null;
+      sig.mfeR = res.mfeR ?? null;
       sig.maeR = res.maeR ?? null;
       sig.barsHeld = res.barsHeld ?? null;
       sig.minutesHeld = res.minutesHeld ?? null;
@@ -806,28 +774,6 @@ function toBingXSymbol(symbol) {
   return symbol;
 }
 
-// ============================================================
-// SYMBOL PRECISION LOOKUP (new) — replaces the previous hardcoded
-// .toFixed(3) quantity rounding used for EVERY coin regardless of
-// symbol. That worked for ETH/SUI by coincidence, but is not safe in
-// general: BingX requires different quantity precision per symbol, and
-// an incorrect precision causes the real order to be silently REJECTED
-// by BingX — not caught by any of the bot's own safety rules, just a
-// formatting mismatch. This matters now that SOLUSDT has been added,
-// and will matter for any future coin. Queries BingX's real contract
-// specs once per symbol and caches the result in memory, so this stays
-// correct automatically without needing a manual code change every
-// time a new coin is added to the Pine Script alerts.
-//
-// FAILS SAFE: if the lookup fails for any reason (network issue,
-// symbol not found, unexpected response shape), falls back to the
-// previous hardcoded 3-decimal behavior rather than blocking execution
-// entirely — same fail-safe philosophy as getOpenPosition's failing-
-// closed pattern elsewhere in this file, but here failing OPEN with a
-// logged warning, since a slightly-wrong quantity precision on an
-// unfamiliar symbol is a much smaller risk than silently never trading
-// a coin at all due to a lookup hiccup.
-// ============================================================
 const symbolPrecisionCache = new Map(); // bingxSymbol -> quantityPrecision (integer)
 
 async function getQuantityPrecision(symbol) {
@@ -915,9 +861,6 @@ async function executeOnBingX(decision, payload) {
     }
     const notional = marginUSDT * leverage;
 
-    // FIXED (2026-08-28): quantity precision now looked up per-symbol
-    // from BingX's real contract specs instead of hardcoded to 3
-    // decimals for every coin — see getQuantityPrecision comment above.
     const qtyPrecision = await getQuantityPrecision(symbol);
     const quantity = Number((notional / entryPrice).toFixed(qtyPrecision));
 
@@ -1256,6 +1199,23 @@ function computeSwingLevels(payload, direction) {
 
 const FIXED_SL_PCT = 0.05;
 
+// ============================================================
+// TP1 -> 0.5R (2026-09-20)
+//
+// Retroactive analysis of 82 EXPIRED trades with MFE/MAE data showed 37
+// (45%) had MFE >= 0.5R, of which 29 looked "clean" (MAE shallow enough
+// that the stop likely wasn't hit first). Estimated +5.8R added across the
+// sample on the 40% TP1 slice alone, excluding the 8 ambiguous cases
+// entirely.
+//
+// This is a FORWARD TEST of that finding, not a repeat of the retroactive
+// analysis — MFE/MAE proves price reached 0.5R at some point, not that it
+// reached 0.5R before the stop. Compare EXPIRED rate and realized R after
+// the next ~30-40 resolved trades before treating this as confirmed.
+//
+// Only OB's TP1 changed here. TP2/TP3 floors (risk * 2, risk * 3) are
+// untouched — this stays a single-variable change from the prior 1R TP1.
+// ============================================================
 function computeOBLevels(payload, direction) {
   if (direction === "Short") {
     const obTop = num(payload.obTop), obBottom = num(payload.obBottom);
@@ -1264,7 +1224,7 @@ function computeOBLevels(payload, direction) {
     const entryMid = (obTop + obBottom) / 2;
     const sl = entryMid * (1 + FIXED_SL_PCT);
     const risk = sl - entryMid;
-    const tp1Floor = entryMid - risk;
+    const tp1Floor = entryMid - risk * 0.5;
     const tp2Floor = entryMid - risk * 2;
     const tp3Floor = entryMid - risk * 3;
     const tp1 = (pobTop > 0 && pobTop < tp1Floor) ? pobTop : tp1Floor;
@@ -1278,7 +1238,7 @@ function computeOBLevels(payload, direction) {
     const entryMid = (pobTop + pobBottom) / 2;
     const sl = entryMid * (1 - FIXED_SL_PCT);
     const risk = entryMid - sl;
-    const tp1Floor = entryMid + risk;
+    const tp1Floor = entryMid + risk * 0.5;
     const tp2Floor = entryMid + risk * 2;
     const tp3Floor = entryMid + risk * 3;
     const tp1 = (obBottom > 0 && obBottom > tp1Floor) ? obBottom : tp1Floor;
@@ -1562,7 +1522,7 @@ const server = http.createServer(async (req, res) => {
   const includePaper = urlObj.searchParams.get("includePaper") === "true";
 
   if (req.method === "GET" && pathname === "/") {
-    res.writeHead(200); res.end("Trade alert server v15 — deterministic scoring, Claude explains only, signal-only (no execution) ✅"); return;
+    res.writeHead(200); res.end("Trade alert server v16 — deterministic scoring, Claude explains only, signal-only (no execution) ✅"); return;
   }
 
   if (req.method === "GET" && pathname === "/signals") {
@@ -1589,7 +1549,7 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify(computeChecklistAnalysis(signals, { includePaper }), null, 2));
     return;
   }
-    if (req.method === "GET" && pathname === "/report") {
+  if (req.method === "GET" && pathname === "/report") {
     const days = parseInt(urlObj.searchParams.get("days") || "7", 10);
     const r = buildPerformanceReport(days);
     if (urlObj.searchParams.get("send") === "true") sendPerformanceReport(days);
@@ -1597,7 +1557,7 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify(r, null, 2));
     return;
   }
-    if (req.method === "GET" && pathname === "/challenge") {
+  if (req.method === "GET" && pathname === "/challenge") {
     const c = buildChallengeReport();
     if (urlObj.searchParams.get("send") === "true") sendChallengeReport();
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -1617,14 +1577,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ============================================================
-  // /test-postmortem  (added 2026-09-04)
-  // Forces a post-mortem run against an already-resolved signal so the
-  // whole chain (prompt -> API -> parse -> file write -> Telegram) can
-  // be verified on demand instead of waiting for a live trade to
-  // resolve. Optional ?index=N picks a specific resolved signal;
-  // defaults to the most recent one.
-  // ============================================================
   if (req.method === "GET" && pathname === "/test-postmortem") {
     const signals = readSignalLog();
     const resolved = signals.filter(s => s.outcome && s.outcome !== "not_taken");
@@ -1717,7 +1669,7 @@ ${note}`);
   res.writeHead(404); res.end("Not found");
 });
 
-server.listen(PORT, () => console.log(`Server v15 running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Server v16 running on port ${PORT}`));
 
 setInterval(() => {
   checkOpenPositions().catch(err => console.error("checkOpenPositions failed (non-fatal):", err.message));
@@ -1732,24 +1684,6 @@ setInterval(() => {
 setTimeout(() => {
   sendSignalBackupToTelegram().catch(err => console.error("Startup backup failed (non-fatal):", err.message));
 }, 60 * 1000);
-
-// ============================================================
-// PERFORMANCE REPORT (added 2026-09-04)
-//
-// Produces a period performance summary for Telegram + /report.
-//
-// Deliberate design choices, so the numbers mean something:
-//  - Deduplicates by SETUP, not by raw signal. The same OB re-alerting
-//    as price lingers inflates counts ~1.93x. Reports the deduped
-//    figure as primary and raw as secondary.
-//  - Keeps REAL and PAPER trades in separate columns and never blends
-//    them into one headline win rate.
-//  - Reports R-multiples, not percentage returns. Summing leveraged
-//    percentage returns across differently-sized positions produces a
-//    meaningless total; R is comparable across trades.
-//  - States sample size next to every win rate, and says plainly when
-//    the sample is too small to mean anything.
-// ============================================================
 
 const MIN_SAMPLE_FOR_CONFIDENCE = 20;
 
@@ -1914,7 +1848,6 @@ async function sendPerformanceReport(days = 7) {
   }
 }
 
-// Daily report at ~08:00 AEDT. Checks hourly, fires once per day.
 let lastReportDay = null;
 setInterval(() => {
   const nowAEDT = new Date().toLocaleString("en-AU", { timeZone: "Australia/Melbourne", hour: "2-digit", hour12: false });
@@ -1922,28 +1855,9 @@ setInterval(() => {
   if (parseInt(nowAEDT, 10) === 8 && lastReportDay !== dayKey) {
     lastReportDay = dayKey;
     sendPerformanceReport(7).catch(err => console.error("Daily report failed:", err.message));
-        sendChallengeReport().catch(err => console.error("Challenge report failed:", err.message));
+    sendChallengeReport().catch(err => console.error("Challenge report failed:", err.message));
   }
 }, 60 * 60 * 1000);
-// ============================================================
-// FIB_SR STRATEGY — server-side scoring (v14)
-//
-// The second independent strategy. Deliberately does NOT reuse
-// scoreOB/applyRiskGates: the two strategies are separate experiments,
-// and sharing a scoring path would mean a change made for one silently
-// alters the evidence for the other.
-//
-// Division of labour, same as the OB engine:
-//   Pine   — detects structure, fires the alert, sends raw context
-//   Server — scores deterministically, applies gates, computes levels
-// Pine never decides a trade. If the two ever disagree, the server is
-// authoritative, because the server is what actually executes.
-//
-// The one thing shared is scoreBTC(). That rule was validated on real
-// backtest evidence (block ON: PF 1.33 / DD 18.32%, block OFF: PF 1.19
-// / DD 22.76%) and applies to any directional setup regardless of how
-// the setup was found.
-// ============================================================
 
 const FIB_MIN_TOUCHES = 3;        // matches the Pine default
 const FIB_SL_ATR_MULT = 1.5;
@@ -1962,36 +1876,21 @@ function scoreFib(payload, direction) {
 
   const points = [];
 
-  // 1 — Zone quality. Backtest evidence (SUI, Feb-Sep 2026): raising the
-  // minimum from 2 to 3 touches moved PF 0.756 -> 1.181 and halved
-  // drawdown. A level respected three times is a level; twice is a
-  // coincidence.
   const p1 = touches >= FIB_MIN_TOUCHES;
   points.push({ n: 1, label: "Zone quality", pass: p1 ? 1 : 0,
     detail: `${touches} confirmed touches (min ${FIB_MIN_TOUCHES})` });
 
-  // 2 — HTF trend agreement. Pine already gates on this, but the server
-  // re-checks rather than trusting the alert: if the Pine filter is ever
-  // misconfigured the server still refuses.
   const p2 = (direction === "Long" && htfTrend === "Bullish") || (direction === "Short" && htfTrend === "Bearish");
   points.push({ n: 2, label: "4H trend agreement", pass: p2 ? 1 : 0,
     detail: `HTF ${htfTrend} vs ${direction}` });
 
-  // 3 — BTC confirmation. Shared with the OB engine; validated rule.
   const btc = scoreBTC(payload, direction);
   points.push({ n: 3, label: "BTC confirmation", pass: btc.score, detail: btc.detail });
 
-  // 4 — Fib / S/R confluence actually present. The Pine control experiment
-  // showed confluence roughly halves drawdown (ETH out-of-sample: 21.35%
-  // -> 7.12% at the same profit factor), so its presence is scored rather
-  // than assumed.
   const p4 = hasStructure && touches > 0;
   points.push({ n: 4, label: "Fib/SR confluence", pass: p4 ? 1 : 0,
     detail: p4 ? `Overlap zone $${zoneBottom}-$${zoneTop}` : "No qualifying S/R zone at the Fib level" });
 
-  // 5 — Entry precision. A confluence zone several ATR wide gives a vague
-  // entry and a stop that has to sit far away to respect it, which wrecks
-  // the R-multiple before the trade even starts.
   const p5 = hasStructure && atr > 0 && zoneWidth <= atr * FIB_MAX_ZONE_ATR;
   points.push({ n: 5, label: "Entry precision", pass: p5 ? 1 : 0,
     detail: atr > 0 ? `Zone width ${(zoneWidth / atr).toFixed(2)} ATR (max ${FIB_MAX_ZONE_ATR})` : "ATR unavailable" });
@@ -2014,10 +1913,6 @@ function applyFibGates(payload, scoreResult, killzoneActive) {
     return { verdict: "NO_TRADE", reason: `Score ${rawScore}/5 below ${threshold} threshold (killzone active: ${killzoneActive})` };
   }
 
-  // FIB_SR is sized more conservatively than OB. Its out-of-sample
-  // drawdown ranged 4.68%-24.08% depending on configuration, and the
-  // ProveX evaluation caps drawdown at 10% — so this deliberately does
-  // not offer the high-leverage bands the OB swing setups do.
   let confidence = rawScore >= 4.5 ? "HIGH" : "MEDIUM";
   let leverage = confidence === "HIGH" ? "5x-8x" : "3x-5x";
 
@@ -2048,9 +1943,6 @@ function computeFibLevels(payload, direction) {
   const zoneTop = num(payload.zoneTop);
   const zoneBottom = num(payload.zoneBottom);
 
-  // ATR stop, not a fixed percentage. The OB engine's flat 5% stop
-  // produced a returns distribution with losses piled at -5% to -6%,
-  // meaning the stop — not the structure — was deciding every exit.
   const entryMid = price;
   const slDist = atr > 0 ? atr * FIB_SL_ATR_MULT : price * 0.02;
   const sl = direction === "Long" ? entryMid - slDist : entryMid + slDist;
@@ -2092,35 +1984,13 @@ function buildFibDecision(payload) {
 
   return { verdict: "TRADE", type: "FIB_" + direction.toUpperCase(), scoreResult, gated, levels, isSwing: false, strategy: "FIB_SR" };
 }
-// ============================================================
-// 7-DAY CHALLENGE TRACKER (v15)
-//
-// Two grades, deliberately separate, because they answer different
-// questions and conflating them is how a lucky week gets mistaken for
-// an edge:
-//
-//   PERFORMANCE — did P&L cross the target? A fact about one week.
-//   EVIDENCE    — did the data demonstrate a repeatable edge? The
-//                 only output that survives past Sunday.
-//
-// EVIDENCE returns INSUFFICIENT below the minimum sample no matter how
-// large the P&L. Two lucky trades cannot grade themselves.
-//
-// Nothing here can change the bot's behaviour. It reads the signal log
-// and reports. Sizing, leverage, thresholds and gates are frozen for
-// the duration by design — a tracker that could tighten risk to chase
-// a target would be measuring itself.
-// ============================================================
 
 const CHALLENGE_TARGET_VST = 30000;
 const CHALLENGE_DAYS = 7;
 const CHALLENGE_MIN_SAMPLE = 30;
 const CHALLENGE_MAX_DD_PCT = 10;
-const CHALLENGE_START = process.env.CHALLENGE_START || null; // ISO date, e.g. "2026-09-11"
+const CHALLENGE_START = process.env.CHALLENGE_START || null;
 
-// Realised VST per R. Derived from the bot's own sizing so the number
-// tracks reality rather than a hardcoded guess: HIGH = 2000 margin at
-// 15x, MEDIUM = 900 at 10x, with a 5% stop distance.
 function vstPerR(sig) {
   const margin = sig.confidence === "HIGH" ? 2000 : 900;
   const lev = sig.confidence === "HIGH" ? 15 : 10;
@@ -2148,15 +2018,11 @@ function buildChallengeReport() {
   const real = closed.filter(s => !s.isPaperTrade);
   const paper = closed.filter(s => s.isPaperTrade);
 
-  // P&L in VST, real fills only. Paper trades are not money.
   const netVST = real.reduce((a, s) => a + (Number(s.realizedR) || 0) * vstPerR(s), 0);
 
-  // Expectancy across everything resolved, since paper trades are
-  // still evidence about the setup even though they are not P&L.
   const rs = closed.map(s => Number(s.realizedR) || 0);
   const expectancy = rs.length ? rs.reduce((a, b) => a + b, 0) / rs.length : null;
 
-  // Peak-to-trough on the cumulative R curve, in order.
   const ordered = [...closed].sort((a, b) => Date.parse(a.loggedAt) - Date.parse(b.loggedAt));
   let cum = 0, peak = 0, maxDDR = 0;
   for (const s of ordered) {
@@ -2173,7 +2039,6 @@ function buildChallengeReport() {
   const symbols = [...new Set(closed.map(s => s.symbol))];
   const expired = setups.filter(s => s.outcome === "EXPIRED").length;
 
-  // ---- PERFORMANCE: a fact, not a judgement ----
   const performance = {
     netVST: Number(netVST.toFixed(2)),
     target: CHALLENGE_TARGET_VST,
@@ -2183,10 +2048,6 @@ function buildChallengeReport() {
       : (netVST >= CHALLENGE_TARGET_VST ? "HIT (early)" : "IN PROGRESS"),
   };
 
-  // ---- EVIDENCE: the grade that actually matters ----
-  // Sample gate comes first and is absolute. A large P&L on six trades
-  // is not weak evidence, it is no evidence, and saying so plainly is
-  // the whole point of grading these separately.
   let verdict, note;
   if (closed.length < CHALLENGE_MIN_SAMPLE) {
     verdict = "INSUFFICIENT";
