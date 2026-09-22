@@ -303,6 +303,31 @@ async function logPostmortem(signal) {
   }
 }
 
+// ============================================================
+// REAL-TRADE OUTCOME TRACKING (v17)
+//
+// Three problems in the previous version, all of which misreported real
+// trades:
+//
+//  1. It resolved the trade the moment TP1 filled — but TP1 is only 40% of
+//     the position. The other 60% kept running and was never accounted for.
+//  2. It never set realizedR, so every real trade showed 0.0R in reports no
+//     matter how it actually closed.
+//  3. BingX code 109421 ("order not found") was recorded as "not_taken".
+//     A MARKET order that BingX accepted has filled — "not taken" was false.
+//     With order IDs corrupted by float rounding (fixed in v17 parsing),
+//     that path was likely hiding real trades.
+//
+// Now: the trade stays open until BingX shows no position on the symbol.
+// Then each TP order is checked. Filled TPs contribute their slice at their
+// actual fill price; any slice not filled by a TP is treated as closed by
+// the stop at -1R. R is measured from the ACTUAL entry fill (avgPrice), not
+// the zone midpoint the order was sized against.
+//
+// KNOWN LIMIT, stated rather than hidden: a manual close on BingX looks
+// identical to a stop-out here. If you close a position by hand, its
+// unfilled slices will be recorded at -1R. The record's notes say so.
+// ============================================================
 async function checkOpenPositions() {
   if (!BINGX_API_KEY || !BINGX_API_SECRET) return;
   const signals = readSignalLog();
@@ -313,52 +338,90 @@ async function checkOpenPositions() {
   for (const sig of openSignals) {
     try {
       const entryCheck = await bingxRequest("GET", "/openApi/swap/v2/trade/order", {
-        symbol: sig.bingxSymbol, orderId: sig.bingxOrderId,
+        symbol: sig.bingxSymbol, orderId: String(sig.bingxOrderId),
       });
-      console.log(`Checked entry order ${sig.bingxOrderId} (${sig.bingxSymbol}):`, JSON.stringify(entryCheck).slice(0, 300));
-      const entryOrder = entryCheck.data?.order || entryCheck.data || entryCheck;
+      const entryOrder = entryCheck.data?.order;
       const entryStatus = entryOrder?.status;
 
-      if (entryCheck.code === 109421 || entryOrder === undefined) {
-        sig.outcome = "not_taken";
-        sig.notes = "Order no longer exists on BingX (code 109421) — likely manually closed outside the bot's tracking. Cannot confirm TP/SL outcome.";
+      if (entryCheck.code === 109421 || (entryCheck.code === 0 && !entryOrder)) {
+        sig.outcome = "UNVERIFIABLE";
+        sig.notes = `BingX could not find entry order ${sig.bingxOrderId} (code ${entryCheck.code}). For records written before v17 the likely cause is the order ID having been rounded when stored. The trade may well have happened — its outcome is unknown, so it is excluded from win/loss stats rather than guessed.`;
         anyUpdated = true;
         continue;
       }
+      if (entryCheck.code !== 0 || !entryOrder) continue; // transient error — retry next cycle
 
       if (entryStatus === "CANCELED" || entryStatus === "EXPIRED" || entryStatus === "FAILED") {
         sig.outcome = "not_taken";
-        sig.notes = "Entry order never filled.";
+        sig.notes = `Entry order status ${entryStatus} — never filled.`;
         anyUpdated = true;
         continue;
       }
       if (entryStatus !== "FILLED") continue;
 
-      if (sig.bingxTpOrderIds) {
-        for (const [label, orderId] of Object.entries(sig.bingxTpOrderIds)) {
-          const tpCheck = await bingxRequest("GET", "/openApi/swap/v2/trade/order", {
-            symbol: sig.bingxSymbol, orderId,
-          });
-          const tpOrder = tpCheck.data?.order || tpCheck.data || tpCheck;
-          if (tpOrder?.status === "FILLED") {
-            sig.outcome = label;
-            sig.notes = `${label} order confirmed filled via BingX.`;
-            anyUpdated = true;
-            logPostmortem(sig).catch(err => console.error("logPostmortem failed (non-fatal):", err.message));
-            break;
-          }
+      const fill = parseFloat(entryOrder.avgPrice);
+      if (!sig.entryFillPrice && fill > 0) { sig.entryFillPrice = fill; anyUpdated = true; }
+
+      const posCheck = await getOpenPosition(sig.bingxSymbol);
+      if (!posCheck.checked) continue;       // could not verify — never guess
+      if (posCheck.existing) continue;       // still open — keep tracking
+
+      // Position is closed. Account for every slice.
+      const sl = parseLevels(sig.stopLoss)[0];
+      const isShort = sig.direction === "Short";
+      const risk = Math.abs(fill - sl);
+      if (!(fill > 0) || !(risk > 0)) {
+        sig.outcome = "UNVERIFIABLE";
+        sig.notes = `Position closed but entry fill (${entryOrder.avgPrice}) or stop (${sig.stopLoss}) unusable — cannot compute R.`;
+        anyUpdated = true;
+        continue;
+      }
+
+      let realized = 0, filledWeight = 0, highest = null, lookupFailed = false;
+      const fills = {};
+      for (const { label, weight } of LADDER) {
+        const id = sig.bingxTpOrderIds?.[label];
+        if (!id) continue;
+        const tpCheck = await bingxRequest("GET", "/openApi/swap/v2/trade/order", {
+          symbol: sig.bingxSymbol, orderId: String(id),
+        });
+        if (tpCheck.code !== 0) { lookupFailed = true; continue; }
+        const o = tpCheck.data?.order;
+        if (o?.status === "FILLED") {
+          const px = parseFloat(o.avgPrice) || parseFloat(o.price);
+          const r = (isShort ? fill - px : px - fill) / risk;
+          realized += weight * r;
+          filledWeight += weight;
+          highest = label;
+          fills[label] = { price: px, r: +r.toFixed(3), weight };
         }
       }
 
-      if (!sig.outcome) {
-        const posCheck = await getOpenPosition(sig.bingxSymbol);
-        if (posCheck.checked && !posCheck.existing) {
-          sig.outcome = "SL";
-          sig.notes = "Position closed with no TP fill detected — inferred SL hit (BingX doesn't expose SL as a separately trackable order ID; a manual close would look identical).";
-          anyUpdated = true;
-          logPostmortem(sig).catch(err => console.error("logPostmortem failed (non-fatal):", err.message));
-        }
+      if (lookupFailed) {
+        // A TP lookup failing means we cannot tell whether that slice won.
+        // Recording it as a stop-out would risk turning a win into a loss.
+        sig.outcome = "UNVERIFIABLE";
+        sig.ladderFills = fills;
+        sig.notes = "Position closed, but at least one TP order could not be looked up (likely a pre-v17 rounded ID). Outcome not recorded rather than guessed.";
+        anyUpdated = true;
+        continue;
       }
+
+      const stoppedWeight = +(1 - filledWeight).toFixed(4);
+      realized += stoppedWeight * -1;
+
+      sig.outcome = highest || "SL";
+      sig.realizedR = +realized.toFixed(3);
+      sig.ladderFills = fills;
+      sig.stoppedWeight = stoppedWeight;
+      sig.resolvedBy = "bingx-orders-v17";
+      sig.notes = (highest
+          ? `${Object.keys(fills).join(", ")} filled on BingX; remaining ${Math.round(stoppedWeight * 100)}% closed without a TP fill and is recorded at -1R.`
+          : `No TP filled; position closed — recorded at -1R.`)
+        + ` Entry fill ${fill}. A manual close looks identical to a stop-out and would be recorded the same way.`;
+      anyUpdated = true;
+      logPostmortem(sig).catch(err => console.error("logPostmortem failed (non-fatal):", err.message));
+      console.log(`Real trade resolved ${sig.symbol} ${sig.direction} -> ${sig.outcome} (${sig.realizedR}R)`);
     } catch (err) {
       console.error(`Failed to check signal (order ${sig.bingxOrderId}):`, err.message);
     }
@@ -447,13 +510,45 @@ async function fetchKlines(bingxSymbol, startTime, endTime) {
   }
 }
 
+// ============================================================
+// LADDER-ACCURATE CANDLE WALK (v17)
+//
+// Previous versions returned the moment TP1 was touched and booked the
+// WHOLE position at TP1. The live bot does not do that — executeOnBingX
+// closes 40% at TP1, 30% at TP2, 30% at TP3, and anything still open when
+// the stop is hit closes at -1R.
+//
+// With TP1 at 0.5R that difference is large. A TP1 touch followed by a
+// reversal to the stop was being recorded as +0.5R. What the live bot
+// actually books is 0.4 x 0.5R - 0.6 x 1R = -0.4R — a loss recorded as a
+// win. Paper results therefore flattered exactly the change being tested.
+//
+// This walk now follows the same ladder the live bot runs:
+//   - each TP closes its own slice at its own price
+//   - the stop closes whatever is still open at -1R
+//   - realizedR is the weighted sum across slices
+//   - if the 48h window ends with a slice still open, that slice is marked
+//     to market at the last close and flagged, never silently dropped
+//
+// A stop and an unfilled target touched inside one 5m candle is still
+// AMBIGUOUS: the order of touches is unknowable at 5m, and guessing would
+// reintroduce the bias this exists to remove.
+// ============================================================
+const LADDER = [
+  { label: "TP1", weight: 0.4 },
+  { label: "TP2", weight: 0.3 },
+  { label: "TP3", weight: 0.3 },
+];
+
 function walkCandles(sig, bars) {
   const zone = parseLevels(sig.entryZone);
   const sl   = parseLevels(sig.stopLoss)[0];
-  const tp1  = parseLevels(sig.tp1)[0];
-  const tp2  = parseLevels(sig.tp2)[0];
-  const tp3  = parseLevels(sig.tp3)[0];
-  if (!zone.length || !sl || !tp1) return { outcome: "BAD_LEVELS" };
+  const tpPx = {
+    TP1: parseLevels(sig.tp1)[0],
+    TP2: parseLevels(sig.tp2)[0],
+    TP3: parseLevels(sig.tp3)[0],
+  };
+  if (!zone.length || !sl || !tpPx.TP1) return { outcome: "BAD_LEVELS" };
 
   const zLo = Math.min(...zone), zHi = Math.max(...zone);
   const isShort = sig.direction === "Short";
@@ -461,20 +556,34 @@ function walkCandles(sig, bars) {
   const risk = Math.abs(entry - sl);
   if (!risk) return { outcome: "BAD_LEVELS" };
 
-  let filled = false, fillT = null;
+  const rAt = (px) => (isShort ? entry - px : px - entry) / risk;
+  const touched = (px, b) => isShort ? b.l <= px : b.h >= px;
 
-  let mfeR = 0;   // best R seen while in the position
-  let maeR = 0;   // worst R seen while in the position (negative)
-  let barsHeld = 0;
-  let mfeBarsIn = null;  // how many bars until MFE was reached
+  // A missing TP2/TP3 price (should not happen for OB levels) folds its
+  // weight into the previous slice rather than silently vanishing.
+  const slices = [];
+  for (const s of LADDER) {
+    if (tpPx[s.label]) slices.push({ ...s, price: tpPx[s.label], done: false });
+    else if (slices.length) slices[slices.length - 1].weight += s.weight;
+  }
+
+  let filled = false, fillT = null;
+  let mfeR = 0, maeR = 0, barsHeld = 0, mfeBarsIn = null;
+  let realized = 0, lastClose = null, highest = null;
+  const fills = {};
+
+  const excursion = () => ({
+    mfeR: +mfeR.toFixed(2), maeR: +maeR.toFixed(2),
+    barsHeld, barsToMfe: mfeBarsIn, minutesHeld: barsHeld * 5,
+  });
 
   for (const b of bars) {
     if (!filled) {
       if (b.l <= zHi && b.h >= zLo) { filled = true; fillT = b.t; }
       else continue;
     }
-
     barsHeld += 1;
+    lastClose = b.c;
 
     const favR = (isShort ? entry - b.l : b.h - entry) / risk;
     const advR = (isShort ? entry - b.h : b.l - entry) / risk;
@@ -482,38 +591,55 @@ function walkCandles(sig, bars) {
     if (advR < maeR) { maeR = advR; }
 
     const hitSL = isShort ? b.h >= sl : b.l <= sl;
-    const hitTP = isShort ? b.l <= tp1 : b.h >= tp1;
+    const open = slices.filter(s => !s.done);
+    const hitNow = open.filter(s => touched(s.price, b));
 
-    const excursion = {
-      mfeR: +mfeR.toFixed(2),
-      maeR: +maeR.toFixed(2),
-      barsHeld,
-      barsToMfe: mfeBarsIn,
-      minutesHeld: barsHeld * 5,
-    };
-
-    if (hitSL && hitTP) {
-      return { outcome: "AMBIGUOUS", entry, fillT, ...excursion,
-        note: "SL and TP1 both touched inside one 5m candle — true order unknowable, not counted as a win or a loss." };
+    if (hitSL && hitNow.length) {
+      return { outcome: "AMBIGUOUS", entry, fillT, realizedR: null, fills, ...excursion(),
+        note: "Stop and an unfilled target touched inside one 5m candle — order unknowable, excluded from win/loss stats. " };
     }
-    if (hitSL) return { outcome: "SL", entry, fillT, exit: sl, realizedR: -1, ...excursion };
-    if (hitTP) {
-      let label = "TP1", px = tp1;
-      if (tp3 && (isShort ? b.l <= tp3 : b.h >= tp3))      { label = "TP3"; px = tp3; }
-      else if (tp2 && (isShort ? b.l <= tp2 : b.h >= tp2)) { label = "TP2"; px = tp2; }
-      const R = (isShort ? entry - px : px - entry) / risk;
-      return { outcome: label, entry, fillT, exit: px, realizedR: +R.toFixed(2), ...excursion };
+
+    for (const s of hitNow) {
+      s.done = true;
+      const r = rAt(s.price);
+      realized += s.weight * r;
+      fills[s.label] = { price: s.price, r: +r.toFixed(3), weight: s.weight };
+      highest = s.label;
+    }
+
+    if (hitSL) {
+      const openWeight = slices.filter(s => !s.done).reduce((a, s) => a + s.weight, 0);
+      realized += openWeight * -1;
+      return {
+        outcome: highest || "SL", entry, fillT, exit: sl,
+        realizedR: +realized.toFixed(3), fills, stoppedWeight: +openWeight.toFixed(2),
+        ...excursion(),
+        note: highest ? `${highest} filled, remaining ${Math.round(openWeight * 100)}% stopped at -1R. ` : "",
+      };
+    }
+
+    if (slices.every(s => s.done)) {
+      return { outcome: highest, entry, fillT, exit: slices[slices.length - 1].price,
+        realizedR: +realized.toFixed(3), fills, ...excursion(), note: "" };
     }
   }
 
+  if (!filled) return { outcome: "NOT_TAKEN", entry, fillT, realizedR: null, fills, ...excursion() };
+
+  // Window ended with part of the position still open.
+  const openWeight = slices.filter(s => !s.done).reduce((a, s) => a + s.weight, 0);
+  if (!highest) {
+    // Nothing filled, nothing stopped — genuinely unresolved, no P&L claimed.
+    return { outcome: "EXPIRED", entry, fillT, realizedR: null, fills, ...excursion() };
+  }
+  const mtmR = lastClose != null ? rAt(lastClose) : 0;
+  realized += openWeight * mtmR;
   return {
-    outcome: filled ? "EXPIRED" : "NOT_TAKEN",
-    entry, fillT,
-    mfeR: +mfeR.toFixed(2),
-    maeR: +maeR.toFixed(2),
-    barsHeld,
-    barsToMfe: mfeBarsIn,
-    minutesHeld: barsHeld * 5,
+    outcome: highest, entry, fillT, exit: lastClose,
+    realizedR: +realized.toFixed(3), fills,
+    openWeightAtExpiry: +openWeight.toFixed(2), openMarkR: +mtmR.toFixed(3),
+    ...excursion(),
+    note: `${highest} filled; remaining ${Math.round(openWeight * 100)}% still open at the 48h mark, valued at last close (${mtmR.toFixed(2)}R) — unrealized, not a closed result. `,
   };
 }
 
@@ -541,7 +667,12 @@ async function resolvePaperTrades() {
       sig.outcome    = res.outcome;
       sig.realizedR  = res.realizedR ?? null;
       sig.isPaperTrade = true;
-      sig.resolvedBy = "candle-walk-v13-mfe";
+      sig.resolvedBy = "candle-walk-v17-ladder";
+      sig.ladderFills = res.fills || null;
+      if (res.openWeightAtExpiry != null) {
+        sig.openWeightAtExpiry = res.openWeightAtExpiry;
+        sig.openMarkR = res.openMarkR;
+      }
       sig.entryFilledAt = res.fillT ? new Date(res.fillT).toISOString() : null;
       sig.mfeR = res.mfeR ?? null;
       sig.maeR = res.maeR ?? null;
@@ -549,10 +680,10 @@ async function resolvePaperTrades() {
       sig.minutesHeld = res.minutesHeld ?? null;
       sig.notes = `PAPER TRADE — resolved by 5m candle walk with entry gate and first-touch sequencing. `
         + `Entry zone ${sig.entryZone}${res.fillT ? ` filled ${new Date(res.fillT).toISOString()}` : " never filled"}. `
-        + `${res.note || ""}Still weaker evidence than a confirmed BingX fill: no slippage, no fees, no partial fills.`;
+        + `${res.note || ""}Modelled on the live 40/30/30 ladder. Still weaker evidence than a confirmed BingX fill: no slippage, no fees.`;
       anyUpdated = true;
 
-      if (res.outcome === "SL" || res.outcome.startsWith("TP")) {
+      if (res.outcome === "SL" || String(res.outcome).startsWith("TP")) {
         logPostmortem(sig).catch(err => console.error("logPostmortem (paper) failed (non-fatal):", err.message));
       }
       console.log(`Resolved ${sig.symbol} ${sig.direction} -> ${res.outcome}${res.realizedR != null ? ` (${res.realizedR}R)` : ""}`);
@@ -565,12 +696,12 @@ async function resolvePaperTrades() {
 
 function computeStats(signals, options = {}) {
   const { includePaper = false } = options;
-  const base = includePaper ? signals : signals.filter(s => !s.isPaperTrade);
-  const resolved = base.filter(s => s.outcome && s.outcome !== "not_taken");
+  const base = includePaper ? signals : signals.filter(s => isReal(s));
+  const resolved = base.filter(s => isClosed(s.outcome));
 
   function winRate(arr) {
-    const won = arr.filter(s => s.outcome === "TP1" || s.outcome === "TP2" || s.outcome === "TP3").length;
-    const lost = arr.filter(s => s.outcome === "SL").length;
+    const won = arr.filter(s => tradeResult(s) === "win").length;
+    const lost = arr.filter(s => tradeResult(s) === "loss").length;
     const total = won + lost;
     return { total, won, lost, winRatePct: total > 0 ? Number((won / total * 100).toFixed(1)) : null };
   }
@@ -582,8 +713,8 @@ function computeStats(signals, options = {}) {
   const repeatZone = resolved.filter(s => (s.flags || []).some(f => f.includes("Repeat signal on the same zone")));
   const freshZone = resolved.filter(s => !(s.flags || []).some(f => f.includes("Repeat signal on the same zone")));
 
-  const realCount = signals.filter(s => !s.isPaperTrade).length;
-  const paperCount = signals.filter(s => s.isPaperTrade).length;
+  const realCount = signals.filter(s => isReal(s)).length;
+  const paperCount = signals.filter(s => !isReal(s)).length;
 
   return {
     totalLogged: signals.length,
@@ -592,7 +723,7 @@ function computeStats(signals, options = {}) {
     paperTradeCount: paperCount,
     filterApplied: includePaper ? "real + paper combined" : "real trades only (default — safer, see HYPOTHESES.md issue #5)",
     ...(includePaper ? {
-      warning: "⚠️ PAPER TRADES INCLUDED — these use a weaker, single-price-snapshot resolution methodology, not real BingX fill confirmations. Do NOT treat this blended win rate as equivalent to real-trade performance. Use default (no ?includePaper=true) for trustworthy numbers.",
+      warning: "⚠️ PAPER TRADES INCLUDED — these are resolved by a 5m candle walk modelled on the live ladder, not real BingX fills (no fees, no slippage). Do NOT treat this blended win rate as equivalent to real-trade performance. Use default (no ?includePaper=true) for trustworthy numbers.",
     } : {}),
     overall: winRate(resolved),
     byHtfOpposition: { opposed: winRate(htfOpposed), aligned: winRate(htfAligned) },
@@ -606,12 +737,12 @@ const MIN_SAMPLE_FOR_INSIGHT = 8;
 
 function computeChecklistAnalysis(signals, options = {}) {
   const { includePaper = false } = options;
-  const base = includePaper ? signals : signals.filter(s => !s.isPaperTrade);
-  const resolved = base.filter(s => s.outcome && s.outcome !== "not_taken" && s.checklist);
+  const base = includePaper ? signals : signals.filter(s => isReal(s));
+  const resolved = base.filter(s => isClosed(s.outcome) && s.checklist);
 
   function winRateOf(arr) {
-    const won = arr.filter(s => s.outcome === "TP1" || s.outcome === "TP2" || s.outcome === "TP3").length;
-    const lost = arr.filter(s => s.outcome === "SL").length;
+    const won = arr.filter(s => tradeResult(s) === "win").length;
+    const lost = arr.filter(s => tradeResult(s) === "loss").length;
     const total = won + lost;
     return {
       total, won, lost,
@@ -725,6 +856,55 @@ async function sendSignalBackupToTelegram() {
   });
 }
 
+// ============================================================
+// BIG-INTEGER SAFE PARSING (v17)
+//
+// BingX order IDs are 19-digit integers. JavaScript numbers are exact only
+// to 16 digits (Number.MAX_SAFE_INTEGER = 9007199254740991), so JSON.parse
+// silently rounded every order ID to the nearest multiple of 256:
+//   BingX sends  2098554729454899201
+//   bot stored   2098554729454899200
+// Every later "did this order fill?" lookup then asked about an order that
+// may not exist. BingX's own developer docs state responses MUST be parsed
+// with a big-int-aware parser, not JSON.parse.
+//
+// Any integer of 16+ digits is converted to a string before parsing. Prices,
+// quantities and 13-digit millisecond timestamps are never that long, so
+// nothing else is affected. IDs stay strings end to end, which is also how
+// BingX's examples pass them back.
+//
+// Records written before v17 already hold rounded IDs. Those cannot be
+// recovered — see the UNVERIFIABLE outcome in checkOpenPositions.
+// ============================================================
+function parseBingXJson(text) {
+  // Walk the raw text once. Outside of string literals, any integer literal
+  // of 16+ digits is wrapped in quotes before JSON.parse sees it. Tracking
+  // string state (including escapes) means digits inside a string are never
+  // touched, and integers anywhere — object values or array elements — are.
+  let out = "", i = 0, inStr = false;
+  const n = text.length;
+  while (i < n) {
+    const ch = text[i];
+    if (inStr) {
+      out += ch;
+      if (ch === "\\") { out += text[i + 1] ?? ""; i += 2; continue; }
+      if (ch === '"') inStr = false;
+      i++; continue;
+    }
+    if (ch === '"') { inStr = true; out += ch; i++; continue; }
+    if (ch === "-" || (ch >= "0" && ch <= "9")) {
+      let j = i + (ch === "-" ? 1 : 0);
+      while (j < n && text[j] >= "0" && text[j] <= "9") j++;
+      const isFloat = j < n && (text[j] === "." || text[j] === "e" || text[j] === "E");
+      const digits = j - i - (ch === "-" ? 1 : 0);
+      if (!isFloat && digits >= 16) { out += '"' + text.slice(i, j) + '"'; i = j; continue; }
+      out += text.slice(i, j); i = j; continue;
+    }
+    out += ch; i++;
+  }
+  return JSON.parse(out);
+}
+
 function bingxSign(queryString) {
   return require("crypto").createHmac("sha256", BINGX_API_SECRET).update(queryString).digest("hex");
 }
@@ -755,7 +935,7 @@ async function bingxRequest(method, path, params) {
       res.on("end", () => {
         console.log(`BingX response [${res.statusCode}]:`, data.slice(0, 500));
         try {
-          resolve(JSON.parse(data));
+          resolve(parseBingXJson(data));
         } catch {
           resolve({ error: "Failed to parse BingX response", statusCode: res.statusCode, raw: data });
         }
@@ -1522,7 +1702,7 @@ const server = http.createServer(async (req, res) => {
   const includePaper = urlObj.searchParams.get("includePaper") === "true";
 
   if (req.method === "GET" && pathname === "/") {
-    res.writeHead(200); res.end("Trade alert server v16 — deterministic scoring, Claude explains only, signal-only (no execution) ✅"); return;
+    res.writeHead(200); res.end("Trade alert server v17 — deterministic scoring, Claude explains only, signal-only (no execution) ✅"); return;
   }
 
   if (req.method === "GET" && pathname === "/signals") {
@@ -1669,7 +1849,7 @@ ${note}`);
   res.writeHead(404); res.end("Not found");
 });
 
-server.listen(PORT, () => console.log(`Server v16 running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Server v17 running on port ${PORT}`));
 
 setInterval(() => {
   checkOpenPositions().catch(err => console.error("checkOpenPositions failed (non-fatal):", err.message));
@@ -1691,19 +1871,56 @@ function isWin(outcome) { return outcome === "TP1" || outcome === "TP2" || outco
 function isLoss(outcome) { return outcome === "SL"; }
 function isClosed(outcome) { return isWin(outcome) || isLoss(outcome); }
 
+// ============================================================
+// WIN / LOSS / REAL — single definitions (v17)
+//
+// A trade is REAL only if BingX gave it an order ID. Previously "real" meant
+// "isPaperTrade is not true", which also counted every signal still waiting
+// to be resolved as a real trade.
+//
+// A trade WINS or LOSES by its net realizedR, not by its outcome label.
+// With a 40/30/30 ladder a trade can fill TP1 and still lose overall
+// (0.4 x 0.5R - 0.6 x 1R = -0.4R). Counting that as a win because its label
+// says "TP1" was a misreport. The label is kept — it records how far the
+// trade got — but the win/loss count uses the money.
+// ============================================================
+function isReal(s) { return !!s.bingxOrderId; }
+
+function tradeResult(s) {
+  if (!isClosed(s.outcome)) return null;
+  if (typeof s.realizedR === "number") {
+    if (s.realizedR > 0) return "win";
+    if (s.realizedR < 0) return "loss";
+    return "flat";
+  }
+  return isWin(s.outcome) ? "win" : "loss";
+}
+
+// Records resolved before v17 by the old paper resolver booked the whole
+// position at the first TP touched, which overstates R. Counted separately
+// in reports so they are never mistaken for current-method results.
+function isLegacyResolution(s) {
+  return !isReal(s) && isClosed(s.outcome) && s.resolvedBy !== "candle-walk-v17-ladder";
+}
+
 function dedupeBySetup(signals) {
   const seen = new Map();
   for (const s of signals) {
     const key = [s.symbol, s.direction, s.entryZone, s.stopLoss].join("|");
-    if (!seen.has(key)) seen.set(key, { ...s, _dupCount: 1 });
-    else seen.get(key)._dupCount += 1;
+    const cur = seen.get(key);
+    if (!cur) { seen.set(key, { ...s, _dupCount: 1 }); continue; }
+    cur._dupCount += 1;
+    // If the same setup has both a paper record and a real BingX fill, keep
+    // the real one. Keeping whichever came first could hide a real trade
+    // behind a paper duplicate of the same zone.
+    if (!isReal(cur) && isReal(s)) seen.set(key, { ...s, _dupCount: cur._dupCount });
   }
   return [...seen.values()];
 }
 
 function bucketStats(arr) {
-  const wins = arr.filter(s => isWin(s.outcome)).length;
-  const losses = arr.filter(s => isLoss(s.outcome)).length;
+  const wins = arr.filter(s => tradeResult(s) === "win").length;
+  const losses = arr.filter(s => tradeResult(s) === "loss").length;
   const total = wins + losses;
   const r = arr.reduce((a, s) => a + (Number(s.realizedR) || 0), 0);
   return {
@@ -1722,13 +1939,15 @@ function groupBy(arr, keyFn) {
   return m;
 }
 
+// Padding never truncates (v17). The old versions sliced anything longer
+// than the column, which could silently cut digits off a number.
 function pad(str, len) {
   const s = String(str ?? "");
-  return s.length >= len ? s.slice(0, len) : s + " ".repeat(len - s.length);
+  return s.length >= len ? s : s + " ".repeat(len - s.length);
 }
 function padL(str, len) {
   const s = String(str ?? "");
-  return s.length >= len ? s.slice(0, len) : " ".repeat(len - s.length) + s;
+  return s.length >= len ? s : " ".repeat(len - s.length) + s;
 }
 
 function buildPerformanceReport(days = 7) {
@@ -1743,12 +1962,16 @@ function buildPerformanceReport(days = 7) {
   const setups = dedupeBySetup(inPeriod);
   const inflation = setups.length > 0 ? (rawCount / setups.length) : 1;
 
-  const real = setups.filter(s => !s.isPaperTrade);
-  const paper = setups.filter(s => s.isPaperTrade);
+  const real = setups.filter(s => isReal(s));
+  const paper = setups.filter(s => !isReal(s));
   const realClosed = real.filter(s => isClosed(s.outcome));
   const paperClosed = paper.filter(s => isClosed(s.outcome));
   const pending = setups.filter(s => !s.outcome);
-  const notTaken = setups.filter(s => s.outcome === "not_taken");
+  const notTaken = setups.filter(s => s.outcome === "not_taken" || s.outcome === "NOT_TAKEN");
+  const unverifiable = setups.filter(s => s.outcome === "UNVERIFIABLE");
+  const ambiguous = setups.filter(s => s.outcome === "AMBIGUOUS");
+  const expired = setups.filter(s => s.outcome === "EXPIRED");
+  const legacy = paperClosed.filter(s => isLegacyResolution(s));
 
   const realStats = bucketStats(realClosed);
   const paperStats = bucketStats(paperClosed);
@@ -1770,6 +1993,8 @@ function buildPerformanceReport(days = 7) {
     days, rawCount, setupCount: setups.length, inflation: Number(inflation.toFixed(2)),
     realCount: real.length, paperCount: paper.length,
     pendingCount: pending.length, notTakenCount: notTaken.length,
+    unverifiableCount: unverifiable.length, ambiguousCount: ambiguous.length,
+    expiredCount: expired.length, legacyCount: legacy.length,
     realStats, paperStats,
     byDirection: Object.fromEntries(Object.entries(byDirection).map(([k, v]) => [k, bucketStats(v)])),
     bySymbol: Object.fromEntries(Object.entries(bySymbol).map(([k, v]) => [k, bucketStats(v)])),
@@ -1782,8 +2007,10 @@ function buildPerformanceReport(days = 7) {
 }
 
 function formatReportForTelegram(r) {
-  const rate = (b) => b.winRate === null ? "  —  " : padL(b.winRate + "%", 5);
-  const line = (label, b) => `${pad(label, 13)}${padL(b.wins, 3)}${padL(b.losses, 4)}${rate(b)}${padL(b.totalR.toFixed(1) + "R", 7)}`;
+  // Every column is separated by an explicit space, so two values can never
+  // run together (v16 printed 18 losses + 53.8% as "1853.8%").
+  const rate = (b) => b.winRate === null ? "—" : b.winRate + "%";
+  const line = (label, b) => `${pad(label, 12)} ${padL(b.wins, 3)} ${padL(b.losses, 3)} ${padL(rate(b), 6)} ${padL(b.totalR.toFixed(1) + "R", 7)}`;
 
   let out = `📈 <b>ProveX Bot — ${r.days}-Day Performance</b>\n`;
   out += `<i>${new Date().toLocaleString("en-AU", { timeZone: "Australia/Melbourne", dateStyle: "medium", timeStyle: "short" })} AEDT</i>\n\n`;
@@ -1792,11 +2019,14 @@ function formatReportForTelegram(r) {
   out += `Raw alerts     ${padL(r.rawCount, 5)}\n`;
   out += `Unique setups  ${padL(r.setupCount, 5)}   (${r.inflation}x dup)\n`;
   out += `Still pending  ${padL(r.pendingCount, 5)}\n`;
+  out += `Expired        ${padL(r.expiredCount, 5)}\n`;
   out += `Not taken      ${padL(r.notTakenCount, 5)}\n`;
+  out += `Ambiguous      ${padL(r.ambiguousCount, 5)}\n`;
+  out += `Unverifiable   ${padL(r.unverifiableCount, 5)}\n`;
   out += `</pre>\n`;
 
   out += `<b>OUTCOMES</b>  <i>(deduped setups)</i>\n<pre>`;
-  out += `${pad("", 13)}${padL("W", 3)}${padL("L", 4)}${padL("Rate", 5)}${padL("Total", 7)}\n`;
+  out += `${pad("", 12)} ${padL("W", 3)} ${padL("L", 3)} ${padL("Rate", 6)} ${padL("Total", 7)}\n`;
   out += line("REAL fills", r.realStats) + `\n`;
   out += line("PAPER only", r.paperStats) + `\n`;
   out += `</pre>\n`;
@@ -1828,7 +2058,13 @@ function formatReportForTelegram(r) {
     out += `⚠️ Only ${r.realStats.total} real closed trade(s). Nothing here is statistically meaningful below ~${r.minSampleForConfidence}. Treat every rate above as noise.\n`;
   }
   if (r.paperStats.total > 0) {
-    out += `⚠️ Paper trades are resolved by price snapshot, not real fills — no entry gate, no intraday sequencing. Weaker evidence, kept in a separate row deliberately.\n`;
+    out += `⚠️ Paper trades are resolved by a 5m candle walk modelled on the live 40/30/30 ladder — not real BingX fills, so no fees or slippage. Weaker evidence, kept in a separate row deliberately.\n`;
+  }
+  if (r.legacyCount > 0) {
+    out += `⚠️ ${r.legacyCount} paper result(s) above were resolved before v17 by the old method, which booked the whole position at the first TP touched. Those overstate R — read the PAPER total as optimistic until they age out.\n`;
+  }
+  if (r.unverifiableCount > 0) {
+    out += `⚠️ ${r.unverifiableCount} real trade(s) could not be verified on BingX (likely pre-v17 rounded order IDs). Excluded from win/loss rather than guessed.\n`;
   }
   if (r.inflation > 1.2) {
     out += `ℹ️ ${r.rawCount} raw alerts collapsed to ${r.setupCount} setups (${r.inflation}x). Same OB re-alerting; deduped figures are the honest ones.\n`;
@@ -2015,8 +2251,8 @@ function buildChallengeReport() {
 
   const setups = dedupeBySetup(inWindow);
   const closed = setups.filter(s => isClosed(s.outcome));
-  const real = closed.filter(s => !s.isPaperTrade);
-  const paper = closed.filter(s => s.isPaperTrade);
+  const real = closed.filter(s => isReal(s));
+  const paper = closed.filter(s => !isReal(s));
 
   const netVST = real.reduce((a, s) => a + (Number(s.realizedR) || 0) * vstPerR(s), 0);
 
@@ -2034,8 +2270,8 @@ function buildChallengeReport() {
   const avgVstPerR = real.length ? real.reduce((a, s) => a + vstPerR(s), 0) / real.length : 3000;
   const maxDDPct = (maxDDR * avgVstPerR) / 96437 * 100;
 
-  const wins = closed.filter(s => isWin(s.outcome)).length;
-  const losses = closed.filter(s => isLoss(s.outcome)).length;
+  const wins = closed.filter(s => tradeResult(s) === "win").length;
+  const losses = closed.filter(s => tradeResult(s) === "loss").length;
   const symbols = [...new Set(closed.map(s => s.symbol))];
   const expired = setups.filter(s => s.outcome === "EXPIRED").length;
 
