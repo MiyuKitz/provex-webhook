@@ -669,6 +669,7 @@ async function resolvePaperTrades() {
       sig.isPaperTrade = true;
       sig.resolvedBy = "candle-walk-v17-ladder";
       sig.ladderFills = res.fills || null;
+      sig.stoppedWeight = res.stoppedWeight ?? null;
       if (res.openWeightAtExpiry != null) {
         sig.openWeightAtExpiry = res.openWeightAtExpiry;
         sig.openMarkR = res.openMarkR;
