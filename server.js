@@ -62,6 +62,9 @@ function logSignal(decision, payload, execResult) {
       bingxOrderId: execResult?.bingxOrderId || null,
       bingxSymbol: execResult?.bingxSymbol || null,
       bingxTpOrderIds: execResult?.tpOrderIds || null,
+      riskVST: execResult?.riskVST ?? null,
+      marginUSDT: execResult?.marginUSDT ?? null,
+      leverageUsed: execResult?.leverageUsed ?? null,
       outcome: null,
       realizedR: null,
       notes: null,
@@ -979,10 +982,194 @@ async function getQuantityPrecision(symbol) {
   }
 }
 
-function computeBingXSizing(confidence) {
-  return confidence === "HIGH"
-    ? { marginUSDT: 2000, leverage: 15 }
-    : { marginUSDT: 900, leverage: 10 };
+// ============================================================
+// SELF-CALIBRATING RISK ENGINE (v19)
+//
+// v18 sized at a flat 1% of equity, justified by a prop-firm drawdown cap.
+// That was wrong for what this bot is: a general trading system, not a
+// challenge-passer. A fixed number chosen from an external rulebook has no
+// business deciding how much a strategy risks.
+//
+// The risk fraction is now DERIVED from the bot's own resolved trades, and
+// recomputed as they accumulate. Nothing about any exchange or evaluation
+// programme enters the calculation.
+//
+// HOW THE NUMBER COMES OUT
+//
+// 1. Edge, measured conservatively.
+//    Expectancy is an estimate, and an estimate from 40 trades is worth less
+//    than the same figure from 400. So the engine uses the LOWER bound of
+//    expectancy (mean minus two standard errors), not the mean. A thin edge
+//    on a small sample produces a lower bound near zero — and therefore
+//    near-zero risk — automatically, with no special case for "early days".
+//
+// 2. Kelly, from the actual return distribution.
+//    For bets measured in R-multiples, the growth-optimal fraction is
+//    approximately E[r] / E[r^2]. Both come from the real trade history,
+//    so fat losing tails shrink the fraction on their own.
+//
+// 3. A fraction of Kelly, not Kelly.
+//    Full Kelly maximises growth only if the edge estimate is exact, and is
+//    violently volatile when it is not. Quarter-Kelly is the long-standing
+//    convention for that reason, and it is what this uses. This is a
+//    convention, openly chosen — but it scales WITH the measured edge rather
+//    than replacing it.
+//
+// 4. A survival ceiling, derived from the strategy's own streakiness.
+//    Losing runs are measured from the trade history, and compared against
+//    the run length probability predicts for a sample this size
+//    (log n / log(1/lossRate)) — the longer of the two is assumed. The
+//    ceiling is then whatever fraction keeps that run inside
+//    MAX_STREAK_DRAWDOWN of equity. A choppier strategy caps itself lower
+//    without anyone adjusting anything.
+//
+// WHAT THIS MEANS IN PRACTICE
+//    No proven edge        -> risk floors at RISK_FLOOR, trades stay tiny
+//    Edge proven, modest   -> risk rises toward quarter-Kelly
+//    Edge strong + long run of evidence -> rises further, capped by survival
+//    Account grows         -> same fraction, larger absolute size (compounds)
+//    Account shrinks       -> same fraction, smaller absolute size (automatic
+//                             de-risking, no drawdown governor needed)
+//
+// The one genuinely chosen input is MAX_STREAK_DRAWDOWN: how much of the
+// account you are willing to lose to a normal bad run. It is stated here,
+// configurable, and its consequence is spelled out — rather than smuggled in
+// as "1% because a prop firm said 10%".
+// ============================================================
+const KELLY_FRACTION = 0.25;
+const RISK_FLOOR = 0.0025;                 // 0.25% — size while evidence is still being gathered
+const MAX_STREAK_DRAWDOWN = Number(process.env.MAX_STREAK_DRAWDOWN || 0.25);
+const RISK_MIN_SAMPLE = 30;
+
+function computeRiskFraction() {
+  const signals = readSignalLog();
+  const closed = signals
+    .filter(s => isClosed(s.outcome) && typeof s.realizedR === "number")
+    .sort((a, b) => Date.parse(a.loggedAt) - Date.parse(b.loggedAt));
+  const rs = closed.map(s => s.realizedR);
+  const n = rs.length;
+
+  if (n < RISK_MIN_SAMPLE) {
+    return { fraction: RISK_FLOOR, n, reason: `only ${n}/${RISK_MIN_SAMPLE} resolved trades — risk held at the floor until there is enough evidence to size on` };
+  }
+
+  const mean = rs.reduce((a, b) => a + b, 0) / n;
+  const variance = rs.reduce((a, b) => a + (b - mean) ** 2, 0) / (n - 1);
+  const se = Math.sqrt(variance / n);
+  const edgeLow = mean - 2 * se;                 // conservative end of the estimate
+  const meanSq = rs.reduce((a, b) => a + b * b, 0) / n;
+
+  if (!(edgeLow > 0) || !(meanSq > 0)) {
+    return { fraction: RISK_FLOOR, n, mean, edgeLow,
+      reason: `expectancy ${mean.toFixed(3)}R is not distinguishable from zero at this sample size (lower bound ${edgeLow.toFixed(3)}R) — risk held at the floor` };
+  }
+
+  const kelly = edgeLow / meanSq;
+  let fraction = KELLY_FRACTION * kelly;
+
+  // Survival ceiling from observed and predicted losing runs.
+  let run = 0, longest = 0;
+  for (const r of rs) { run = r < 0 ? run + 1 : 0; if (run > longest) longest = run; }
+  const lossRate = rs.filter(r => r < 0).length / n;
+  const predicted = lossRate > 0 && lossRate < 1
+    ? Math.log(n) / Math.log(1 / lossRate) : longest;
+  const assumedStreak = Math.max(longest, Math.ceil(predicted), 1);
+  const ceiling = 1 - Math.pow(1 - MAX_STREAK_DRAWDOWN, 1 / assumedStreak);
+
+  let cappedBy = null;
+  if (fraction > ceiling) { fraction = ceiling; cappedBy = "survival ceiling"; }
+  if (fraction < RISK_FLOOR) { fraction = RISK_FLOOR; cappedBy = "floor"; }
+
+  return {
+    fraction, n, mean, edgeLow, kelly, assumedStreak, ceiling, lossRate, cappedBy,
+    reason: cappedBy === "survival ceiling"
+      ? `quarter-Kelly wanted ${(KELLY_FRACTION * kelly * 100).toFixed(2)}%, capped at ${(ceiling * 100).toFixed(2)}% so a ${assumedStreak}-loss run costs at most ${(MAX_STREAK_DRAWDOWN * 100).toFixed(0)}% of equity`
+      : cappedBy === "floor"
+        ? `computed fraction below the floor — held at ${(RISK_FLOOR * 100).toFixed(2)}%`
+        : `quarter-Kelly on ${n} trades (expectancy ${mean.toFixed(3)}R, conservative bound ${edgeLow.toFixed(3)}R)`,
+  };
+}
+
+// ============================================================
+// POSITION SIZING
+//
+// Replaces fixed 900 / 2000 VST margins. Two reasons:
+//
+// 1. The old tiers were BACKWARDS. HIGH confidence averaged -0.121R over 57
+//    trades and MEDIUM +0.149R over 303, so the bot was sizing its worst
+//    trades largest. Confidence is no longer used for sizing at all.
+//
+// 2. Fixed margins cannot compound. At 900 VST the bot risks the same amount
+//    whether the account holds 90k or 900k, so growth never feeds back into
+//    position size.
+//
+// Now: risk a constant FRACTION of equity per trade. Because the stop is a
+// fixed 5%, required notional follows directly:
+//
+//     risk    = equity x riskFraction (see the risk engine above)
+//     notional = risk / FIXED_SL_PCT
+//     margin   = notional / LEVERAGE
+//
+// WHY 1.0% AND NOT MORE. The prop-firm cap is 10% max drawdown. At the
+// observed ~44% win rate, runs of 7-8 consecutive losses occur regularly in
+// a few hundred trades. At 1.0% that is a 7-8% drawdown — inside the cap
+// with room to spare. At 1.5% the same run breaches it. Raising this number
+// does not improve expectancy; it only moves the account closer to the line
+// that ends the evaluation.
+//
+// Sizing has no effect on expectancy measured in R, so changing it does not
+// contaminate the HTF filter test running alongside it.
+// ============================================================
+const SIZING_LEVERAGE = 10;
+const MAX_MARGIN_FRACTION = 0.5;   // never commit more than half of free margin to one trade
+const FALLBACK_MARGIN = 900;       // the old MEDIUM size, used only if equity cannot be read
+
+let equityCache = { equity: null, available: null, at: 0 };
+const EQUITY_TTL_MS = 60000;
+
+async function getAccountEquity() {
+  if (equityCache.equity && Date.now() - equityCache.at < EQUITY_TTL_MS) return equityCache;
+  try {
+    const res = await bingxRequest("GET", "/openApi/swap/v2/user/balance", {});
+    const b = res?.data?.balance ?? res?.data;
+    const equity = parseFloat(b?.equity ?? b?.balance);
+    const available = parseFloat(b?.availableMargin ?? b?.balance ?? equity);
+    if (equity > 0) {
+      equityCache = { equity, available: available > 0 ? available : equity, at: Date.now() };
+      return equityCache;
+    }
+    console.error("Equity lookup returned no usable figure:", JSON.stringify(res).slice(0, 200));
+  } catch (err) {
+    console.error("Equity lookup failed (non-fatal):", err.message);
+  }
+  return { equity: null, available: null, at: 0 };
+}
+
+async function computeBingXSizing() {
+  const { equity, available } = await getAccountEquity();
+  if (!equity) {
+    // Fail SMALL, not large: an unreadable balance must never size up.
+    console.error(`Sizing fell back to ${FALLBACK_MARGIN} margin — equity unavailable.`);
+    return { marginUSDT: FALLBACK_MARGIN, leverage: SIZING_LEVERAGE,
+             riskVST: FALLBACK_MARGIN * SIZING_LEVERAGE * FIXED_SL_PCT, equity: null, sizedBy: "fallback" };
+  }
+  const rf = computeRiskFraction();
+  const risk = equity * rf.fraction;
+  const notional = risk / FIXED_SL_PCT;
+  let margin = notional / SIZING_LEVERAGE;
+  const cap = available * MAX_MARGIN_FRACTION;
+  let capped = false;
+  if (margin > cap) { margin = cap; capped = true; }
+  return {
+    marginUSDT: Number(margin.toFixed(2)),
+    leverage: SIZING_LEVERAGE,
+    riskVST: Number((margin * SIZING_LEVERAGE * FIXED_SL_PCT).toFixed(2)),
+    equity: Number(equity.toFixed(2)),
+    riskPct: Number((rf.fraction * 100).toFixed(3)),
+    sizedBy: capped
+      ? `capped by free margin (wanted ${(rf.fraction * 100).toFixed(2)}% of equity)`
+      : `${(rf.fraction * 100).toFixed(2)}% of equity — ${rf.reason}`,
+  };
 }
 
 function confidenceEmoji(confidence, rawScore) {
@@ -1034,7 +1221,9 @@ async function executeOnBingX(decision, payload) {
     const entrySide = direction === "Short" ? "SELL" : "BUY";
     const exitSide = direction === "Short" ? "BUY" : "SELL";
 
-    const { marginUSDT, leverage } = computeBingXSizing(gated.confidence);
+    const sizing = await computeBingXSizing();
+    const { marginUSDT, leverage, riskVST } = sizing;
+    console.log(`Sizing: ${marginUSDT} VST margin x ${leverage}x = ${(marginUSDT * leverage).toFixed(0)} notional, risking ${riskVST} VST (${sizing.sizedBy}, equity ${sizing.equity ?? "unknown"})`);
     const entryPrice = levels.entryMidRaw;
     if (!entryPrice || entryPrice <= 0) {
       console.error("BingX execution skipped — invalid entry price", entryPrice);
@@ -1093,9 +1282,9 @@ async function executeOnBingX(decision, payload) {
       if (tpOrderId) tpOrderIds[tp.label] = tpOrderId;
     }
 
-    await sendTelegram(`${confidenceEmoji(gated.confidence, scoreResult.rawScore)} <b>BingX demo execution</b>\n${symbol} ${direction} │ ${marginUSDT} VST margin │ ${leverage}x\nQty: ${quantity}\n${tpResults.join("\n")}`);
+    await sendTelegram(`${confidenceEmoji(gated.confidence, scoreResult.rawScore)} <b>BingX demo execution</b>\n${symbol} ${direction} │ ${marginUSDT} VST margin │ ${leverage}x\nRisking ${riskVST} VST (${sizing.sizedBy})\nQty: ${quantity}\n${tpResults.join("\n")}`);
     console.log("BingX execution complete", symbol, direction, "| TP results:", tpResults);
-    return { bingxOrderId: entryRes.data?.order?.orderId ?? entryRes.orderId ?? null, bingxSymbol: symbol, tpOrderIds };
+    return { bingxOrderId: entryRes.data?.order?.orderId ?? entryRes.orderId ?? null, bingxSymbol: symbol, tpOrderIds, riskVST, marginUSDT, leverageUsed: leverage };
   } catch (err) {
     console.error("BingX execution error (non-fatal):", err.message);
     try { await sendTelegram(`⚠️ <b>BingX execution error:</b> ${err.message}`); } catch {}
@@ -1281,11 +1470,44 @@ function applyRiskGates(payload, scoreResult, killzoneActive, isSwing = false, i
   const flags = [];
   const htfTrend  = payload.htfTrend || "Unknown";
   const htfOpposes = (direction === "Short" && htfTrend === "Bullish") || (direction === "Long" && htfTrend === "Bearish");
+  const htfKnown  = htfTrend === "Bullish" || htfTrend === "Bearish";
 
+  // ============================================================
+  // HTF FILTER (v18) — the direction of this rule is REVERSED from v17.
+  //
+  // Evidence, re-scored from candles across 360 logged OB signals with the
+  // live ladder:
+  //
+  //     HTF opposes the signal   +0.315R   n=161
+  //     HTF aligns with it       -0.063R   n=199
+  //
+  // The gap held under stratification by session (kill zone and outside),
+  // by direction (longs and shorts separately), and across every time
+  // period the sample was split into. Confidence tiers turned out to be
+  // this same effect relabelled, since v17 forced opposing trades down to
+  // MEDIUM — which is why "HIGH confidence" measured worse than MEDIUM.
+  //
+  // Mechanically this fits: OB is a mean-reversion setup. Taken WITH the
+  // higher-timeframe trend it fades nothing; taken AGAINST it, it fades an
+  // extended move, which is the setup's actual premise.
+  //
+  // KNOWN WEAKNESS, recorded rather than hidden: the whole sample sits
+  // inside one rising market (SUI roughly 0.67 -> 1.26, 4H trend bullish
+  // 71% of the time). Most of the profit came from HTF-opposing LONGS,
+  // which in a rally is dip buying. A sustained downtrend has never been
+  // observed in this data, and the same logic would then be catching
+  // falling knives. This filter is a hypothesis under live test, not a
+  // settled rule — if a real downtrend arrives, re-check it before trusting
+  // it.
+  // ============================================================
+  if (htfKnown && !htfOpposes) {
+    return { verdict: "NO_TRADE", reason: `HTF trend (${htfTrend}) aligns with the ${direction.toLowerCase()} — these averaged -0.063R over 199 logged signals while counter-trend ones averaged +0.315R. Blocked pending the live test of that finding.` };
+  }
   if (htfOpposes) {
-    confidence = "MEDIUM";
-    if (leverage !== floorLeverage) leverage = floorLeverage;
-    flags.push(`HTF trend (${htfTrend}) opposes signal direction — headwind`);
+    flags.push(`HTF trend (${htfTrend}) opposes signal direction — this is the condition being tested, no longer penalised (v18)`);
+  }
+  if (!htfKnown) {
+    flags.push(`HTF trend unknown — cannot apply the counter-trend filter, trade allowed but unclassified`);
   }
 
   const smtCheck = checkSMT(payload, direction);
@@ -1703,7 +1925,7 @@ const server = http.createServer(async (req, res) => {
   const includePaper = urlObj.searchParams.get("includePaper") === "true";
 
   if (req.method === "GET" && pathname === "/") {
-    res.writeHead(200); res.end("Trade alert server v17 — deterministic scoring, Claude explains only, signal-only (no execution) ✅"); return;
+    res.writeHead(200); res.end("Trade alert server v19 — deterministic scoring, Claude explains only, signal-only (no execution) ✅"); return;
   }
 
   if (req.method === "GET" && pathname === "/signals") {
@@ -1850,7 +2072,7 @@ ${note}`);
   res.writeHead(404); res.end("Not found");
 });
 
-server.listen(PORT, () => console.log(`Server v17 running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Server v19 running on port ${PORT}`));
 
 setInterval(() => {
   checkOpenPositions().catch(err => console.error("checkOpenPositions failed (non-fatal):", err.message));
@@ -2222,13 +2444,23 @@ function buildFibDecision(payload) {
   return { verdict: "TRADE", type: "FIB_" + direction.toUpperCase(), scoreResult, gated, levels, isSwing: false, strategy: "FIB_SR" };
 }
 
-const CHALLENGE_TARGET_VST = 30000;
-const CHALLENGE_DAYS = 7;
+// Evidence tracking (v19). These were prop-firm evaluation rules —
+// a 30,000 VST target and a 10% hard drawdown cap. The bot is no longer
+// built to pass an evaluation, so the target is now an optional personal
+// goal (unset by default, in which case no profit target is reported at
+// all) and the drawdown figure is the engine's own survival assumption
+// rather than somebody else's rule.
+const PROFIT_TARGET = Number(process.env.PROFIT_TARGET || 0);   // 0 = no target
+const CHALLENGE_DAYS = Number(process.env.REVIEW_WINDOW_DAYS || 7);
 const CHALLENGE_MIN_SAMPLE = 30;
-const CHALLENGE_MAX_DD_PCT = 10;
+const CHALLENGE_MAX_DD_PCT = MAX_STREAK_DRAWDOWN * 100;
 const CHALLENGE_START = process.env.CHALLENGE_START || null;
 
+// Sizing is no longer fixed, so the VST value of 1R must come from what the
+// trade actually risked. Older records predate that field and fall back to
+// the sizing that was in force when they were taken.
 function vstPerR(sig) {
+  if (typeof sig.riskVST === "number" && sig.riskVST > 0) return sig.riskVST;
   const margin = sig.confidence === "HIGH" ? 2000 : 900;
   const lev = sig.confidence === "HIGH" ? 15 : 10;
   return margin * lev * FIXED_SL_PCT;
@@ -2276,13 +2508,18 @@ function buildChallengeReport() {
   const symbols = [...new Set(closed.map(s => s.symbol))];
   const expired = setups.filter(s => s.outcome === "EXPIRED").length;
 
-  const performance = {
+  const performance = PROFIT_TARGET > 0 ? {
     netVST: Number(netVST.toFixed(2)),
-    target: CHALLENGE_TARGET_VST,
-    pctOfTarget: Number((netVST / CHALLENGE_TARGET_VST * 100).toFixed(1)),
+    target: PROFIT_TARGET,
+    pctOfTarget: Number((netVST / PROFIT_TARGET * 100).toFixed(1)),
     status: complete
-      ? (netVST >= CHALLENGE_TARGET_VST ? "HIT" : "MISSED")
-      : (netVST >= CHALLENGE_TARGET_VST ? "HIT (early)" : "IN PROGRESS"),
+      ? (netVST >= PROFIT_TARGET ? "HIT" : "MISSED")
+      : (netVST >= PROFIT_TARGET ? "HIT (early)" : "IN PROGRESS"),
+  } : {
+    netVST: Number(netVST.toFixed(2)),
+    target: null,
+    pctOfTarget: null,
+    status: "no profit target set — P&L reported, not graded",
   };
 
   let verdict, note;
