@@ -1,219 +1,246 @@
-# Trading Bot Hypotheses Log
+# Hypotheses & Evidence Register
 
-Method note: these findings come from reconstructing real outcomes for
-historical signals that were never resolved by the bot itself (skipped by
-one-position-per-symbol, so `checkOpenPositions` never saw them). Outcomes
-were determined by checking real ETH/SUI 4h candle highs/lows against each
-signal's logged entry/SL/TP1 price, walking forward from the signal's
-timestamp to find whichever level was touched first.
+*Last rewritten 2 October 2026, at server v19. The previous version of this file is preserved in git history; its findings predate the v17 measurement audit and should not be relied on.*
 
-**Precision limit:** 4h candle resolution means "which level was hit
-first" is only accurate to within a 4-hour window. If TP1 and SL were both
-touched inside the same 4h candle, true sequencing cannot be determined
-from high/low alone — this could overstate wins in rare cases. Treat these
-numbers as directionally reliable, not exact.
+This file records what has been tested, what the evidence showed, and why the bot is built the way it is. Every live rule in `server.js` should trace back to an entry here.
 
-**Coverage:** Aug 18–24, 2026 only (68 resolved signals). Earlier dates
-(Aug 14–17) were outside available candle history depth at the time of
-this analysis and are not included.
+**Status labels**
 
-## Evidence Classification
-
-This document uses these status labels consistently. Do not invent new
-ones without adding them here first.
-
-- **SUPPORTED — LIMITED TO OBSERVED WINDOW**: evidence currently supports
-  the hypothesis within the stated dataset and date range, but does NOT
-  establish that the pattern holds across other market regimes or time
-  periods. Requires re-testing against new/different data before being
-  treated as general.
-- **OBSERVATION**: a pattern exists in the data, but causality or
-  persistence is not established. Weaker than SUPPORTED — no claim about
-  reliability is being made yet, just that something was noticed.
-- **INCONCLUSIVE**: available sample size is insufficient to draw a
-  reliable conclusion either way.
-- **ENGINEERING ISSUE**: a software/data-pipeline defect affecting data
-  quality or reliability, not a trading hypothesis.
-- **REGIME-DEPENDENT**: reserved for a hypothesis that has been tested
-  across multiple distinct market regimes and found to hold in some but
-  not others — this is a genuinely stronger, more useful finding than a
-  single-window SUPPORTED status.
-- **CONFIRMED**: reserved for findings that remain supported after
-  sufficient additional data AND at least one different market regime.
-  Nothing in this document currently qualifies for this label.
-
----
-
-## H-006: OB_LONG signals substantially outperform OB_SHORT signals
-
-**Status: SUPPORTED — LIMITED TO OBSERVED WINDOW (real market data, n=66 combined)**
-
-| Type | Result |
+| Label | Meaning |
 |---|---|
-| OB_LONG | 38W / 11L — **77.6% win rate** (n=49) |
-| OB_SHORT | 2W / 15L — **11.8% win rate** (n=17) |
-| BREAKOUT_LONG | 2W / 0L (n=2, too small to conclude anything) |
-
-This is the single largest, clearest signal in the data. Long OB
-rejections won roughly 4 out of 5 times; Short OB rejections lost roughly
-5 out of 6 times, over the same 6-day window, same two symbols.
-
-**Honest read — likely NOT a property of "shorts are bad" in general.**
-This window (Aug 18–24) coincides with a broadly bullish market for both
-ETH and SUI (visible directly in the candle data — both trended up hard
-from roughly Aug 18 lows toward Aug 22 highs before pulling back). A
-mean-reversion Short signal fighting a strong uptrend is structurally
-disadvantaged regardless of checklist quality — this matches the "Market
-regime: Trending" flag already built into the bot, and the newer BTC hard-
-block and HTF-opposition downgrade were built for exactly this reason.
-
-**What this hypothesis actually establishes, and what it does not:**
-established — in this specific window (Aug 18–24, broadly bullish
-regime), OB_LONG massively outperformed OB_SHORT. **Not established** —
-that OB_LONG generally outperforms OB_SHORT across market regimes. Those
-are different claims, and only the first one has evidence behind it right
-now.
-
-**What's NOT yet known:** whether OB_SHORT performs this poorly across a
-genuinely bearish or ranging window too, or whether the underperformance
-is specific to fighting this particular bull run. This needs testing
-against a different market regime before treating "Shorts underperform"
-as a standing rule rather than a regime-specific observation. If future
-data eventually shows OB_SHORT outperforming in a bearish regime, this
-hypothesis should be relabeled REGIME-DEPENDENT rather than rewritten —
-that would itself be a more valuable finding than either static win-rate
-number alone (e.g., "OB_SHORT underperforms specifically when the broader
-market is strongly bullish" is a smarter, more actionable rule than
-"OB_SHORT is bad").
-
-**Action taken already:** the BTC-opposition hard block (shipped 2026-08-
-13) and HTF-opposition confidence downgrade already suppress a meaningful
-share of exactly this failure mode going forward. This data is retroactive
-confirmation those changes were pointed at a real problem, not a guess.
-
-**Suggested next step (not yet done):** once enough OB_SHORT signals
-accumulate post-BTC-block, compare their win rate against this historical
-11.8% baseline. If it's still low even with BTC/HTF alignment enforced,
-that's evidence the OB_SHORT structural logic itself (not just trend
-opposition) needs review.
+| `REFUTED` | Tested properly, did not hold. Do not re-introduce without new evidence. |
+| `LEAD` | Survived retroactive scrutiny. Not yet proven live. |
+| `UNDER TEST` | Experiment currently running. |
+| `PARTIAL` | Real but narrower than first appeared. |
+| `SUPERSEDED` | Replaced by a better-measured finding. |
 
 ---
 
-## H-007: Confidence tier (MEDIUM vs HIGH) showed little separation in this window
+## 1. Read this first: measurement before v17 is not comparable
 
-**Status: INCONCLUSIVE (small HIGH-tier sample)**
+Results recorded before server v17 (1 Sep – 21 Sep 2026) were produced by instruments with known defects. An audit found:
 
-| Confidence | Result |
+1. **Order IDs corrupted.** BingX order IDs are 19 digits; `JSON.parse` silently rounded them to the nearest 256. Lookups then asked BingX about orders that did not exist, which could turn real trades into "not taken" or record a win as a loss. BingX's own documentation requires a big-integer-aware parser.
+2. **Paper results flattered by ~0.9R per trade.** The paper resolver booked the *whole* position at TP1 the moment it was touched. Live, only 40% closes at TP1; the rest runs to TP2/TP3 or the stop. A TP1-then-stop trade was recorded as +0.5R when the live bot actually books −0.4R.
+3. **Real trades never scored.** No `realizedR` was ever written for real fills, so they reported 0.0R regardless of outcome.
+4. **Wins counted by label, not money.** A TP1 fill followed by a stop-out was counted as a win.
+
+v17 fixed all four. **Any figure from before v17 overstates performance and should be treated as unreliable.**
+
+---
+
+## 2. Current live configuration (v19)
+
+| Component | Setting | Evidence |
+|---|---|---|
+| Strategy | OB (ICT order block rejection), 15M | — |
+| Symbols | SUI, ETH | Deliberate narrowing, Oct 2026 |
+| BTC filter | Hard block when BTC trend opposes | H-013 — *under test* |
+| HTF filter | **Block** trades where the 4H trend aligns with the signal | H-012 — *lead* |
+| Score gate | ≥ 4.0 (≥ 3.5 in kill zone) | H-011 — gate shown to carry no information |
+| Entry | OB zone midpoint, market order | — |
+| Stop | Fixed 5% | H-010 |
+| Targets | TP1 0.5R (40%) · TP2 2R (30%) · TP3 3R (30%) | H-009 |
+| Leverage | Fixed 10x, isolated | Liquidation sits ~10% away vs a 5% stop, so the stop fires first |
+| Sizing | Self-calibrating — see §4 | — |
+| Positions | One per symbol, any side | Known issue — see §6 |
+
+---
+
+## 3. Hypothesis register
+
+### H-012 — Counter-trend OB trades outperform trend-aligned ones · `LEAD`
+
+**Claim.** OB setups taken *against* the 4H trend outperform those taken with it.
+
+**Evidence** (360 OB signals re-scored from candles under the live ladder, Aug 28 – Oct 1 2026):
+
+| | n | Expectancy |
+|---|---|---|
+| HTF opposes signal | 161 | **+0.315R** |
+| HTF aligns with signal | 199 | **−0.063R** |
+
+Held under every check applied:
+
+- **By session** — kill zone −0.505R gap, outside −0.295R gap; both significant
+- **By direction** — longs −0.581R gap, shorts −0.348R gap; both significant
+- **By time** — same sign in all five period cells (halves and thirds); effect *grew* rather than decayed
+
+**Mechanism.** OB is a mean-reversion setup. Taken with the trend it fades nothing; taken against an extended move, it fades exactly what it is designed to fade.
+
+**Known weakness — read before trusting it.** The entire sample sits inside one rising market: SUI went from ~0.67 to ~1.26, and the 4H trend read bullish 71% of the time. Most of the profit came from HTF-opposing **longs**, which during a rally is simply dip-buying. A sustained downtrend has never been observed in this data. The time-split tested *time*, not *regime*. In a real downtrend the same logic would be catching falling knives.
+
+**Contradiction on record.** Pattern 4 in the earlier manual-trading log (29 June 2026) concluded the opposite — *"weight HTF trend as dominant thesis and treat counter-trend as tight-leash secondary"* — from a single BTC trade. That observation is the likely origin of the bot's former HTF penalty. Systematic evidence across 360 trades now points the other way. The manual pattern is `SUPERSEDED` for this strategy, though it may still hold for discretionary trend trades.
+
+**Status.** Live forward test since 2026-10-01 22:38 UTC. Target: 30 resolved trades. Success bar: beating **+0.10R net**. Expected to land below the retroactive +0.315R, since the filter was derived from the same data it is being measured on.
+
+---
+
+### H-013 — The BTC hard block improves results · `UNDER TEST`
+
+**Origin.** Added after two losing shorts on 13 Aug 2026 (SUI and ETH, both against BTC trend). Two trades is thin evidence for a hard block. Earlier backtests suggested removing it worsened profit factor, win rate and drawdown together — but those backtests predate the v17 fixes.
+
+**Why it has never been measured live.** Every signal it blocks is diverted to `missed_signals.jsonl`, so it shows `PASS 360 / FAIL 0` in `signals.jsonl` and is invisible to normal analysis.
+
+**Test.** `btc_test.js` scores the blocked signals under the same live config. The decisive comparison is *within HTF-opposing trades* (the only kind v19 takes), restricted to blocked signals that would have cleared every other gate.
+
+**Interaction to be aware of.** Combined with H-012, the bot only trades when BTC and the coin *disagree* — long when BTC is bullish but the coin's 4H is bearish, and the reverse. That is narrow, and is the main reason trade flow is slow.
+
+**Open design question.** Correlation with BTC varies by coin and over time. A blanket rule may suit BTC-correlated majors and filter nothing useful elsewhere. A better version would measure each coin's actual correlation.
+
+---
+
+### H-011 — The 5-point checklist predicts outcome · `REFUTED`
+
+Of the five points, three never vary:
+
+| Point | Pass / Fail |
 |---|---|
-| MEDIUM | 36W / 22L — 62.1% win rate (n=58) |
-| HIGH | 6W / 4L — 60.0% win rate (n=10) |
+| MSS confirmed | 359 / 1 |
+| BTC confirmation | 360 / 0 |
+| OB retest holding | 360 / 0 |
 
-At face value, HIGH confidence signals performed almost identically to
-MEDIUM ones — which would be a concerning finding if confirmed, since the
-whole point of the confidence tier is to signal "this one's better."
+They are true by construction — BTC opposition is a hard block, OB validity triggers the alert, MSS is a standing state. A condition that never varies cannot predict anything.
 
-**Why this is NOT yet a real finding:** our current internal threshold
-(`MIN_SAMPLE_FOR_INSIGHT = 8`) is a conservative, self-chosen engineering
-rule, not a universal statistical standard — it should not be read as
-"8 is when a result becomes statistically valid." n=10 for HIGH confidence
-is below even this conservative internal bar, and for a meaningful
-real comparison we'd ideally want substantially more observations in
-both outcome classes (wins and losses) than either tier currently has. A
-60% vs 62% gap on this sample size is easily noise.
+The two that do vary both came back as noise:
+
+| Point | Gap | Noise band |
+|---|---|---|
+| Liquidity sweep | +0.032R | ±0.167R |
+| Delta flip | +0.051R | ±0.145R |
+
+Score 5 did *worse* than score 4 (+0.058R vs +0.133R), within noise. **The score gate is decoration.** Raising the threshold to 5/5 would roughly halve trade count without improving expectancy.
 
 ---
 
-## H-008: SUI underperformed ETH in this window, magnitude unclear if regime-driven
+### H-014 — Kill zone trades outperform · `PARTIAL`
 
-**Status: OBSERVATION, not yet a tested hypothesis**
+Headline: kill zone +0.233R vs outside +0.046R, significant.
 
-| Symbol | Result |
+Stratified: within HTF-aligned trades the effect **vanishes** (+0.057R gap, noise). Within HTF-opposing trades it **holds** (+0.267R gap).
+
+So the session effect is mostly a shadow of H-012, with a real residual only for counter-trend trades. Best single cell in the data: **HTF-opposing and in kill zone, +0.484R over 58 trades.** Not yet acted on — testing two filters at once would make the result unreadable.
+
+---
+
+### H-007 — HIGH confidence outperforms MEDIUM · `REFUTED` (explained)
+
+Previously marked inconclusive for small sample. With 360 trades: **HIGH −0.121R, MEDIUM +0.149R** — significant, and backwards.
+
+Cause: v17's `applyRiskGates` forced confidence down to MEDIUM whenever HTF opposed. So "MEDIUM" was largely "HTF opposes" relabelled. This is H-012 measured a second time, not an independent finding. As a consequence the old sizing tiers put the *largest* positions on the *worst* trades. Confidence no longer affects sizing as of v18.
+
+---
+
+### H-006 — Longs outperform shorts · `SUPERSEDED`
+
+Earlier: OB_LONG 77.6% win rate vs OB_SHORT 11.8%, flagged as likely regime-specific.
+
+Now: longs +0.142R vs shorts +0.048R — gap within noise. The earlier asymmetry was produced partly by the defective pre-v17 resolver and partly by a bullish window. Direction on its own is not a reliable filter; its apparent effect is largely explained by H-012.
+
+---
+
+### H-010 — A structure-based stop beats a fixed 5% stop · `REFUTED`
+
+Retroactive A/B over 358 signals, stop placed just beyond the OB boundary with buffers of 0.25×, 0.5× and 1.0× zone height.
+
+Gross expectancy was positive and consistent across all three (+0.123R, +0.096R, +0.081R fully closed). Then costs:
+
+| | Stop | Cost in R | Gross | Net |
+|---|---|---|---|---|
+| Fixed 5% | 5.00% | 0.020R | +0.103R | +0.083R |
+| Structural 0.25× | 0.65% | 0.154R | +0.123R | **−0.031R** |
+| Structural 0.5× | 0.76% | 0.132R | +0.096R | **−0.036R** |
+| Structural 1.0× | 1.02% | 0.098R | +0.081R | **−0.017R** |
+
+Fees are a percentage of *notional*; R is a percentage of *risk*. Cost in R = fee% ÷ stop%. A tighter stop always makes every fee larger in R terms. **This is arithmetic, not a tunable.**
+
+The fixed 5% figure is hollow too: 75% of its trades were still open at the 48-hour mark, so its result is mostly unrealised marks.
+
+---
+
+### H-009 — Moving TP1 from 1R to 0.5R improves results · `REFUTED`
+
+**Motivation.** 61% of outcomes were EXPIRED, with an average best excursion of 0.47R — trades got halfway and stalled.
+
+**Retroactive check.** 37 of 82 expired trades reached 0.5R. Looked promising.
+
+**Forward test** (36 resolved, 3 symbols): **−0.028R**, 17W / 19L, max drawdown 6.07%.
+
+The expired share did fall (61% → 42%), so the change converted some stalled trades into small wins — but +0.5R wins cannot outrun −1R losses.
+
+**The lesson that matters more than the result.** The interim numbers drifted steadily toward zero as the sample grew: +0.39R at 12 trades, +0.15R at 29, −0.028R at 36. Small samples flatter. Only the full-sample forward number counts.
+
+---
+
+### FIB_SR `minQualifyingTouches` · `REFUTED`
+
+The parameter's effect inverted between SUI and ETH, and ETH swung from PF 1.398 out-of-sample to PF 0.383 in-sample in an adjacent window. A gradient that reverses between symbols is a sign of overfitting, not structure.
+
+### Score threshold 5/5 vs 4/5 · `REFUTED`
+
+5/5 backtested well but produced 3 trades in 5 months out of sample — unusable frequency. Combined with H-011, there is no reason to raise it.
+
+---
+
+## 4. How position sizing works (v19)
+
+Sizing is derived from the bot's own resolved trades. No external rule — prop-firm, exchange, or otherwise — enters the calculation.
+
+1. **Edge, measured conservatively.** Uses the *lower bound* of expectancy (mean − 2 standard errors), not the mean. A thin edge on a small sample produces a bound near zero, and therefore near-zero risk, automatically.
+2. **Kelly from the real distribution.** For R-multiple outcomes the growth-optimal fraction is approximately `E[r] / E[r²]`. Fat losing tails shrink it on their own.
+3. **Quarter-Kelly.** Full Kelly assumes the edge estimate is exact. Quarter-Kelly is the standard convention for uncertainty. This is a chosen convention, openly stated.
+4. **Survival ceiling.** The strategy's longest losing run is measured, and compared with the run length probability predicts for the sample size (`log n / log(1/lossRate)`). The longer is assumed. The ceiling keeps that run within `MAX_STREAK_DRAWDOWN` of equity (default 25%, env-configurable).
+
+| Situation | Risk per trade |
 |---|---|
-| ETHUSDT | 27W / 14L — 65.9% win rate (n=41) |
-| SUIUSDT | 15W / 12L — 55.6% win rate (n=27) |
+| Fewer than 30 resolved trades | 0.25% floor |
+| Expectancy not distinguishable from zero | 0.25% floor |
+| Proven edge | rises toward quarter-Kelly |
+| Account grows | same fraction, larger size — compounds |
+| Account shrinks | same fraction, smaller size — de-risks automatically |
 
-A 10-point win-rate gap between the two symbols the bot trades. Not yet
-enough evidence to say why — could be symbol-specific volatility/liquidity
-differences, could be that SUI's OB_SHORT signals (which we know
-underperform generally per H-006) happened to cluster more heavily on SUI
-in this window. Needs a symbol-by-type cross-tab on a larger dataset
-before treating this as a real per-symbol effect.
+**Leverage is not a risk dial.** Loss per trade is stop distance × position size. Leverage only determines margin locked up and where liquidation sits. At 10x isolated, liquidation is ~10% away versus a 5% stop. At 20x it would land on top of the stop.
 
 ---
 
-## Known data-pipeline issues surfaced by this analysis (engineering, not trading)
+## 5. Methodology rules
 
-1. **Signals blocked by one-position-per-symbol never resolve** in the
-   bot's own tracking — confirmed via 121 signals logged Aug 14–24 with
-   zero outcomes recorded natively. Fixed 2026-08-26 via
-   `resolvePaperTrades()`, which resolves stranded signals against
-   current price. This document's findings had to be reconstructed
-   manually via historical candles specifically because that fix didn't
-   exist yet when this data was generated.
+These were each learned the hard way in this project.
 
-2. **[ENGINEERING ISSUE — 🔴 IMPORTANT INFRASTRUCTURE DEBT] Every
-   redeploy wipes `signals.jsonl`** (Railway ephemeral filesystem, no
-   persistent volume available on current plan). This is not merely an
-   inconvenience — this entire learning architecture depends on
-   preserving accumulated experience over time. If this bot eventually
-   accumulates thousands of signals, a single redeploy without a
-   completed backup could destroy a large portion of the dataset the
-   whole "self-improving" premise depends on. The daily Telegram CSV
-   backup is a mitigation, not a fix — it only survives if it fires
-   *before* the next redeploy, and on nights with frequent pushes,
-   multiple signals have already been lost to this before ever reaching
-   a backup. Should be prioritized above cosmetic/strategy features
-   (additional signal types, MFE/MAE tracking, etc.) even though it isn't
-   a "drop everything today" emergency.
+1. **Retroactive is a reason to forward-test, never a result.** H-009 looked good retroactively and failed live.
+2. **Watch the interim drift.** If expectancy shrinks steadily as the sample grows, the edge was probably noise.
+3. **Measure every gap against its own noise band.** With ~15 comparisons, one will look significant by chance alone.
+4. **Stratify before believing.** Two of three "significant" results in the entry test turned out to be one finding counted twice.
+5. **Check for conditions that never vary.** A filter that is always true cannot predict anything, and looks perfect in a pass-rate table.
+6. **Price costs in R, not in percent.** A tight stop can turn a gross edge net-negative.
+7. **One variable at a time.** Changing two things at once makes the result unattributable.
+8. **Never compare samples of different composition.** Dropping unresolved trades from one side of a comparison and not the other produces a false winner (as in H-010's first run).
+9. **Instruments must be audited too.** The worst errors in this project were in the measuring tools, not the strategy.
+10. **Parameter gradients that reverse between symbols mean overfitting.**
 
-3. **`explainDecision`'s Claude-generated reasoning fell back to the
-   generic default text** ("Deterministic checklist cleared
-   threshold...") on multiple live signals throughout this period. Root
-   cause found and fixed 2026-08-28: the code was calling an invalid
-   model string (`claude-sonnet-4-6`, which does not match any real
-   Anthropic model), and the failure was being silently swallowed with
-   no error logging at all — so this had been failing invisibly the
-   entire time. Fixed by correcting the model name to `claude-sonnet-5`
-   and adding real `console.error` logging at every failure point across
-   all three Claude API call sites (`explainDecision`,
-   `generateLegacyNote`, `generatePostmortem`), so any future failure is
-   diagnosable instead of silent. Not yet confirmed against a live signal
-   post-fix — next real signal will be the actual test.
+---
 
-4. **Signals that fail the checklist or get risk-blocked were logged
-   nowhere at all** prior to 2026-08-28 — meaning there was no way to
-   ever check "is the rejection threshold too strict, and are we missing
-   real winners?" Fixed via `logMissedSignal()` / `resolveMissedSignals()`
-   and the new `/missed-signals` endpoint, which tracks hypothetical
-   entry/SL/TP for every rejected structural signal and resolves them
-   against current price the same way paper trades are resolved. No data
-   exists yet under this system — it only started tonight. **Not yet
-   verified against a real live event** — no NO_TRADE signal has fired
-   since this code deployed, so the logging path is implemented but
-   unconfirmed in production. Needs verification the first time a real
-   rejected signal comes through.
+## 6. Open questions and known issues
 
-5. **[ENGINEERING ISSUE — 🔴 MAJOR ANALYTICAL DISTINCTION] `resolvePaperTrades`
-   and `checkOpenPositions` (real trades) use genuinely different outcome
-   methodologies, confirmed by code review 2026-08-28.** Real trades
-   resolve via each TP order's actual BingX fill status, checked
-   individually and in the order they actually fill. Paper trades resolve
-   via a single current-price snapshot checked against TP3, then TP2,
-   then TP1, then SL, assuming whichever level current price has reached
-   is "the" outcome. These are not equivalent: a paper trade could show
-   "TP3" simply because price is currently past that level right now,
-   even if the real intraday path never held there, spiked through and
-   reversed, or would have hit SL first before ever reaching TP1.
+- **Regime dependence of H-012.** Untested until a sustained downtrend occurs. Plan to re-check the HTF split by trend direction once one does.
+- **One-position-per-symbol rule.** Blocks any new trade while a position is open — including the opposite side — even though the account is in Hedge Mode, where opposite positions are independent. Main reason only 1 of 36 trades in the Sep test was a real fill. Options: leave it; allow opposite sides; or allow opposite sides with a combined open-risk cap.
+- **Stale SUI alert.** Created 28 July 2026; the indicator has been edited since. TradingView freezes the script version at alert creation, so SUI may be running older logic than ETH. Recreate against the same indicator as the ETH alert.
+- **Per-coin BTC correlation.** Whether a blanket BTC rule should become a measured per-coin one.
+- **Kill zone within counter-trend trades** (H-014 residual) — a second filter to test only after H-012 resolves.
+- **FIB_SR regime dependence** — whether its poor in-sample ETH result reflects regime or a real refutation.
 
-   **Hard rule going forward: paper and real outcomes must remain
-   analytically separate unless their resolution methodology is made
-   equivalent.** This matters specifically because this is a learning
-   system — if the bot (or Claude, via post-mortems) is ever allowed to
-   learn from a blended number like "TP3 hit rate: 42%" that actually
-   mixes an optimistic paper-resolution method with a strict real-fill
-   method, that's exactly the kind of silent data contamination this
-   whole logging architecture exists to prevent. `isPaperTrade` filtering
-   exists in `computeStats`/`computeChecklistAnalysis` via `?real=true`,
-   but the default (unfiltered) view still combines both into one win
-   rate — worth revisiting whether that default should change to
-   real-only, with paper trades opt-in rather than opt-out.
+---
+
+## 7. Research tools
+
+All read `/data/signals.jsonl` and share a candle cache at `/data/walk_cache.json`, so repeat analyses are near-instant. All score trades with the same live ladder, so their results are directly comparable.
+
+| Script | Purpose |
+|---|---|
+| `cross_tab.js` | Builds the candle cache; stratifies HTF by session and direction |
+| `time_split.js` | Tests whether the HTF effect holds across time periods |
+| `entry_test.js` | Breaks outcomes down by each checklist point, score, session, direction and confidence |
+| `btc_test.js` | Scores signals the BTC rule blocked, compared with those it allowed |
+| `sl_test.js` | Structural vs fixed stop comparison — kept as the record for H-010 |
+
+Every finding above rests on roughly 360 retroactive trades. **Re-running these on 600 or 1,000 trades is how a lead becomes a confirmed result.**
