@@ -13,6 +13,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = "https://open-api-vst.bingx.com";
 
 const DATA_DIR = process.env.DATA_DIR || __dirname;
+const SERVER_VERSION = "v19.1";
 const SIGNAL_LOG_FILE = path.join(DATA_DIR, "signals.jsonl");
 
 // ============================================================
@@ -37,6 +38,7 @@ function logSignal(decision, payload, execResult) {
     const { type, scoreResult, gated, levels, isSwing } = decision;
     const entry = {
       loggedAt: new Date().toISOString(),
+      serverVersion: SERVER_VERSION,
       symbol: payload.symbol || "—",
       condition: payload.condition || "",
       type,
@@ -120,6 +122,7 @@ function logMissedSignal(decision, payload) {
     const levels = computeHypotheticalLevels(payload, direction, type);
     const entry = {
       loggedAt: new Date().toISOString(),
+      serverVersion: SERVER_VERSION,
       symbol: payload.symbol || "—",
       condition: payload.condition || "",
       type,
@@ -365,9 +368,12 @@ async function checkOpenPositions() {
       const fill = parseFloat(entryOrder.avgPrice);
       if (!sig.entryFillPrice && fill > 0) { sig.entryFillPrice = fill; anyUpdated = true; }
 
-      const posCheck = await getOpenPosition(sig.bingxSymbol);
+      // v19.1: side-aware. With opposite sides allowed in Hedge Mode, "any
+      // position on this symbol" would keep a closed LONG looking open while
+      // a SHORT is live — so match symbol AND direction.
+      const posCheck = await getOpenPositions();
       if (!posCheck.checked) continue;       // could not verify — never guess
-      if (posCheck.existing) continue;       // still open — keep tracking
+      if (posCheck.positions.some(p => p.symbol === sig.bingxSymbol && p.direction === sig.direction)) continue; // still open
 
       // Position is closed. Account for every slice.
       const sl = parseLevels(sig.stopLoss)[0];
@@ -1178,22 +1184,39 @@ function confidenceEmoji(confidence, rawScore) {
   return "🔴";
 }
 
-async function getOpenPosition(symbol) {
+// v19.1 — Hedge Mode position check.
+// The old rule blocked ANY open position on the symbol, including the
+// opposite side, even though Hedge Mode keeps LONG and SHORT independent.
+// That starved fills (1 of 36 Sep trades was real). Now:
+//   - same symbol + same side  -> still blocked (no stacking duplicate zones)
+//   - opposite side            -> allowed
+//   - total open risk across ALL positions capped at
+//     OPEN_RISK_MULT x the engine's current per-trade risk
+// Open risk of an existing position = notional x FIXED_SL_PCT (the fixed
+// 5% stop). Opposite sides are summed, not netted — conservative on purpose.
+const OPEN_RISK_MULT = Number(process.env.OPEN_RISK_MULT || 2);
+
+async function getOpenPositions() {
   try {
-    const res = await bingxRequest("GET", "/openApi/swap/v2/user/positions", { symbol });
-    console.log(`BingX position check for ${symbol}:`, JSON.stringify(res).slice(0, 500));
-    const positions = Array.isArray(res.data) ? res.data : [];
-    const active = positions.find(p => {
-      const amt = parseFloat(p.positionAmt ?? p.positionAmount ?? 0);
-      return amt !== 0;
-    });
-    if (!active) return { checked: true, existing: null };
-    const amt = parseFloat(active.positionAmt ?? active.positionAmount ?? 0);
-    const direction = active.positionSide === "SHORT" ? "Short" : "Long";
-    return { checked: true, existing: { direction, amt } };
+    const res = await bingxRequest("GET", "/openApi/swap/v2/user/positions", {});
+    console.log("BingX position check (all symbols):", JSON.stringify(res).slice(0, 500));
+    if (!Array.isArray(res.data)) throw new Error("positions response had no data array");
+    const positions = res.data
+      .map(p => {
+        const amt = Math.abs(parseFloat(p.positionAmt ?? p.positionAmount ?? 0));
+        const price = parseFloat(p.avgPrice ?? p.entryPrice ?? p.markPrice ?? 0);
+        return {
+          symbol: p.symbol,
+          direction: p.positionSide === "SHORT" ? "Short" : "Long",
+          amt,
+          openRiskVST: amt * price * FIXED_SL_PCT,
+        };
+      })
+      .filter(p => p.amt > 0);
+    return { checked: true, positions };
   } catch (err) {
-    console.error(`Position check failed for ${symbol} (non-fatal, failing closed):`, err.message);
-    return { checked: false, existing: null };
+    console.error("Position check failed (non-fatal, failing closed):", err.message);
+    return { checked: false, positions: [] };
   }
 }
 
@@ -1205,15 +1228,16 @@ async function executeOnBingX(decision, payload) {
     const symbol = toBingXSymbol(payload.symbol);
     const direction = scoreResult.direction;
 
-    const positionCheck = await getOpenPosition(symbol);
+    const positionCheck = await getOpenPositions();
     if (!positionCheck.checked) {
-      await sendTelegram(`⚠️ <b>BingX execution skipped</b>\nSymbol: ${symbol}\nCould not verify current position (failing closed to avoid the opposing-position bug) — trade not placed.`);
+      await sendTelegram(`⚠️ <b>BingX execution skipped</b>\nSymbol: ${symbol}\nCould not verify current positions (failing closed) — trade not placed.`);
       return;
     }
 
-    if (positionCheck.existing) {
-      console.log(`Skipping ${symbol} ${direction} — position already open (${positionCheck.existing.direction}), one-position-per-symbol rule`);
-      await sendTelegram(`🔕 <b>BingX execution skipped</b>\nSymbol: ${symbol}\nSignal: ${direction}, but a ${positionCheck.existing.direction} position is already open on this symbol. One-position-per-symbol rule — not adding to it regardless of direction or zone.`);
+    const sameSide = positionCheck.positions.find(p => p.symbol === symbol && p.direction === direction);
+    if (sameSide) {
+      console.log(`Skipping ${symbol} ${direction} — ${direction} already open on this symbol (same-side rule)`);
+      await sendTelegram(`🔕 <b>BingX execution skipped</b>\nSymbol: ${symbol}\nSignal: ${direction}, but a ${direction} position is already open. Same-side stacking is blocked; opposite side would be allowed.`);
       return;
     }
 
@@ -1223,6 +1247,18 @@ async function executeOnBingX(decision, payload) {
 
     const sizing = await computeBingXSizing();
     const { marginUSDT, leverage, riskVST } = sizing;
+
+    // Combined open-risk cap. Based on the INTENDED per-trade risk
+    // (equity x fraction), not the margin-capped riskVST, so a squeezed
+    // trade can't loosen the cap.
+    const openRiskVST = positionCheck.positions.reduce((a, p) => a + p.openRiskVST, 0);
+    const intendedRiskVST = sizing.equity ? sizing.equity * (sizing.riskPct / 100) : riskVST;
+    const openRiskCap = OPEN_RISK_MULT * intendedRiskVST;
+    if (openRiskVST + riskVST > openRiskCap) {
+      console.log(`Skipping ${symbol} ${direction} — open-risk cap: ${openRiskVST.toFixed(2)} open + ${riskVST} new > ${openRiskCap.toFixed(2)} cap (${OPEN_RISK_MULT}x per-trade)`);
+      await sendTelegram(`🔕 <b>BingX execution skipped</b>\nSymbol: ${symbol} ${direction}\nOpen risk ${openRiskVST.toFixed(2)} VST + this trade ${riskVST} VST would exceed the cap of ${openRiskCap.toFixed(2)} VST (${OPEN_RISK_MULT}x per-trade risk).`);
+      return;
+    }
     console.log(`Sizing: ${marginUSDT} VST margin x ${leverage}x = ${(marginUSDT * leverage).toFixed(0)} notional, risking ${riskVST} VST (${sizing.sizedBy}, equity ${sizing.equity ?? "unknown"})`);
     const entryPrice = levels.entryMidRaw;
     if (!entryPrice || entryPrice <= 0) {
@@ -2046,7 +2082,7 @@ ${note}`);
         }
 
         if (decision.verdict === "NO_TRADE") {
-          console.log("No trade (deterministic) — complete silence ⏭️", new Date().toISOString(), "| condition:", condition, "| reason:", decision.reason);
+          console.log("No trade (deterministic) — complete silence ⏭️", new Date().toISOString(), "| symbol:", payload.symbol || "—", "| condition:", condition, "| reason:", decision.reason);
           logMissedSignal(decision, payload);
           return;
         }
@@ -2072,7 +2108,7 @@ ${note}`);
   res.writeHead(404); res.end("Not found");
 });
 
-server.listen(PORT, () => console.log(`Server v19 running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Server ${SERVER_VERSION} running on port ${PORT}`));
 
 setInterval(() => {
   checkOpenPositions().catch(err => console.error("checkOpenPositions failed (non-fatal):", err.message));
