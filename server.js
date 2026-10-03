@@ -13,7 +13,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = "https://open-api-vst.bingx.com";
 
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v19.2";
+const SERVER_VERSION = "v19.3";
 const SIGNAL_LOG_FILE = path.join(DATA_DIR, "signals.jsonl");
 
 // ============================================================
@@ -1049,8 +1049,13 @@ const RISK_MIN_SAMPLE = 30;
 
 function computeRiskFraction() {
   const signals = readSignalLog();
-  const closed = signals
-    .filter(s => isClosed(s.outcome) && typeof s.realizedR === "number")
+  // v19.3: dedupe by setup first. Duplicate zone alerts were counted as
+  // separate trades (137 vs 91 real setups), which made the edge look
+  // proven and sized ~4x above what the honest evidence supports.
+  // Filter to resolved trades BEFORE deduping, so an unresolved duplicate
+  // can never hide a resolved one of the same setup.
+  const closed = dedupeBySetup(signals
+    .filter(s => isClosed(s.outcome) && typeof s.realizedR === "number"))
     .sort((a, b) => Date.parse(a.loggedAt) - Date.parse(b.loggedAt));
   const rs = closed.map(s => s.realizedR);
   const n = rs.length;
