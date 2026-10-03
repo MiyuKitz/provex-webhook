@@ -13,7 +13,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = "https://open-api-vst.bingx.com";
 
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v19.1";
+const SERVER_VERSION = "v19.2";
 const SIGNAL_LOG_FILE = path.join(DATA_DIR, "signals.jsonl");
 
 // ============================================================
@@ -1311,13 +1311,20 @@ async function executeOnBingX(decision, payload) {
         type: "LIMIT",
         quantity: tp.qty,
         price: tp.price,
-        reduceOnly: true,
+        // v19.2: NO reduceOnly. In Hedge Mode BingX rejects it (code 109400)
+        // and every TP silently failed — positionSide + opposite side already
+        // makes this a closing order. Live trades were running SL-only.
       });
       tpResults.push(`${tp.label}: ${res.code === 0 ? "placed" : JSON.stringify(res).slice(0, 100)}`);
       const tpOrderId = res.data?.order?.orderId ?? res.orderId ?? null;
       if (tpOrderId) tpOrderIds[tp.label] = tpOrderId;
     }
 
+    const tpFailed = tpResults.filter(r => !r.endsWith("placed") && !r.includes("skipped"));
+    if (tpFailed.length) {
+      console.error(`⚠️ TP PLACEMENT FAILED on ${symbol} ${direction}:`, tpFailed);
+      await sendTelegram(`🚨 <b>TP placement FAILED</b>\n${symbol} ${direction} is open with SL only.\n${tpFailed.join("\n")}\nPlace TPs manually.`);
+    }
     await sendTelegram(`${confidenceEmoji(gated.confidence, scoreResult.rawScore)} <b>BingX demo execution</b>\n${symbol} ${direction} │ ${marginUSDT} VST margin │ ${leverage}x\nRisking ${riskVST} VST (${sizing.sizedBy})\nQty: ${quantity}\n${tpResults.join("\n")}`);
     console.log("BingX execution complete", symbol, direction, "| TP results:", tpResults);
     return { bingxOrderId: entryRes.data?.order?.orderId ?? entryRes.orderId ?? null, bingxSymbol: symbol, tpOrderIds, riskVST, marginUSDT, leverageUsed: leverage };
