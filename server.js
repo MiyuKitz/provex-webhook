@@ -13,7 +13,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = "https://open-api-vst.bingx.com";
 
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v19.5";
+const SERVER_VERSION = "v19.6";
 const SIGNAL_LOG_FILE = path.join(DATA_DIR, "signals.jsonl");
 
 // ============================================================
@@ -2088,6 +2088,14 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ count: lessons.length, lessons }, null, 2));
     return;
   }
+  if (req.method === "GET" && pathname === "/funding") {
+    const rows = readFundingWatch();
+    const closed = rows.filter(r => r.closed);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ rule: "72h avg funding >= 0.05%/8h -> paper short 3 days", open: rows.filter(r => !r.closed), closedCount: closed.length,
+      avgResultPct: closed.length ? +(closed.reduce((a, r) => a + r.resultPct, 0) / closed.length).toFixed(2) : null, closed: closed.slice(-50) }, null, 2));
+    return;
+  }
   if (req.method === "GET" && pathname === "/core") {
     const log = readCoreLog();
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -2309,11 +2317,79 @@ async function coreModeTick() {
   }
 }
 
+// ============================================================
+// 🔥 FUNDING WATCH — PAPER TRACKER (v19.6, no orders)
+//
+// Research (research/funding_test.py, 18 coins, 2022-2025): when a coin's
+// average funding over 72h reached >= 0.05% per 8h (longs extremely
+// crowded), shorting for 3 days returned +2.0% per trade, 60% win,
+// n=282 — robust to dropping any single coin. BUT 251 of 282 trades came
+// from the 2024 euphoria, so it is effectively 1-2 market events, and 2026
+// had none to verify against. Status: promising, unconfirmed.
+// This tracks it on paper and pings Telegram when it fires.
+// ============================================================
+const FUND_COINS = ["BTC","ETH","SOL","SUI","BNB","XRP","DOGE","ADA","AVAX","LINK","DOT","LTC","NEAR","APT","ARB","OP","INJ","TIA"];
+const FUND_THRESHOLD = 0.0005;       // 0.05% per 8h, 72h average
+const FUND_HOLD_MS = 3 * 86400000;
+const FUND_FILE = path.join(DATA_DIR, "funding_watch.jsonl");
+
+async function fundingHistory(coin, sinceMs) {
+  const r = await fetch(`https://open-api.bingx.com/openApi/swap/v2/quote/fundingRate?symbol=${coin}-USDT&limit=100`);
+  const j = await r.json();
+  if (!Array.isArray(j.data)) throw new Error(`no funding data for ${coin}`);
+  return j.data.map(x => ({ t: +x.fundingTime, f: +x.fundingRate })).filter(x => x.t > sinceMs);
+}
+async function lastPrice(coin) {
+  const r = await fetch(`https://open-api.bingx.com/openApi/swap/v2/quote/price?symbol=${coin}-USDT`);
+  const j = await r.json();
+  return +j?.data?.price;
+}
+function readFundingWatch() {
+  try { return fs.readFileSync(FUND_FILE, "utf8").split("\n").filter(Boolean).map(l => JSON.parse(l)); }
+  catch { return []; }
+}
+function writeFundingWatch(rows) { fs.writeFileSync(FUND_FILE, rows.map(r => JSON.stringify(r)).join("\n") + (rows.length ? "\n" : "")); }
+
+async function fundingWatchTick() {
+  try {
+    const rows = readFundingWatch(); const now = Date.now(); let dirty = false;
+    // 1. resolve paper trades whose 3 days are up
+    for (const r of rows.filter(r => !r.closed && now >= r.openedAt + FUND_HOLD_MS)) {
+      const px = await lastPrice(r.coin);
+      const carry = (await fundingHistory(r.coin, r.openedAt)).filter(x => x.t <= r.openedAt + FUND_HOLD_MS).reduce((a, x) => a + x.f, 0);
+      r.closePrice = px; r.carryPct = +(carry * 100).toFixed(3);
+      r.resultPct = +((-(px / r.entryPrice - 1) + carry - 0.001) * 100).toFixed(2);
+      r.closed = true; dirty = true;
+      await sendTelegram(`🔥 <b>Funding watch (paper) closed</b>\n${r.coin} short: ${r.resultPct > 0 ? "+" : ""}${r.resultPct}% after 3 days (funding carry ${r.carryPct}%)`);
+    }
+    // 2. scan for new extremes
+    for (const coin of FUND_COINS) {
+      if (rows.some(r => r.coin === coin && !r.closed)) continue;
+      const h = await fundingHistory(coin, now - 72 * 3600000);
+      if (!h.length) continue;
+      const f3 = h.reduce((a, x) => a + x.f, 0) / h.length;
+      if (f3 >= FUND_THRESHOLD) {
+        const px = await lastPrice(coin);
+        rows.push({ coin, side: "Short", openedAt: now, opened: new Date(now).toISOString(), entryPrice: px,
+                    f3Pct: +(f3 * 100).toFixed(4), serverVersion: SERVER_VERSION, closed: false });
+        dirty = true;
+        await sendTelegram(`🔥 <b>Funding extreme (paper)</b>\n${coin}: 72h avg funding ${(f3 * 100).toFixed(3)}% per 8h, longs very crowded.\nPaper short logged at ${px}, resolves in 3 days. No real order placed.`);
+      }
+      await new Promise(res => setTimeout(res, 150));
+    }
+    if (dirty) writeFundingWatch(rows);
+  } catch (err) {
+    console.error("Funding watch tick failed (non-fatal):", err.message);
+  }
+}
+
 server.listen(PORT, () => console.log(`Server ${SERVER_VERSION} running on port ${PORT}`));
 
 // Core mode shadow tracker: check hourly, processes each new daily close once.
 setInterval(coreModeTick, 60 * 60 * 1000);
 setTimeout(coreModeTick, 2 * 60 * 1000);
+setInterval(fundingWatchTick, 60 * 60 * 1000);
+setTimeout(fundingWatchTick, 3 * 60 * 1000);
 
 setInterval(() => {
   checkOpenPositions().catch(err => console.error("checkOpenPositions failed (non-fatal):", err.message));
