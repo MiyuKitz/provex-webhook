@@ -13,7 +13,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = "https://open-api-vst.bingx.com";
 
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v19.6";
+const SERVER_VERSION = "v19.7";
 const SIGNAL_LOG_FILE = path.join(DATA_DIR, "signals.jsonl");
 
 // ============================================================
@@ -2154,7 +2154,7 @@ const server = http.createServer(async (req, res) => {
         if (condition === "WATCH_HTF_RESISTANCE_NEARBY" || condition === "WATCH_HTF_SUPPORT_NEARBY") {
           const zoneType = condition === "WATCH_HTF_RESISTANCE_NEARBY" ? "resistance" : "support";
           const htfLevel = condition === "WATCH_HTF_RESISTANCE_NEARBY" ? payload.htfSwingHigh : payload.htfSwingLow;
-          console.log("HTF watch alert sent 👀", new Date().toISOString(), "| condition:", condition);
+          console.log("HTF watch alert sent 👀", new Date().toISOString(), "| symbol:", payload.symbol || "—", "| condition:", condition);
           return;
         }
 
@@ -2163,7 +2163,7 @@ const server = http.createServer(async (req, res) => {
         if (decision.verdict === "UNRECOGNIZED") {
           const legacyConditions = ["cross_manual_level1", "cross_manual_level2", "cross_manual_level3"];
           if (!legacyConditions.some(s => condition.includes(s))) {
-            console.log("Low priority / unrecognized signal — skipping ⏭️", new Date().toISOString(), "| condition:", condition);
+            console.log("Low priority / unrecognized signal — skipping ⏭️", new Date().toISOString(), "| symbol:", payload.symbol || "—", "| condition:", condition);
             return;
           }
           const note = await generateLegacyNote(payload);
