@@ -13,7 +13,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = "https://open-api-vst.bingx.com";
 
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v20.0";
+const SERVER_VERSION = "v20.2";
 const SIGNAL_LOG_FILE = path.join(DATA_DIR, "signals.jsonl");
 
 // ============================================================
@@ -2014,7 +2014,7 @@ function formatTradeSetup(decision, payload, reasoning) {
   const flagLines = gated.flags.length ? `\n\n<b>Risk Flags:</b>\n${gated.flags.map(f => `⚠️ ${f}`).join("\n")}` : "";
   const htfPart = payload.htfTrend ? ` - HTF Trend: ${payload.htfTrend}` : "";
   const swingLine = isSwing && payload.swingTrend ? `\n1H Structure: ${payload.swingTrend} (swing-eligible)` : "";
-  const titleTag = isSwing ? " 🌙" : "";
+  const titleTag = (isSwing ? " 🌙" : "") + (V19_EXECUTE ? "" : " (v19 paper, no order)");
 
   let rMultLine = "";
   if (isSwing && levels.riskRaw > 0) {
@@ -2243,12 +2243,13 @@ async function fetchDailyCloses(symbol) {
 function coreTargetWeight(closes) {
   const n = closes.length;
   if (n < CORE_LOOKBACK + 21) return null;
-  const on = closes[n - 1].c / closes[n - 1 - CORE_LOOKBACK].c - 1 > 0;
+  const mom = closes[n - 1].c / closes[n - 1 - CORE_LOOKBACK].c - 1;
+  const on = mom > 0;
   let ss = 0;
   for (let k = n - 20; k < n; k++) ss += Math.log(closes[k].c / closes[k - 1].c) ** 2;
   const vol = Math.sqrt(ss / 20) * Math.sqrt(365);
   const size = vol > 0 ? Math.min(1, CORE_VOL_TARGET / vol) : 1;
-  return { on, vol, size, weight: on ? size / CORE_ASSETS.length : 0 };
+  return { on, mom, vol, size, ref: closes[n - 1 - CORE_LOOKBACK].c, weight: on ? size / CORE_ASSETS.length : 0 };
 }
 
 function readCoreState() {
@@ -2295,7 +2296,7 @@ async function runCoreMode() {
     drawdownPct: +((st.equity / st.peak - 1) * 100).toFixed(2),
     positions: Object.fromEntries(CORE_ASSETS.map(s => [s, {
       inMarket: detail[s].on, weightPct: +(detail[s].weight * 100).toFixed(1),
-      vol: +(detail[s].vol * 100).toFixed(0), price: px[s] }])),
+      vol: +(detail[s].vol * 100).toFixed(0), momPct: +(detail[s].mom * 100).toFixed(1), refPrice: detail[s].ref, price: px[s] }])),
   };
   fs.appendFileSync(CORE_LOG_FILE, JSON.stringify(entry) + "\n");
   return { entry, changed: turnover > 0.05 };
@@ -2403,6 +2404,17 @@ async function fundingWatchTick() {
 const CORE_EXECUTE = (process.env.CORE_EXECUTE || "on") === "on";
 const CORE_ALLOC = Number(process.env.CORE_ALLOC || 0.5);
 const CORE_DISASTER_STOP = 0.15;
+// Leverage applied to Core's weights. Research (2018-2026, incl. funding):
+// 1x +22%/yr maxDD -45% | 2x +37%/yr maxDD -71% | 3x +42%/yr maxDD -85% |
+// 5x +18%/yr maxDD -97% | 10x wiped. Hard-capped at 2x.
+const CORE_LEVERAGE = Math.min(2, Math.max(1, Number(process.env.CORE_LEVERAGE || 1)));
+// PROFIT SLEEVE: the starting balance (principal) trades at CORE_LEVERAGE,
+// only PROFITS above it trade at CORE_PROFIT_LEV (max 3x). If the profits are
+// lost, the sleeve shrinks to zero by itself; principal never runs above 1-2x.
+// Research ($500, 2018-2026): profits at 3x -> $6,001, maxDD -74%;
+// profits at 5x -> $2,613, maxDD -92% (worse), so 3x is the hard cap.
+// Starting balance = equity the first time this runs, or CORE_START_EQUITY.
+const CORE_PROFIT_LEV = Math.min(3, Math.max(1, Number(process.env.CORE_PROFIT_LEV || 3)));
 
 async function coreStopOrders(symbol) {
   const res = await bingxRequest("GET", "/openApi/swap/v2/trade/openOrders", { symbol });
@@ -2427,6 +2439,47 @@ async function placeCoreStop(symbol, qty, price) {
   return true;
 }
 
+function formatCoreTrade({ symbol, side, qty, px, targetQty, curQty, w, equity, stopOk, principal = 0, profit = 0 }) {
+  const coin = symbol.replace("-USDT", "");
+  const info = (readCoreLog().slice(-1)[0]?.positions || {})[symbol] || {};
+  const fmt = (v, d = 2) => (v == null || isNaN(v)) ? "?" : Number(v).toLocaleString("en-US", { maximumFractionDigits: d });
+  const closing = targetQty === 0;
+  const action = closing ? "CLOSE" : curQty === 0 ? "OPEN" : side === "BUY" ? "ADD" : "TRIM";
+  const trend = info.momPct == null ? "?" : `${info.momPct > 0 ? "Bullish" : "Bearish"} (${info.momPct > 0 ? "+" : ""}${info.momPct}%)`;
+  const sizePct = info.vol ? Math.min(100, Math.round(4000 / info.vol)) : null;
+  const levels = closing
+    ? `<b>Exit:</b> $${fmt(px)}\n<b>Reason:</b> daily close fell below the 28-day reference ($${fmt(info.refPrice)})`
+    : `<b>Entry:</b> $${fmt(px)}
+<b>Exit trigger:</b> daily close below $${fmt(info.refPrice)} (28-day reference, moves daily)
+<b>Disaster stop:</b> $${fmt(px * (1 - CORE_DISASTER_STOP))} (−15%)
+<b>Take profit:</b> none, rides the trend until the exit trigger`;
+  const checklist = closing
+    ? `❌ 28-day trend negative\n✅ Position closed, disaster stop cancelled`
+    : `✅ 28-day trend positive
+${sizePct === 100 ? "✅" : "➖"} Volatility ${info.vol ?? "?"}% → size ${sizePct ?? "?"}% of full (target 40%)
+${stopOk ? "✅ Disaster stop placed" : "❌ Disaster stop NOT confirmed, check BingX"}`;
+  const reasoning = closing
+    ? `${coin}'s 28-day trend turned negative, so Core steps out to cash and waits for the trend to recover.`
+    : action === "OPEN"
+      ? `${coin} is above where it traded 28 days ago, so Core holds it. Size is scaled by volatility so a wild market means a smaller position.`
+      : `Rebalance only: volatility moved, so the position was resized to stay near the 40% volatility target. Trend unchanged.`;
+  return `🛡️ <b>Core Mode Trade</b> (demo)
+
+<b>${coin}USDT</b> - 28d Trend: ${trend}
+Long  │  ${action}  │  principal ${CORE_LEVERAGE}x${profit > 0 ? ` + profits ${CORE_PROFIT_LEV}x` : ""}
+
+${levels}
+
+<b>Size:</b> ${side} ${qty} ${coin} → holding ${targetQty} ${coin} (≈ ${fmt(targetQty * px, 0)} VST)
+<b>Weight:</b> ${(w * 100).toFixed(1)}% of Core budget │ Core gets ${CORE_ALLOC * 100}% of ${fmt(equity, 0)} VST
+<b>Profit sleeve:</b> ${profit > 0 ? `${fmt(profit, 0)} VST of profit trading at ${CORE_PROFIT_LEV}x, principal ${fmt(principal, 0)} at ${CORE_LEVERAGE}x` : `no profit above the starting balance yet, all at ${CORE_LEVERAGE}x`}
+
+<b>Checklist:</b>
+${checklist}
+
+<b>Reasoning:</b> ${reasoning}`;
+}
+
 async function coreExecute() {
   if (!CORE_EXECUTE || !BINGX_API_KEY || !BINGX_API_SECRET) return;
   const st = readCoreState();
@@ -2435,13 +2488,17 @@ async function coreExecute() {
   if (!equity) { console.error("Core exec: equity unavailable, skipping"); return; }
   const pos = await getOpenPositions();
   if (!pos.checked) { console.error("Core exec: positions unavailable, skipping"); return; }
+  if (!st.coreStart) { st.coreStart = Number(process.env.CORE_START_EQUITY) || equity; fs.writeFileSync(CORE_STATE_FILE, JSON.stringify(st)); }
+  const coreStart = st.coreStart;
   for (const symbol of CORE_ASSETS) {
     try {
       const w = st.weights[symbol] || 0;
       const px = await lastPrice(symbol.replace("-USDT", ""));
       if (!px) continue;
       const prec = await getQuantityPrecision(symbol);
-      const targetQty = Number(((w * equity * CORE_ALLOC) / px).toFixed(prec));
+      const principal = Math.min(equity, coreStart), profit = Math.max(0, equity - coreStart);
+      const exposure = principal * CORE_LEVERAGE + profit * CORE_PROFIT_LEV;
+      const targetQty = Number(((w * exposure * CORE_ALLOC) / px).toFixed(prec));
       const cur = pos.positions.find(p => p.symbol === symbol && p.direction === "Long");
       const curQty = cur ? cur.amt : 0;
       const diff = Number((targetQty - curQty).toFixed(prec));
@@ -2454,7 +2511,7 @@ async function coreExecute() {
         }
         continue;
       }
-      await bingxRequest("POST", "/openApi/swap/v2/trade/leverage", { symbol, side: "LONG", leverage: 1 });
+      await bingxRequest("POST", "/openApi/swap/v2/trade/leverage", { symbol, side: "LONG", leverage: Math.ceil(Math.max(CORE_LEVERAGE, profit > 0 ? CORE_PROFIT_LEV : 1)) });
       const side = diff > 0 ? "BUY" : "SELL";
       const qty = targetQty === 0 ? curQty : Math.abs(diff);
       const r = await bingxRequest("POST", "/openApi/swap/v2/trade/order", { symbol, side, positionSide: "LONG", type: "MARKET", quantity: qty });
@@ -2462,8 +2519,8 @@ async function coreExecute() {
         await sendTelegram(`⚠️ <b>Core mode order failed</b>\n${symbol} ${side} ${qty}\n${JSON.stringify(r).slice(0, 200)}`);
         continue;
       }
-      await placeCoreStop(symbol, targetQty, px);
-      const msg = `🛡️ <b>Core mode (demo)</b> ${symbol}: ${side === "BUY" ? "bought" : "sold"} ${qty} @ ~${px}\nNow holding ${targetQty} (${(w * 100).toFixed(1)}% target, ${CORE_ALLOC * 100}% of equity allocated)`;
+      const stopOk = await placeCoreStop(symbol, targetQty, px);
+      const msg = formatCoreTrade({ symbol, side, qty, px, targetQty, curQty, w, equity, stopOk, principal, profit });
       console.log(msg.replace(/<[^>]+>/g, ""));
       await sendTelegram(msg);
     } catch (err) {
