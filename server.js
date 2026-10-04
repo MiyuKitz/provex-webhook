@@ -13,7 +13,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = "https://open-api-vst.bingx.com";
 
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v19.4";
+const SERVER_VERSION = "v19.5";
 const SIGNAL_LOG_FILE = path.join(DATA_DIR, "signals.jsonl");
 
 // ============================================================
@@ -1204,7 +1204,12 @@ const OPEN_RISK_MULT = Number(process.env.OPEN_RISK_MULT || 2);
 async function getOpenPositions() {
   try {
     const res = await bingxRequest("GET", "/openApi/swap/v2/user/positions", {});
-    console.log("BingX position check (all symbols):", JSON.stringify(res).slice(0, 500));
+    if (Array.isArray(res.data)) {
+      const live = res.data.filter(p => Math.abs(parseFloat(p.positionAmt ?? 0)) > 0);
+      console.log(`BingX positions: ${live.length ? live.map(p => `${p.symbol} ${p.positionSide} ${p.positionAmt} @${p.avgPrice} uPnL ${p.unrealizedProfit}`).join(" | ") : "none"}`);
+    } else {
+      console.log("BingX position check returned:", JSON.stringify(res).slice(0, 300));
+    }
     if (!Array.isArray(res.data)) throw new Error("positions response had no data array");
     const positions = res.data
       .map(p => {
@@ -1225,6 +1230,61 @@ async function getOpenPositions() {
   }
 }
 
+// ============================================================
+// SAFETY NETS (v19.5)
+//
+// 1. KILL SWITCH — if account equity falls KILL_SWITCH_DD (default 15%)
+//    below its recorded peak, no new trades are opened until re-armed.
+//    Open positions keep their own stops; nothing is force-closed.
+//    Re-arm: change the Railway variable KILL_SWITCH_RESET to any new
+//    value — the peak then resets to current equity.
+//
+// 2. STOP WATCHDOG — every 15 minutes, every open BingX position must
+//    have a live stop-loss order. This exists because two orphan
+//    positions ran unmanaged for weeks (Sep 2026). It never trades —
+//    it only alerts (at most once per 6h per position).
+// ============================================================
+const KILL_SWITCH_DD = Number(process.env.KILL_SWITCH_DD || 0.15);
+const KILL_SWITCH_RESET = process.env.KILL_SWITCH_RESET || "";
+const PEAK_FILE = path.join(DATA_DIR, "equity_peak.json");
+
+async function killSwitchCheck() {
+  const { equity } = await getAccountEquity();
+  if (!equity) return { tripped: false, reason: "equity unavailable" };
+  let st = {};
+  try { st = JSON.parse(fs.readFileSync(PEAK_FILE, "utf8")); } catch {}
+  if (!st.peak || st.resetToken !== KILL_SWITCH_RESET) st = { peak: equity, resetToken: KILL_SWITCH_RESET, since: new Date().toISOString() };
+  if (equity > st.peak) st.peak = equity;
+  fs.writeFileSync(PEAK_FILE, JSON.stringify(st));
+  const dd = 1 - equity / st.peak;
+  return { tripped: dd >= KILL_SWITCH_DD, equity, peak: st.peak, dd };
+}
+
+const stopAlertAt = {};
+async function stopWatchdog() {
+  if (!BINGX_API_KEY || !BINGX_API_SECRET) return;
+  const pos = await getOpenPositions();
+  if (!pos.checked || !pos.positions.length) return;
+  let orders;
+  try {
+    const res = await bingxRequest("GET", "/openApi/swap/v2/trade/openOrders", {});
+    orders = res?.data?.orders;
+    if (!Array.isArray(orders)) { console.error("Stop watchdog: openOrders returned no list:", JSON.stringify(res).slice(0, 200)); return; }
+  } catch (err) { console.error("Stop watchdog failed (non-fatal):", err.message); return; }
+  const unprotected = pos.positions.filter(p => {
+    const side = p.direction === "Short" ? "SHORT" : "LONG";
+    return !orders.some(o => o.symbol === p.symbol && o.positionSide === side
+      && /STOP/.test(o.type || "") && !/TAKE_PROFIT/.test(o.type || ""));
+  });
+  console.log(`Stop watchdog: ${pos.positions.length} position(s), ${unprotected.length} without a stop`);
+  for (const p of unprotected) {
+    const key = `${p.symbol}|${p.direction}`;
+    if (stopAlertAt[key] && Date.now() - stopAlertAt[key] < 6 * 3600 * 1000) continue;
+    stopAlertAt[key] = Date.now();
+    await sendTelegram(`🚨 <b>Position with NO stop-loss</b>\n${p.symbol} ${p.direction}, size ${p.amt}\nNothing is protecting this position. Set a stop in the BingX app or close it.`);
+  }
+}
+
 async function executeOnBingX(decision, payload) {
   if (!BINGX_API_KEY || !BINGX_API_SECRET) return;
 
@@ -1232,6 +1292,13 @@ async function executeOnBingX(decision, payload) {
     const { scoreResult, gated, levels } = decision;
     const symbol = toBingXSymbol(payload.symbol);
     const direction = scoreResult.direction;
+
+    const ks = await killSwitchCheck();
+    if (ks.tripped) {
+      console.log(`Kill switch: equity ${ks.equity.toFixed(2)} is ${(ks.dd * 100).toFixed(1)}% below peak ${ks.peak.toFixed(2)} — no new trades`);
+      await sendTelegram(`🛑 <b>Kill switch active</b>\nEquity ${ks.equity.toFixed(0)} is ${(ks.dd * 100).toFixed(1)}% below its peak (${ks.peak.toFixed(0)}). New ${symbol} ${direction} not placed.\nRe-arm by changing KILL_SWITCH_RESET in Railway.`);
+      return;
+    }
 
     const positionCheck = await getOpenPositions();
     if (!positionCheck.checked) {
@@ -2252,7 +2319,9 @@ setInterval(() => {
   checkOpenPositions().catch(err => console.error("checkOpenPositions failed (non-fatal):", err.message));
   resolvePaperTrades().catch(err => console.error("resolvePaperTrades failed (non-fatal):", err.message));
   resolveMissedSignals().catch(err => console.error("resolveMissedSignals failed (non-fatal):", err.message));
+  stopWatchdog().catch(err => console.error("stopWatchdog failed (non-fatal):", err.message));
 }, 15 * 60 * 1000);
+setTimeout(() => stopWatchdog().catch(() => {}), 90 * 1000);
 
 setInterval(() => {
   sendSignalBackupToTelegram().catch(err => console.error("Backup interval failed (non-fatal):", err.message));
