@@ -13,7 +13,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = "https://open-api-vst.bingx.com";
 
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v19.7";
+const SERVER_VERSION = "v20.0";
 const SIGNAL_LOG_FILE = path.join(DATA_DIR, "signals.jsonl");
 
 // ============================================================
@@ -1285,7 +1285,12 @@ async function stopWatchdog() {
   }
 }
 
+// v20: v19 is paper-only by default (3-year replay: ~breakeven). Signals are
+// still logged and paper-resolved. Turn demo orders back on with V19_EXECUTE=on.
+const V19_EXECUTE = (process.env.V19_EXECUTE || "off") === "on";
+
 async function executeOnBingX(decision, payload) {
+  if (!V19_EXECUTE) { console.log(`v19 paper-only: ${payload.symbol || "—"} signal logged, no order placed`); return; }
   if (!BINGX_API_KEY || !BINGX_API_SECRET) return;
 
   try {
@@ -2383,11 +2388,95 @@ async function fundingWatchTick() {
   }
 }
 
+// ============================================================
+// 🛡️ CORE MODE — DEMO EXECUTION (v20)
+//
+// Mirrors the Core mode target weights onto the BingX demo (VST) account:
+// BTC and ETH LONG only, 1x leverage, sized as weight x equity x CORE_ALLOC.
+// Rebalances only when a position is >10% away from target, so it trades
+// a few times a month, not every hour. Every Core position also carries a
+// disaster stop 15% below the current price, refreshed on each rebalance:
+// the daily trend filter is the normal exit, the stop only covers a crash
+// between daily checks (and keeps the stop watchdog happy).
+// Switch off with Railway variable CORE_EXECUTE=off.
+// ============================================================
+const CORE_EXECUTE = (process.env.CORE_EXECUTE || "on") === "on";
+const CORE_ALLOC = Number(process.env.CORE_ALLOC || 0.5);
+const CORE_DISASTER_STOP = 0.15;
+
+async function coreStopOrders(symbol) {
+  const res = await bingxRequest("GET", "/openApi/swap/v2/trade/openOrders", { symbol });
+  const orders = res?.data?.orders;
+  if (!Array.isArray(orders)) return null;
+  return orders.filter(o => o.positionSide === "LONG" && /STOP/.test(o.type || "") && !/TAKE_PROFIT/.test(o.type || ""));
+}
+
+async function placeCoreStop(symbol, qty, price) {
+  const old = await coreStopOrders(symbol);
+  if (old === null) { console.error(`Core exec: could not read open orders for ${symbol}; stop not refreshed`); return false; }
+  for (const o of old) await bingxRequest("DELETE", "/openApi/swap/v2/trade/order", { symbol, orderId: o.orderId });
+  if (qty <= 0) return true;
+  const stopPrice = +(price * (1 - CORE_DISASTER_STOP)).toPrecision(6);
+  const r = await bingxRequest("POST", "/openApi/swap/v2/trade/order", {
+    symbol, side: "SELL", positionSide: "LONG", type: "STOP_MARKET", quantity: qty, stopPrice, workingType: "MARK_PRICE",
+  });
+  if (r.error || r.code !== 0) {
+    await sendTelegram(`🚨 <b>Core mode: disaster stop FAILED</b>\n${symbol} LONG ${qty}\n${JSON.stringify(r).slice(0, 200)}`);
+    return false;
+  }
+  return true;
+}
+
+async function coreExecute() {
+  if (!CORE_EXECUTE || !BINGX_API_KEY || !BINGX_API_SECRET) return;
+  const st = readCoreState();
+  if (!st.lastDay || !st.weights) return;
+  const { equity } = await getAccountEquity();
+  if (!equity) { console.error("Core exec: equity unavailable, skipping"); return; }
+  const pos = await getOpenPositions();
+  if (!pos.checked) { console.error("Core exec: positions unavailable, skipping"); return; }
+  for (const symbol of CORE_ASSETS) {
+    try {
+      const w = st.weights[symbol] || 0;
+      const px = await lastPrice(symbol.replace("-USDT", ""));
+      if (!px) continue;
+      const prec = await getQuantityPrecision(symbol);
+      const targetQty = Number(((w * equity * CORE_ALLOC) / px).toFixed(prec));
+      const cur = pos.positions.find(p => p.symbol === symbol && p.direction === "Long");
+      const curQty = cur ? cur.amt : 0;
+      const diff = Number((targetQty - curQty).toFixed(prec));
+      const needTrade = targetQty === 0 ? curQty > 0 : Math.abs(diff) * px > 0.10 * targetQty * px;
+      if (!needTrade) {
+        // self-heal: a Core position must always have its disaster stop
+        if (curQty > 0) {
+          const stops = await coreStopOrders(symbol);
+          if (stops && stops.length === 0) await placeCoreStop(symbol, curQty, px);
+        }
+        continue;
+      }
+      await bingxRequest("POST", "/openApi/swap/v2/trade/leverage", { symbol, side: "LONG", leverage: 1 });
+      const side = diff > 0 ? "BUY" : "SELL";
+      const qty = targetQty === 0 ? curQty : Math.abs(diff);
+      const r = await bingxRequest("POST", "/openApi/swap/v2/trade/order", { symbol, side, positionSide: "LONG", type: "MARKET", quantity: qty });
+      if (r.error || r.code !== 0) {
+        await sendTelegram(`⚠️ <b>Core mode order failed</b>\n${symbol} ${side} ${qty}\n${JSON.stringify(r).slice(0, 200)}`);
+        continue;
+      }
+      await placeCoreStop(symbol, targetQty, px);
+      const msg = `🛡️ <b>Core mode (demo)</b> ${symbol}: ${side === "BUY" ? "bought" : "sold"} ${qty} @ ~${px}\nNow holding ${targetQty} (${(w * 100).toFixed(1)}% target, ${CORE_ALLOC * 100}% of equity allocated)`;
+      console.log(msg.replace(/<[^>]+>/g, ""));
+      await sendTelegram(msg);
+    } catch (err) {
+      console.error(`Core exec ${symbol} failed (non-fatal):`, err.message);
+    }
+  }
+}
+
 server.listen(PORT, () => console.log(`Server ${SERVER_VERSION} running on port ${PORT}`));
 
 // Core mode shadow tracker: check hourly, processes each new daily close once.
-setInterval(coreModeTick, 60 * 60 * 1000);
-setTimeout(coreModeTick, 2 * 60 * 1000);
+setInterval(() => coreModeTick().then(coreExecute).catch(e => console.error("core loop:", e.message)), 60 * 60 * 1000);
+setTimeout(() => coreModeTick().then(coreExecute).catch(e => console.error("core loop:", e.message)), 2 * 60 * 1000);
 setInterval(fundingWatchTick, 60 * 60 * 1000);
 setTimeout(fundingWatchTick, 3 * 60 * 1000);
 
