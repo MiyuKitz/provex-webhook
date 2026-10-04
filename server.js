@@ -13,7 +13,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = "https://open-api-vst.bingx.com";
 
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v19.3";
+const SERVER_VERSION = "v19.4";
 const SIGNAL_LOG_FILE = path.join(DATA_DIR, "signals.jsonl");
 
 // ============================================================
@@ -2021,6 +2021,12 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ count: lessons.length, lessons }, null, 2));
     return;
   }
+  if (req.method === "GET" && pathname === "/core") {
+    const log = readCoreLog();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ strategy: "BTC+ETH, 28d trend filter, 40% vol target, daily (paper)", state: readCoreState(), days: log.length, log: log.slice(-60) }, null, 2));
+    return;
+  }
   if (req.method === "GET" && pathname === "/missed-signals") {
     const missed = readMissedSignalLog();
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -2120,7 +2126,127 @@ ${note}`);
   res.writeHead(404); res.end("Not found");
 });
 
+// ============================================================
+// 🛡️ CORE MODE — SHADOW TRACKER (v19.4, paper only, no orders)
+//
+// Research (2018-2026 daily, research/voltarget_test.py): BTC+ETH held
+// only while each one's 28-day return is positive, checked daily, sized by
+// volatility targeting (40% annualised, never above 1x). Across 8 years it
+// beat buy & hold on risk-adjusted return (Sharpe ~1.04 vs 0.68) with about
+// half the max drawdown (-44% vs -84%), and the result held across every
+// lookback (21/28/35d) and vol target (30/40/60%) tested.
+//
+// This block only TRACKS that strategy on a virtual 10,000 balance so we
+// get honest forward evidence. It places no orders and is fully separate
+// from v19: it never touches executeOnBingX, the open-risk cap, or sizing.
+// ============================================================
+const CORE_ASSETS = ["BTC-USDT", "ETH-USDT"];
+const CORE_LOOKBACK = 28;        // days
+const CORE_VOL_TARGET = 0.40;    // annualised
+const CORE_FEE = 0.001;          // per unit of weight traded
+const CORE_STATE_FILE = path.join(DATA_DIR, "core_state.json");
+const CORE_LOG_FILE = path.join(DATA_DIR, "core_log.jsonl");
+const DAY_MS = 86400000;
+
+async function fetchDailyCloses(symbol) {
+  const url = `https://open-api.bingx.com/openApi/swap/v3/quote/klines?symbol=${symbol}&interval=1d&limit=80`;
+  const r = await fetch(url);
+  const j = await r.json();
+  if (!Array.isArray(j.data)) throw new Error(`no daily data for ${symbol}`);
+  const now = Date.now();
+  return j.data
+    .map(k => ({ t: +k.time, c: +k.close }))
+    .filter(k => k.t + DAY_MS <= now)          // closed candles only
+    .sort((a, b) => a.t - b.t);
+}
+
+function coreTargetWeight(closes) {
+  const n = closes.length;
+  if (n < CORE_LOOKBACK + 21) return null;
+  const on = closes[n - 1].c / closes[n - 1 - CORE_LOOKBACK].c - 1 > 0;
+  let ss = 0;
+  for (let k = n - 20; k < n; k++) ss += Math.log(closes[k].c / closes[k - 1].c) ** 2;
+  const vol = Math.sqrt(ss / 20) * Math.sqrt(365);
+  const size = vol > 0 ? Math.min(1, CORE_VOL_TARGET / vol) : 1;
+  return { on, vol, size, weight: on ? size / CORE_ASSETS.length : 0 };
+}
+
+function readCoreState() {
+  try { return JSON.parse(fs.readFileSync(CORE_STATE_FILE, "utf8")); }
+  catch { return { equity: 10000, startedAt: null, lastDay: null, weights: {}, prices: {} }; }
+}
+
+async function runCoreMode() {
+  const data = {};
+  for (const s of CORE_ASSETS) data[s] = await fetchDailyCloses(s);
+  const day = Math.min(...CORE_ASSETS.map(s => data[s][data[s].length - 1].t));
+  const st = readCoreState();
+  if (st.lastDay !== null && day <= st.lastDay) return null;   // already processed this day
+
+  const px = {};
+  for (const s of CORE_ASSETS) px[s] = data[s].find(k => k.t === day)?.c ?? data[s][data[s].length - 1].c;
+
+  // 1. mark yesterday's weights to today's close
+  let dayRet = 0;
+  for (const s of CORE_ASSETS) {
+    const w = st.weights[s] || 0, p0 = st.prices[s];
+    if (w && p0) dayRet += w * (px[s] / p0 - 1);
+  }
+  // 2. new target weights
+  const detail = {}, newW = {};
+  let turnover = 0;
+  for (const s of CORE_ASSETS) {
+    const tw = coreTargetWeight(data[s].filter(k => k.t <= day));
+    if (!tw) return null;
+    detail[s] = tw; newW[s] = tw.weight;
+    turnover += Math.abs(tw.weight - (st.weights[s] || 0));
+  }
+  const cost = turnover * CORE_FEE;
+  const prevEq = st.equity;
+  st.equity = prevEq * (1 + dayRet) - prevEq * cost;
+  st.peak = Math.max(st.peak || st.equity, st.equity);
+  st.startedAt = st.startedAt || new Date(day).toISOString();
+  st.lastDay = day; st.weights = newW; st.prices = px;
+  fs.writeFileSync(CORE_STATE_FILE, JSON.stringify(st));
+
+  const entry = {
+    day: new Date(day).toISOString().slice(0, 10), serverVersion: SERVER_VERSION,
+    equity: +st.equity.toFixed(2), dayRetPct: +(dayRet * 100).toFixed(3), costPct: +(cost * 100).toFixed(3),
+    drawdownPct: +((st.equity / st.peak - 1) * 100).toFixed(2),
+    positions: Object.fromEntries(CORE_ASSETS.map(s => [s, {
+      inMarket: detail[s].on, weightPct: +(detail[s].weight * 100).toFixed(1),
+      vol: +(detail[s].vol * 100).toFixed(0), price: px[s] }])),
+  };
+  fs.appendFileSync(CORE_LOG_FILE, JSON.stringify(entry) + "\n");
+  return { entry, changed: turnover > 0.05 };
+}
+
+function readCoreLog() {
+  try { return fs.readFileSync(CORE_LOG_FILE, "utf8").split("\n").filter(Boolean).map(l => JSON.parse(l)); }
+  catch { return []; }
+}
+
+async function coreModeTick() {
+  try {
+    const res = await runCoreMode();
+    if (!res) return;
+    const e = res.entry;
+    const pos = Object.entries(e.positions)
+      .map(([s, p]) => `${s.replace("-USDT", "")}: ${p.inMarket ? `IN ${p.weightPct}%` : "cash"}`).join(" | ");
+    console.log(`🛡️ Core mode ${e.day}: equity ${e.equity} (${e.dayRetPct}%), DD ${e.drawdownPct}% | ${pos}`);
+    if (res.changed) {
+      await sendTelegram(`🛡️ <b>Core mode (paper)</b> — position change\n${pos}\nVirtual equity: ${e.equity} (DD ${e.drawdownPct}%)`);
+    }
+  } catch (err) {
+    console.error("Core mode tick failed (non-fatal):", err.message);
+  }
+}
+
 server.listen(PORT, () => console.log(`Server ${SERVER_VERSION} running on port ${PORT}`));
+
+// Core mode shadow tracker: check hourly, processes each new daily close once.
+setInterval(coreModeTick, 60 * 60 * 1000);
+setTimeout(coreModeTick, 2 * 60 * 1000);
 
 setInterval(() => {
   checkOpenPositions().catch(err => console.error("checkOpenPositions failed (non-fatal):", err.message));
