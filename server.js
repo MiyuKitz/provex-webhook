@@ -24,7 +24,17 @@ const BINGX_API_KEY    = process.env.BINGX_API_KEY;
 const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = "https://open-api-vst.bingx.com";
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v23.0";
+const SERVER_VERSION = "v24.1";
+
+// v24: Aggro can run on its OWN BingX account (sub-account or second account).
+// Set AGGRO_BINGX_API_KEY + AGGRO_BINGX_API_SECRET and Aggro trades there, so
+// its positions never merge with Core's: both can hold the same coin at their
+// own leverage (hold + hunt on the same coin). Without them, Aggro shares the
+// main account and skips any coin+side Core already holds.
+const AGGRO_KEY = process.env.AGGRO_BINGX_API_KEY, AGGRO_SECRET = process.env.AGGRO_BINGX_API_SECRET;
+const AGGRO_SEPARATE = !!(AGGRO_KEY && AGGRO_SECRET);
+const AG_ACCT = AGGRO_SEPARATE ? "aggro" : "main";
+const acctKeys = acct => acct === "aggro" && AGGRO_SEPARATE ? { key: AGGRO_KEY, secret: AGGRO_SECRET } : { key: BINGX_API_KEY, secret: BINGX_API_SECRET };
 
 // ---------------- exchange + telegram helpers ----------------
 function parseBingXJson(text) {
@@ -56,16 +66,17 @@ function parseBingXJson(text) {
   return JSON.parse(out);
 }
 
-function bingxSign(queryString) {
-  return require("crypto").createHmac("sha256", BINGX_API_SECRET).update(queryString).digest("hex");
+function bingxSign(queryString, secret = BINGX_API_SECRET) {
+  return require("crypto").createHmac("sha256", secret).update(queryString).digest("hex");
 }
 
-async function bingxRequest(method, path, params) {
+async function bingxRequest(method, path, params, acct = "main") {
+  const { key, secret } = acctKeys(acct);
   const timestamp = Date.now();
   const allParams = { ...params, timestamp };
   const sortedKeys = Object.keys(allParams).sort();
   const rawParamString = sortedKeys.map(k => `${k}=${allParams[k]}`).join("&");
-  const signature = bingxSign(rawParamString);
+  const signature = bingxSign(rawParamString, secret);
   const encodedParamString = sortedKeys.map(k => `${k}=${encodeURIComponent(allParams[k])}`).join("&");
   const signedString = `${encodedParamString}&signature=${signature}`;
   const fullPath = `${path}?${signedString}`;
@@ -76,7 +87,7 @@ async function bingxRequest(method, path, params) {
       path: fullPath,
       method,
       headers: {
-        "X-BX-APIKEY": BINGX_API_KEY,
+        "X-BX-APIKEY": key,
         "Content-Type": "application/x-www-form-urlencoded",
         "Content-Length": 0,
       },
@@ -124,16 +135,18 @@ const FIXED_SL_PCT = 0.05;          // used only to estimate open risk in getOpe
 const MAX_MARGIN_FRACTION = 0.5;    // never commit more than half of free margin to one trade
 let equityCache = { equity: null, available: null, at: 0 };
 const EQUITY_TTL_MS = 60000;
-async function getAccountEquity() {
+const equityCaches = {};
+async function getAccountEquity(acct = "main") {
+  const equityCache = equityCaches[acct] || { equity: null, available: null, at: 0 };
   if (equityCache.equity && Date.now() - equityCache.at < EQUITY_TTL_MS) return equityCache;
   try {
-    const res = await bingxRequest("GET", "/openApi/swap/v2/user/balance", {});
+    const res = await bingxRequest("GET", "/openApi/swap/v2/user/balance", {}, acct);
     const b = res?.data?.balance ?? res?.data;
     const equity = parseFloat(b?.equity ?? b?.balance);
     const available = parseFloat(b?.availableMargin ?? b?.balance ?? equity);
     if (equity > 0) {
-      equityCache = { equity, available: available > 0 ? available : equity, at: Date.now() };
-      return equityCache;
+      equityCaches[acct] = { equity, available: available > 0 ? available : equity, at: Date.now() };
+      return equityCaches[acct];
     }
     console.error("Equity lookup returned no usable figure:", JSON.stringify(res).slice(0, 200));
   } catch (err) {
@@ -142,12 +155,12 @@ async function getAccountEquity() {
   return { equity: null, available: null, at: 0 };
 }
 
-async function getOpenPositions() {
+async function getOpenPositions(acct = "main") {
   try {
-    const res = await bingxRequest("GET", "/openApi/swap/v2/user/positions", {});
+    const res = await bingxRequest("GET", "/openApi/swap/v2/user/positions", {}, acct);
     if (Array.isArray(res.data)) {
       const live = res.data.filter(p => Math.abs(parseFloat(p.positionAmt ?? 0)) > 0);
-      console.log(`BingX positions: ${live.length ? live.map(p => `${p.symbol} ${p.positionSide} ${p.positionAmt} @${p.avgPrice} uPnL ${p.unrealizedProfit}`).join(" | ") : "none"}`);
+      console.log(`BingX positions${acct === "aggro" ? " (Aggro account)" : ""}: ${live.length ? live.map(p => `${p.symbol} ${p.positionSide} ${p.positionAmt} @${p.avgPrice} uPnL ${p.unrealizedProfit}`).join(" | ") : "none"}`);
     } else {
       console.log("BingX position check returned:", JSON.stringify(res).slice(0, 300));
     }
@@ -216,12 +229,16 @@ async function marketRegime() {
 // ---------------- stop watchdog ----------------
 const stopAlertAt = {};
 async function stopWatchdog() {
+  await stopWatchdogFor("main");
+  if (AGGRO_SEPARATE) await stopWatchdogFor("aggro");
+}
+async function stopWatchdogFor(acct) {
   if (!BINGX_API_KEY || !BINGX_API_SECRET) return;
-  const pos = await getOpenPositions();
+  const pos = await getOpenPositions(acct);
   if (!pos.checked || !pos.positions.length) return;
   let orders;
   try {
-    const res = await bingxRequest("GET", "/openApi/swap/v2/trade/openOrders", {});
+    const res = await bingxRequest("GET", "/openApi/swap/v2/trade/openOrders", {}, acct);
     orders = res?.data?.orders;
     if (!Array.isArray(orders)) { console.error("Stop watchdog: openOrders returned no list:", JSON.stringify(res).slice(0, 200)); return; }
   } catch (err) { console.error("Stop watchdog failed (non-fatal):", err.message); return; }
@@ -230,12 +247,12 @@ async function stopWatchdog() {
     return !orders.some(o => o.symbol === p.symbol && o.positionSide === side
       && /STOP/.test(o.type || "") && !/TAKE_PROFIT/.test(o.type || ""));
   });
-  console.log(`Stop watchdog: ${pos.positions.length} position(s), ${unprotected.length} without a stop`);
+  console.log(`Stop watchdog${acct === "aggro" ? " (Aggro account)" : ""}: ${pos.positions.length} position(s), ${unprotected.length} without a stop`);
   for (const p of unprotected) {
     const key = `${p.symbol}|${p.direction}`;
     if (stopAlertAt[key] && Date.now() - stopAlertAt[key] < 6 * 3600 * 1000) continue;
     stopAlertAt[key] = Date.now();
-    await sendTelegram(`🚨 <b>Position with NO stop-loss</b>\n${p.symbol} ${p.direction}, size ${p.amt}\nNothing is protecting this position. Set a stop in the BingX app or close it.`);
+    await sendTelegram(`🚨 <b>Position with NO stop-loss</b>${acct === "aggro" ? " (Aggro account)" : ""}\n${p.symbol} ${p.direction}, size ${p.amt}\nNothing is protecting this position. Set a stop in the BingX app or close it.`);
   }
 }
 
@@ -673,11 +690,11 @@ function agScan(b, b4) {
 function agFmt(v) { return (v == null || isNaN(v)) ? "?" : Number(v).toLocaleString("en-US", { maximumSignificantDigits: 6 }); }
 
 async function agOrder(params) {
-  const r = await bingxRequest("POST", "/openApi/swap/v2/trade/order", params);
+  const r = await bingxRequest("POST", "/openApi/swap/v2/trade/order", params, AG_ACCT);
   if (r.error || r.code !== 0) return { ok: false, r };
   return { ok: true, id: String(r.data?.order?.orderId ?? ""), filled: parseFloat(r.data?.order?.executedQty ?? params.quantity) || 0 };
 }
-async function agCancel(symbol, id) { if (id) await bingxRequest("DELETE", "/openApi/swap/v2/trade/order", { symbol, orderId: id }); }
+async function agCancel(symbol, id) { if (id) await bingxRequest("DELETE", "/openApi/swap/v2/trade/order", { symbol, orderId: id }, AG_ACCT); }
 
 async function agEnter(a, symbol, sig, pos) {
   const coin = symbol.replace("-USDT", ""), side = sig.side, leg = side === "Long" ? "LONG" : "SHORT";
@@ -685,16 +702,17 @@ async function agEnter(a, symbol, sig, pos) {
   const px = await lastPrice(coin); if (!px) return;
   const d = Math.abs(px - sig.stop) / px;
   if (d < 0.003 || d > 0.05 || (side === "Long" ? sig.stop >= px : sig.stop <= px)) { console.log(`Aggro v2: ${symbol} ${side} skipped, stop distance ${(d * 100).toFixed(2)}%`); return; }
-  if (pos.positions.some(p => p.symbol === symbol && p.direction === side)) { console.log(`Aggro v2: ${symbol} ${side} skipped, that side is already held (Core or another trade)`); return; }
-  const { available } = await getAccountEquity();
+  if (pos.positions.some(p => p.symbol === symbol && p.direction === side)) { console.log(`Aggro v2: ${symbol} ${side} skipped, that side is already held${AGGRO_SEPARATE ? " on the Aggro account" : " (Core or another trade)"}`); return; }
+  const { equity: agEq, available } = await getAccountEquity(AG_ACCT);
   const prec = await getQuantityPrecision(symbol);
   const lev = Math.max(1, Math.min(AGGRO_LEVERAGE, Math.floor(1 / (1.5 * d))));
-  let notional = (a.balance * AGGRO_RISK) / d;
+  const bal = AGGRO_SEPARATE && agEq ? agEq : a.balance;   // own account -> real equity compounds
+  let notional = (bal * AGGRO_RISK) / d;
   const cap = (available || 0) * MAX_MARGIN_FRACTION * lev;
   if (notional > cap) notional = cap;
   const qty = Number((notional / px).toFixed(prec));
   if (!(qty > 0)) return;
-  await bingxRequest("POST", "/openApi/swap/v2/trade/leverage", { symbol, side: leg, leverage: lev });
+  await bingxRequest("POST", "/openApi/swap/v2/trade/leverage", { symbol, side: leg, leverage: lev }, AG_ACCT);
   const e = await agOrder({ symbol, side: side === "Long" ? "BUY" : "SELL", positionSide: leg, type: "MARKET", quantity: qty });
   if (!e.ok) { await sendTelegram(`⚠️ <b>Aggro order failed</b>\n${symbol} ${side} ${qty} @${lev}x\n${JSON.stringify(e.r).slice(0, 200)}`); return; }
   const filled = Number(e.filled.toFixed(prec)), R = Math.abs(px - sig.stop), sgn = side === "Long" ? 1 : -1;
@@ -734,6 +752,22 @@ async function agManage(a, pos) {
         const pnl = t.riskVST * R;
         a.balance = +(a.balance + pnl).toFixed(2); a.trades += 1; if (R > 0) a.wins += 1;
         a.peak = Math.max(a.peak, a.balance); if (a.balance < a.start * 0.1) a.busted = true;
+        // ♻️ RECYCLE: each time Aggro doubles, half its profit is banked for Core.
+        if (a.balance >= a.start * 2) {
+          const bank = +((a.balance - a.start) / 2).toFixed(2);
+          if (AGGRO_SEPARATE) {
+            const lvl = Math.floor(a.balance / a.start);
+            if (lvl > (a.recycleNudged || 1)) {
+              a.recycleNudged = lvl;
+              await sendTelegram(`♻️ <b>Recycle time</b>\nAggro is at ${lvl}x its start (${a.balance.toFixed(0)} VST). Move about ${bank.toFixed(0)} VST to the main account so Core holds it at low leverage.`);
+            }
+          } else {
+            // Shared account: the money is already in the same wallet Core sizes from,
+            // so banking = Aggro stops betting that half. Core's next rebalance uses it.
+            a.balance = +(a.balance - bank).toFixed(2); a.banked = +((a.banked || 0) + bank).toFixed(2);
+            await sendTelegram(`♻️ <b>Profit banked for Core</b>\nAggro doubled, so ${bank.toFixed(0)} VST of its profit is locked away from 40x and handed to Core (same account, Core sizes from total equity).\nAggro now trades from ${a.balance.toFixed(0)} VST │ banked so far: ${a.banked.toFixed(0)} VST`);
+          }
+        }
         (a.history = a.history || []).push({ symbol: t.symbol, side: t.side, R, pnl: +pnl.toFixed(2), closedAt: new Date().toISOString() });
         await sendTelegram(`🎰 <b>Aggro v2 trade closed</b> (demo)\n${t.symbol} ${t.side} ${t.lev}x: ≈ ${R > 0 ? "+" : ""}${R}R = ${pnl > 0 ? "+" : ""}${pnl.toFixed(0)} VST${t.part ? " (TP1 hit, runner stopped)" : ""}\nAggro balance: ${a.balance.toFixed(0)} VST (${((a.balance / a.start - 1) * 100).toFixed(0)}% from start) │ ${a.wins}W / ${a.trades - a.wins}L${a.busted ? "\n💀 Below 10% of the starting budget, Aggro has stopped." : ""}`);
         continue;
@@ -768,10 +802,10 @@ async function aggroTick() {
   if (!AGGRO || !BINGX_API_KEY || !BINGX_API_SECRET) return;
   try {
     const a = readAggro(); a.lastEntryT = a.lastEntryT || {};
-    let pos = await getOpenPositions(); if (!pos.checked) return;
+    let pos = await getOpenPositions(AG_ACCT); if (!pos.checked) return;
     await agManage(a, pos); writeAggro(a);
     if (a.busted || a.balance < a.start * 0.1) return;
-    pos = await getOpenPositions(); if (!pos.checked) return;
+    pos = await getOpenPositions(AG_ACCT); if (!pos.checked) return;
     for (const coin of AGGRO_COINS) {
       const symbol = `${coin}-USDT`;
       if ((a.open || []).some(t => t.symbol === symbol)) continue;
@@ -795,7 +829,7 @@ const server = http.createServer(async (req, res) => {
   const json = (obj, code = 200) => { res.writeHead(code, { "Content-Type": "application/json" }); res.end(JSON.stringify(obj, null, 2)); };
   if (req.method === "GET" && pathname === "/") {
     return json({ bot: "Two-Speed", version: SERVER_VERSION, regime: regimeCache.value, core: { execute: CORE_EXECUTE, coins: CORE_ASSETS, shorts: CORE_SHORTS },
-      aggro: { on: AGGRO, coins: AGGRO_COINS, maxLeverage: AGGRO_LEVERAGE } });
+      aggro: { on: AGGRO, account: AGGRO_SEPARATE ? "own sub-account" : "shared main account", coins: AGGRO_COINS, maxLeverage: AGGRO_LEVERAGE } });
   }
   if (req.method === "GET" && pathname === "/core") {
     const log = readCoreLog();
@@ -803,7 +837,8 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "GET" && pathname === "/aggro") {
     const a = readAggro();
-    return json({ on: AGGRO, coins: AGGRO_COINS, riskPerTrade: AGGRO_RISK, maxLeverage: AGGRO_LEVERAGE, ...a, returnPct: +((a.balance / a.start - 1) * 100).toFixed(1) });
+    const acctEq = AGGRO_SEPARATE ? (await getAccountEquity("aggro")).equity : null;
+    return json({ on: AGGRO, account: AGGRO_SEPARATE ? "own sub-account" : "shared main account", accountEquity: acctEq, coins: AGGRO_COINS, riskPerTrade: AGGRO_RISK, maxLeverage: AGGRO_LEVERAGE, ...a, returnPct: +((a.balance / a.start - 1) * 100).toFixed(1) });
   }
   if (req.method === "POST" && pathname === "/webhook") {
     req.resume();   // old TradingView alerts: accepted and ignored (v19 retired in v23)

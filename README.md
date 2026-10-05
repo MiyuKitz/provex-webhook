@@ -1,4 +1,4 @@
-# Two-Speed bot (v23.0)
+# Two-Speed bot (v24.1)
 
 Crypto trading bot on Railway, executing on the BingX demo (VST) account. Clean build: only the two new strategies + safety.
 (Repo/service are still named `provex-webhook` so the deploy doesn't break.)
@@ -18,10 +18,17 @@ Crypto trading bot on Railway, executing on the BingX demo (VST) account. Clean 
 **No shorts in a bull market.** Bull market = BTC's 28-day return > 0. While that's true, neither strategy opens a short.
 Core shorts only exist if `CORE_SHORTS=on` **and** the market is bearish.
 
+## Two accounts (hold + hunt on the same coin)
+Set `AGGRO_BINGX_API_KEY` + `AGGRO_BINGX_API_SECRET` (a BingX sub-account) and Aggro trades on its own account.
+Positions never merge, so Core can hold a coin at 1x while Aggro hunts the same coin at up to 40x.
+Aggro then sizes from that account's real equity, so its profits compound there. When Aggro reaches 2x, 3x… its start,
+Telegram suggests ♻️ moving half the profit to the main account for Core to hold. On a shared account (demo) this happens automatically: half the profit is banked out of Aggro and Core sizes from it.
+Without these keys, Aggro shares the main account and skips any coin+side Core holds.
+
 ## Safety
 - Stop watchdog every 15 min: any position without a stop → 🚨 Telegram. Core re-places its own missing stops.
 - Stops use the quantity BingX actually filled.
-- Core and Aggro never share a coin+side (leverage on BingX is per coin+side).
+- Stop watchdog checks both accounts. On a shared account, Core and Aggro never share a coin+side (leverage on BingX is per coin+side).
 - Aggro stops itself below 10% of its budget. Fail-closed if positions/equity can't be read.
 
 ## Railway variables
@@ -34,7 +41,8 @@ Core shorts only exist if `CORE_SHORTS=on` **and** the market is bearish.
 | `CORE_EXECUTE` | `on` | `off` = paper only |
 | `AGGRO` | `on` | `off` stops Aggro |
 | `AGGRO_COINS` | `ZRO,XRP,LINK,AVAX,ADA,OP` | Aggro's coins |
-| `AGGRO_BUDGET` / `AGGRO_RISK` / `AGGRO_LEVERAGE` | `20000` / `0.5` / `40` | Budget / risk per trade (max 0.5) / max leverage (max 50) |
+| `AGGRO_BUDGET` / `AGGRO_RISK` / `AGGRO_LEVERAGE` | `20000` / `0.5` / `40` | Budget (shared mode) / risk per trade (max 0.5) / max leverage (max 50) |
+| `AGGRO_BINGX_API_KEY` / `AGGRO_BINGX_API_SECRET` | — | Aggro's own sub-account keys |
 
 ## Pages
 `/` status · `/core` Core equity & positions · `/aggro` Aggro balance, open trades, history
