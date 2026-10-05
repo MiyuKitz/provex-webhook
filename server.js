@@ -13,7 +13,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = "https://open-api-vst.bingx.com";
 
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v20.4";
+const SERVER_VERSION = "v20.5";
 const SIGNAL_LOG_FILE = path.join(DATA_DIR, "signals.jsonl");
 
 // ============================================================
@@ -1304,6 +1304,14 @@ const AGGRO = (process.env.AGGRO || "on") === "on";
 const AGGRO_BUDGET = Number(process.env.AGGRO_BUDGET || 20000);
 const AGGRO_RISK = Math.min(0.5, Math.max(0.01, Number(process.env.AGGRO_RISK || 0.5)));
 const AGGRO_FILE = path.join(DATA_DIR, "aggro_state.json");
+// v20.5 — Krysie's 40x style: stop goes just beyond the order block (the
+// structure), not a fixed 5%, so the stop is tight and leverage can be high.
+// Leverage = AGGRO_LEVERAGE (default 40, max 50) but automatically lowered so
+// the liquidation price always sits beyond the stop (liq distance >= 1.5x stop).
+// Research: OB-structure stops on 15m v14 signals averaged -0.17R over 3 years
+// (tight stops + fees), so this is a demo experiment, not a proven edge.
+const AGGRO_STOP = (process.env.AGGRO_STOP || "structure");      // "structure" | "fixed"
+const AGGRO_LEVERAGE = Math.min(50, Math.max(1, Number(process.env.AGGRO_LEVERAGE || 40)));
 function readAggro() {
   try { return JSON.parse(fs.readFileSync(AGGRO_FILE, "utf8")); }
   catch { return { start: AGGRO_BUDGET, balance: AGGRO_BUDGET, peak: AGGRO_BUDGET, trades: 0, wins: 0, busted: false, startedAt: new Date().toISOString() }; }
@@ -1329,7 +1337,7 @@ async function executeOnBingX(decision, payload) {
   if (!BINGX_API_KEY || !BINGX_API_SECRET) return;
 
   try {
-    const { scoreResult, gated, levels } = decision;
+    let { scoreResult, gated, levels } = decision;
     const symbol = toBingXSymbol(payload.symbol);
     const direction = scoreResult.direction;
 
@@ -1362,13 +1370,30 @@ async function executeOnBingX(decision, payload) {
       const a = readAggro();
       const { available } = await getAccountEquity();
       const aggroRisk = a.balance * AGGRO_RISK;
-      let margin = (aggroRisk / FIXED_SL_PCT) / SIZING_LEVERAGE;
+      let stopPct = FIXED_SL_PCT, lev = SIZING_LEVERAGE;
+      if (AGGRO_STOP === "structure") {
+        const num = v => parseFloat(v);
+        const entry = levels.entryMidRaw;
+        const sl = direction === "Short" ? num(payload.obTop) * 1.002 : num(payload.pobBottom) * 0.998;
+        const d = Math.abs(entry - sl) / entry;
+        if (!(d >= 0.003 && d <= 0.05) || (direction === "Short" ? sl <= entry : sl >= entry)) {
+          console.log(`Aggro skipped ${symbol} ${direction} — structure stop distance ${(d * 100).toFixed(2)}% outside 0.3-5%`);
+          return;
+        }
+        const sgn = direction === "Short" ? -1 : 1, R = Math.abs(entry - sl);
+        levels = { ...levels, slRaw: +sl.toPrecision(6),
+          tp1Raw: +(entry + sgn * R * 0.5).toPrecision(6), tp2Raw: +(entry + sgn * R * 2).toPrecision(6), tp3Raw: +(entry + sgn * R * 3).toPrecision(6) };
+        stopPct = d;
+        lev = Math.max(1, Math.min(AGGRO_LEVERAGE, Math.floor(1 / (1.5 * d))));   // liquidation beyond the stop
+      }
+      sizing.leverage = lev;
+      let margin = (aggroRisk / stopPct) / lev;
       const cap = (available || 0) * MAX_MARGIN_FRACTION;
       if (margin > cap) margin = cap;
       sizing.marginUSDT = Number(margin.toFixed(2));
-      sizing.riskVST = Number((margin * SIZING_LEVERAGE * FIXED_SL_PCT).toFixed(2));
+      sizing.riskVST = Number((margin * lev * stopPct).toFixed(2));
       sizing.riskPct = Number((sizing.riskVST / sizing.equity * 100).toFixed(3));
-      sizing.sizedBy = `🎰 AGGRO: ${(AGGRO_RISK * 100).toFixed(0)}% of aggro balance ${a.balance.toFixed(0)} VST`;
+      sizing.sizedBy = `🎰 AGGRO ${lev}x: ${(AGGRO_RISK * 100).toFixed(0)}% of aggro balance ${a.balance.toFixed(0)} VST, stop ${(stopPct * 100).toFixed(2)}% (${AGGRO_STOP})`;
     }
     const { marginUSDT, leverage, riskVST } = sizing;
 
@@ -2061,7 +2086,7 @@ function formatTradeSetup(decision, payload, reasoning) {
   const flagLines = gated.flags.length ? `\n\n<b>Risk Flags:</b>\n${gated.flags.map(f => `⚠️ ${f}`).join("\n")}` : "";
   const htfPart = payload.htfTrend ? ` - HTF Trend: ${payload.htfTrend}` : "";
   const swingLine = isSwing && payload.swingTrend ? `\n1H Structure: ${payload.swingTrend} (swing-eligible)` : "";
-  const titleTag = (isSwing ? " 🌙" : "") + (AGGRO ? ` 🎰 AGGRO ${SIZING_LEVERAGE}x` : V19_EXECUTE ? "" : " (v19 paper, no order)");
+  const titleTag = (isSwing ? " 🌙" : "") + (AGGRO ? ` 🎰 AGGRO up to ${AGGRO_STOP === "structure" ? AGGRO_LEVERAGE : SIZING_LEVERAGE}x` : V19_EXECUTE ? "" : " (v19 paper, no order)");
 
   let rMultLine = "";
   if (isSwing && levels.riskRaw > 0) {
