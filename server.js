@@ -13,7 +13,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = "https://open-api-vst.bingx.com";
 
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v20.3";
+const SERVER_VERSION = "v20.4";
 const SIGNAL_LOG_FILE = path.join(DATA_DIR, "signals.jsonl");
 
 // ============================================================
@@ -2273,7 +2273,9 @@ ${note}`);
 // get honest forward evidence. It places no orders and is fully separate
 // from v19: it never touches executeOnBingX, the open-risk cap, or sizing.
 // ============================================================
-const CORE_ASSETS = ["BTC-USDT", "ETH-USDT"];
+// Coins Core trades — Railway variable CORE_COINS, e.g. "BTC,ETH,SUI".
+// Researched: BTC, ETH (2018-2026), SUI (2023-2026). Others are untested.
+const CORE_ASSETS = (process.env.CORE_COINS || "BTC,ETH").split(",").map(c => c.trim().toUpperCase()).filter(Boolean).map(c => `${c}-USDT`);
 const CORE_LOOKBACK = 28;        // days
 const CORE_VOL_TARGET = 0.40;    // annualised
 const CORE_FEE = 0.001;          // per unit of weight traded
@@ -2469,17 +2471,20 @@ const CORE_LEVERAGE = Math.min(2, Math.max(1, Number(process.env.CORE_LEVERAGE |
 // Starting balance = equity the first time this runs, or CORE_START_EQUITY.
 const CORE_PROFIT_LEV = Math.min(3, Math.max(1, Number(process.env.CORE_PROFIT_LEV || 3)));
 
-async function coreStopOrders(symbol) {
+// Core keeps its OWN record of what it holds (st.coreQty) and of the stop
+// orders it placed (st.coreStopIds), so it never mixes with Aggro/v19
+// positions on the same coin and never cancels a stop it didn't create.
+async function openOrderIds(symbol) {
   const res = await bingxRequest("GET", "/openApi/swap/v2/trade/openOrders", { symbol });
   const orders = res?.data?.orders;
-  if (!Array.isArray(orders)) return null;
-  return orders.filter(o => o.positionSide === "LONG" && /STOP/.test(o.type || "") && !/TAKE_PROFIT/.test(o.type || ""));
+  return Array.isArray(orders) ? orders : null;
 }
 
-async function placeCoreStop(symbol, qty, price) {
-  const old = await coreStopOrders(symbol);
-  if (old === null) { console.error(`Core exec: could not read open orders for ${symbol}; stop not refreshed`); return false; }
-  for (const o of old) await bingxRequest("DELETE", "/openApi/swap/v2/trade/order", { symbol, orderId: o.orderId });
+async function placeCoreStop(st, symbol, qty, price) {
+  st.coreStopIds = st.coreStopIds || {};
+  const oldId = st.coreStopIds[symbol];
+  if (oldId) await bingxRequest("DELETE", "/openApi/swap/v2/trade/order", { symbol, orderId: oldId });
+  delete st.coreStopIds[symbol];
   if (qty <= 0) return true;
   const stopPrice = +(price * (1 - CORE_DISASTER_STOP)).toPrecision(6);
   const r = await bingxRequest("POST", "/openApi/swap/v2/trade/order", {
@@ -2489,6 +2494,7 @@ async function placeCoreStop(symbol, qty, price) {
     await sendTelegram(`🚨 <b>Core mode: disaster stop FAILED</b>\n${symbol} LONG ${qty}\n${JSON.stringify(r).slice(0, 200)}`);
     return false;
   }
+  st.coreStopIds[symbol] = String(r.data?.order?.orderId ?? r.data?.order?.orderID ?? "");
   return true;
 }
 
@@ -2541,26 +2547,43 @@ async function coreExecute() {
   if (!equity) { console.error("Core exec: equity unavailable, skipping"); return; }
   const pos = await getOpenPositions();
   if (!pos.checked) { console.error("Core exec: positions unavailable, skipping"); return; }
-  if (!st.coreStart) { st.coreStart = Number(process.env.CORE_START_EQUITY) || equity; fs.writeFileSync(CORE_STATE_FILE, JSON.stringify(st)); }
+  if (!st.coreStart) st.coreStart = Number(process.env.CORE_START_EQUITY) || equity;
   const coreStart = st.coreStart;
-  for (const symbol of CORE_ASSETS) {
+
+  // one-time migration (v20.4): adopt the BTC/ETH positions + stops v20.0-v20.3 opened
+  if (!st.coreQty) {
+    st.coreQty = {}; st.coreStopIds = {};
+    for (const symbol of ["BTC-USDT", "ETH-USDT"]) {
+      const p = pos.positions.find(x => x.symbol === symbol && x.direction === "Long");
+      if (!p) continue;
+      st.coreQty[symbol] = p.amt;
+      const oo = await openOrderIds(symbol);
+      const stop = (oo || []).find(o => o.positionSide === "LONG" && /STOP/.test(o.type || "") && !/TAKE_PROFIT/.test(o.type || ""));
+      if (stop) st.coreStopIds[symbol] = String(stop.orderId);
+    }
+  }
+  const save = () => fs.writeFileSync(CORE_STATE_FILE, JSON.stringify(st));
+  save();
+
+  // coins to manage: the configured list + anything Core still holds (removed coins get sold)
+  const symbols = [...new Set([...CORE_ASSETS, ...Object.keys(st.coreQty).filter(k => st.coreQty[k] > 0)])];
+  for (const symbol of symbols) {
     try {
-      const w = st.weights[symbol] || 0;
+      const w = CORE_ASSETS.includes(symbol) ? (st.weights[symbol] || 0) : 0;
       const px = await lastPrice(symbol.replace("-USDT", ""));
       if (!px) continue;
       const prec = await getQuantityPrecision(symbol);
       const principal = Math.min(equity, coreStart), profit = Math.max(0, equity - coreStart);
       const exposure = principal * CORE_LEVERAGE + profit * CORE_PROFIT_LEV;
       const targetQty = Number(((w * exposure * CORE_ALLOC) / px).toFixed(prec));
-      const cur = pos.positions.find(p => p.symbol === symbol && p.direction === "Long");
-      const curQty = cur ? cur.amt : 0;
+      const exLong = pos.positions.find(p => p.symbol === symbol && p.direction === "Long")?.amt || 0;
+      const curQty = Math.min(st.coreQty[symbol] || 0, exLong);   // never sell more than really exists
       const diff = Number((targetQty - curQty).toFixed(prec));
       const needTrade = targetQty === 0 ? curQty > 0 : Math.abs(diff) * px > 0.10 * targetQty * px;
       if (!needTrade) {
-        // self-heal: a Core position must always have its disaster stop
-        if (curQty > 0) {
-          const stops = await coreStopOrders(symbol);
-          if (stops && stops.length === 0) await placeCoreStop(symbol, curQty, px);
+        if (curQty > 0) {   // self-heal: Core's own stop must exist
+          const oo = await openOrderIds(symbol);
+          if (oo && !oo.some(o => String(o.orderId) === st.coreStopIds?.[symbol])) { await placeCoreStop(st, symbol, curQty, px); save(); }
         }
         continue;
       }
@@ -2572,7 +2595,8 @@ async function coreExecute() {
         await sendTelegram(`⚠️ <b>Core mode order failed</b>\n${symbol} ${side} ${qty}\n${JSON.stringify(r).slice(0, 200)}`);
         continue;
       }
-      const stopOk = await placeCoreStop(symbol, targetQty, px);
+      st.coreQty[symbol] = targetQty; save();
+      const stopOk = await placeCoreStop(st, symbol, targetQty, px); save();
       const msg = formatCoreTrade({ symbol, side, qty, px, targetQty, curQty, w, equity, stopOk, principal, profit });
       console.log(msg.replace(/<[^>]+>/g, ""));
       await sendTelegram(msg);
