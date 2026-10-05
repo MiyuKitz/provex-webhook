@@ -13,7 +13,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = "https://open-api-vst.bingx.com";
 
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v20.2";
+const SERVER_VERSION = "v20.3";
 const SIGNAL_LOG_FILE = path.join(DATA_DIR, "signals.jsonl");
 
 // ============================================================
@@ -67,6 +67,7 @@ function logSignal(decision, payload, execResult) {
       riskVST: execResult?.riskVST ?? null,
       marginUSDT: execResult?.marginUSDT ?? null,
       leverageUsed: execResult?.leverageUsed ?? null,
+      aggro: execResult?.aggro || false,
       outcome: null,
       realizedR: null,
       notes: null,
@@ -429,6 +430,7 @@ async function checkOpenPositions() {
           : `No TP filled; position closed — recorded at -1R.`)
         + ` Entry fill ${fill}. A manual close looks identical to a stop-out and would be recorded the same way.`;
       anyUpdated = true;
+      settleAggro(sig).catch(err => console.error("settleAggro failed (non-fatal):", err.message));
       logPostmortem(sig).catch(err => console.error("logPostmortem failed (non-fatal):", err.message));
       console.log(`Real trade resolved ${sig.symbol} ${sig.direction} -> ${sig.outcome} (${sig.realizedR}R)`);
     } catch (err) {
@@ -1289,8 +1291,41 @@ async function stopWatchdog() {
 // still logged and paper-resolved. Turn demo orders back on with V19_EXECUTE=on.
 const V19_EXECUTE = (process.env.V19_EXECUTE || "off") === "on";
 
+// 🎰 AGGRO MODE (v20.3, DEMO EXPERIMENT) — Krysie's request: trade the v19
+// key-level entries with a big, compounding position on a SEPARATE virtual
+// budget. Each trade risks AGGRO_RISK of the aggro balance (0.5 = 50%, i.e.
+// a position ~10x the budget at the 5% stop, on 10x leverage).
+// Research before launch (v19 replay R distribution, 30 trades, 20k sims):
+//   risk 50%: hit 5x at some point 11% | end down 50%+ 83% | busted 70%
+//   risk 20%: hit 5x 1.4% | end down 50%+ 41% | busted 2%
+// It stops itself when its balance falls below 10% of the starting budget.
+// It does not touch Core mode's budget. Off switch: AGGRO=off.
+const AGGRO = (process.env.AGGRO || "on") === "on";
+const AGGRO_BUDGET = Number(process.env.AGGRO_BUDGET || 20000);
+const AGGRO_RISK = Math.min(0.5, Math.max(0.01, Number(process.env.AGGRO_RISK || 0.5)));
+const AGGRO_FILE = path.join(DATA_DIR, "aggro_state.json");
+function readAggro() {
+  try { return JSON.parse(fs.readFileSync(AGGRO_FILE, "utf8")); }
+  catch { return { start: AGGRO_BUDGET, balance: AGGRO_BUDGET, peak: AGGRO_BUDGET, trades: 0, wins: 0, busted: false, startedAt: new Date().toISOString() }; }
+}
+function writeAggro(a) { fs.writeFileSync(AGGRO_FILE, JSON.stringify(a)); }
+async function settleAggro(sig) {
+  if (!sig.aggro || typeof sig.realizedR !== "number" || !sig.riskVST) return;
+  const a = readAggro();
+  const pnl = sig.riskVST * sig.realizedR;
+  a.balance = +(a.balance + pnl).toFixed(2); a.trades += 1; if (sig.realizedR > 0) a.wins += 1;
+  a.peak = Math.max(a.peak, a.balance);
+  if (a.balance < a.start * 0.1) a.busted = true;
+  writeAggro(a);
+  await sendTelegram(`🎰 <b>Aggro trade closed</b> (demo)\n${sig.symbol} ${sig.direction}: ${sig.realizedR > 0 ? "+" : ""}${sig.realizedR}R = ${pnl > 0 ? "+" : ""}${pnl.toFixed(0)} VST\nAggro balance: ${a.balance.toFixed(0)} VST (${((a.balance / a.start - 1) * 100).toFixed(0)}% from start) │ ${a.wins}W / ${a.trades - a.wins}L${a.busted ? "\n💀 Below 10% of the starting budget, aggro mode has stopped." : ""}`);
+}
+
 async function executeOnBingX(decision, payload) {
-  if (!V19_EXECUTE) { console.log(`v19 paper-only: ${payload.symbol || "—"} signal logged, no order placed`); return; }
+  if (!V19_EXECUTE && !AGGRO) { console.log(`v19 paper-only: ${payload.symbol || "—"} signal logged, no order placed`); return; }
+  if (AGGRO) {
+    const a = readAggro();
+    if (a.busted || a.balance < a.start * 0.1) { console.log("Aggro mode busted — no order placed"); return; }
+  }
   if (!BINGX_API_KEY || !BINGX_API_SECRET) return;
 
   try {
@@ -1298,7 +1333,7 @@ async function executeOnBingX(decision, payload) {
     const symbol = toBingXSymbol(payload.symbol);
     const direction = scoreResult.direction;
 
-    const ks = await killSwitchCheck();
+    const ks = AGGRO ? { tripped: false } : await killSwitchCheck();   // aggro has its own bust rule
     if (ks.tripped) {
       console.log(`Kill switch: equity ${ks.equity.toFixed(2)} is ${(ks.dd * 100).toFixed(1)}% below peak ${ks.peak.toFixed(2)} — no new trades`);
       await sendTelegram(`🛑 <b>Kill switch active</b>\nEquity ${ks.equity.toFixed(0)} is ${(ks.dd * 100).toFixed(1)}% below its peak (${ks.peak.toFixed(0)}). New ${symbol} ${direction} not placed.\nRe-arm by changing KILL_SWITCH_RESET in Railway.`);
@@ -1323,6 +1358,18 @@ async function executeOnBingX(decision, payload) {
     const exitSide = direction === "Short" ? "BUY" : "SELL";
 
     const sizing = await computeBingXSizing();
+    if (AGGRO && sizing.equity) {
+      const a = readAggro();
+      const { available } = await getAccountEquity();
+      const aggroRisk = a.balance * AGGRO_RISK;
+      let margin = (aggroRisk / FIXED_SL_PCT) / SIZING_LEVERAGE;
+      const cap = (available || 0) * MAX_MARGIN_FRACTION;
+      if (margin > cap) margin = cap;
+      sizing.marginUSDT = Number(margin.toFixed(2));
+      sizing.riskVST = Number((margin * SIZING_LEVERAGE * FIXED_SL_PCT).toFixed(2));
+      sizing.riskPct = Number((sizing.riskVST / sizing.equity * 100).toFixed(3));
+      sizing.sizedBy = `🎰 AGGRO: ${(AGGRO_RISK * 100).toFixed(0)}% of aggro balance ${a.balance.toFixed(0)} VST`;
+    }
     const { marginUSDT, leverage, riskVST } = sizing;
 
     // Combined open-risk cap. Based on the INTENDED per-trade risk
@@ -1404,7 +1451,7 @@ async function executeOnBingX(decision, payload) {
     }
     await sendTelegram(`${confidenceEmoji(gated.confidence, scoreResult.rawScore)} <b>BingX demo execution</b>\n${symbol} ${direction} │ ${marginUSDT} VST margin │ ${leverage}x\nRisking ${riskVST} VST (${sizing.sizedBy})\nQty: ${quantity}\n${tpResults.join("\n")}`);
     console.log("BingX execution complete", symbol, direction, "| TP results:", tpResults);
-    return { bingxOrderId: entryRes.data?.order?.orderId ?? entryRes.orderId ?? null, bingxSymbol: symbol, tpOrderIds, riskVST, marginUSDT, leverageUsed: leverage };
+    return { bingxOrderId: entryRes.data?.order?.orderId ?? entryRes.orderId ?? null, bingxSymbol: symbol, tpOrderIds, riskVST, marginUSDT, leverageUsed: leverage, aggro: AGGRO };
   } catch (err) {
     console.error("BingX execution error (non-fatal):", err.message);
     try { await sendTelegram(`⚠️ <b>BingX execution error:</b> ${err.message}`); } catch {}
@@ -2014,7 +2061,7 @@ function formatTradeSetup(decision, payload, reasoning) {
   const flagLines = gated.flags.length ? `\n\n<b>Risk Flags:</b>\n${gated.flags.map(f => `⚠️ ${f}`).join("\n")}` : "";
   const htfPart = payload.htfTrend ? ` - HTF Trend: ${payload.htfTrend}` : "";
   const swingLine = isSwing && payload.swingTrend ? `\n1H Structure: ${payload.swingTrend} (swing-eligible)` : "";
-  const titleTag = (isSwing ? " 🌙" : "") + (V19_EXECUTE ? "" : " (v19 paper, no order)");
+  const titleTag = (isSwing ? " 🌙" : "") + (AGGRO ? ` 🎰 AGGRO ${SIZING_LEVERAGE}x` : V19_EXECUTE ? "" : " (v19 paper, no order)");
 
   let rMultLine = "";
   if (isSwing && levels.riskRaw > 0) {
@@ -2091,6 +2138,12 @@ const server = http.createServer(async (req, res) => {
     const lessons = readLessonsLog();
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ count: lessons.length, lessons }, null, 2));
+    return;
+  }
+  if (req.method === "GET" && pathname === "/aggro") {
+    const a = readAggro();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ on: AGGRO, riskPerTrade: AGGRO_RISK, ...a, returnPct: +((a.balance / a.start - 1) * 100).toFixed(1) }, null, 2));
     return;
   }
   if (req.method === "GET" && pathname === "/funding") {
