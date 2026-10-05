@@ -13,7 +13,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = "https://open-api-vst.bingx.com";
 
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v20.8";
+const SERVER_VERSION = "v20.9";
 const SIGNAL_LOG_FILE = path.join(DATA_DIR, "signals.jsonl");
 
 // ============================================================
@@ -2614,7 +2614,7 @@ async function coreExecute() {
       const prec = await getQuantityPrecision(symbol);
       const principal = Math.min(equity, coreStart), profit = Math.max(0, equity - coreStart);
       const exposure = principal * CORE_LEVERAGE + profit * CORE_PROFIT_LEV;
-      const effLev = Math.max(1, Math.ceil((exposure / equity) - 1e-9));
+      const effLev = Math.max(1, Math.ceil((exposure / equity) - 0.05));   // 1.001 stays 1x
       const targetQty = Number(((w * exposure * CORE_ALLOC) / px).toFixed(prec));
       const exLong = pos.positions.find(p => p.symbol === symbol && p.direction === "Long")?.amt || 0;
       const curQty = Math.min(st.coreQty[symbol] || 0, exLong);   // never sell more than really exists
@@ -2641,9 +2641,13 @@ async function coreExecute() {
         await sendTelegram(`⚠️ <b>Core mode order failed</b>\n${symbol} ${side} ${qty}\n${JSON.stringify(r).slice(0, 200)}`);
         continue;
       }
-      st.coreQty[symbol] = targetQty; save();
-      const stopOk = await placeCoreStop(st, symbol, targetQty, px); save();
-      const msg = formatCoreTrade({ symbol, side, qty, px, targetQty, curQty, w, equity, stopOk, principal, profit });
+      // v20.9: use what BingX ACTUALLY filled (e.g. INJ fills whole units: 227.61
+      // asked -> 227 filled). A stop bigger than the position gets dropped.
+      const filled = parseFloat(r.data?.order?.executedQty ?? qty) || 0;
+      const held = Number(Math.max(0, side === "BUY" ? curQty + filled : curQty - filled).toFixed(prec));
+      st.coreQty[symbol] = held; save();
+      const stopOk = await placeCoreStop(st, symbol, held, px); save();
+      const msg = formatCoreTrade({ symbol, side, qty: filled || qty, px, targetQty: held, curQty, w, equity, stopOk, principal, profit });
       console.log(msg.replace(/<[^>]+>/g, ""));
       await sendTelegram(msg);
     } catch (err) {
