@@ -13,7 +13,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = "https://open-api-vst.bingx.com";
 
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v20.7";
+const SERVER_VERSION = "v20.8";
 const SIGNAL_LOG_FILE = path.join(DATA_DIR, "signals.jsonl");
 
 // ============================================================
@@ -2306,6 +2306,7 @@ const CORE_VOL_TARGET = 0.40;    // annualised
 const CORE_FEE = 0.001;          // per unit of weight traded
 const CORE_STATE_FILE = path.join(DATA_DIR, "core_state.json");
 let coreBadWarned = "";
+const coreLevSynced = {};
 const CORE_LOG_FILE = path.join(DATA_DIR, "core_log.jsonl");
 const DAY_MS = 86400000;
 
@@ -2613,19 +2614,26 @@ async function coreExecute() {
       const prec = await getQuantityPrecision(symbol);
       const principal = Math.min(equity, coreStart), profit = Math.max(0, equity - coreStart);
       const exposure = principal * CORE_LEVERAGE + profit * CORE_PROFIT_LEV;
+      const effLev = Math.max(1, Math.ceil((exposure / equity) - 1e-9));
       const targetQty = Number(((w * exposure * CORE_ALLOC) / px).toFixed(prec));
       const exLong = pos.positions.find(p => p.symbol === symbol && p.direction === "Long")?.amt || 0;
       const curQty = Math.min(st.coreQty[symbol] || 0, exLong);   // never sell more than really exists
       const diff = Number((targetQty - curQty).toFixed(prec));
       const needTrade = targetQty === 0 ? curQty > 0 : Math.abs(diff) * px > 0.10 * targetQty * px;
       if (!needTrade) {
+        if (curQty > 0 && coreLevSynced[symbol] !== effLev) {   // keep held positions' margin leverage in line
+          await bingxRequest("POST", "/openApi/swap/v2/trade/leverage", { symbol, side: "LONG", leverage: effLev });
+          coreLevSynced[symbol] = effLev;
+        }
         if (curQty > 0) {   // self-heal: Core's own stop must exist
           const oo = await openOrderIds(symbol);
           if (oo && !oo.some(o => String(o.orderId) === st.coreStopIds?.[symbol])) { await placeCoreStop(st, symbol, curQty, px); save(); }
         }
         continue;
       }
-      await bingxRequest("POST", "/openApi/swap/v2/trade/leverage", { symbol, side: "LONG", leverage: Math.ceil(Math.max(CORE_LEVERAGE, profit > 0 ? CORE_PROFIT_LEV : 1)) });
+      // Exchange leverage = the account's REAL overall exposure, rounded up. A tiny
+      // profit sleeve no longer flips every position to 3x margin (v20.8).
+      await bingxRequest("POST", "/openApi/swap/v2/trade/leverage", { symbol, side: "LONG", leverage: effLev });
       const side = diff > 0 ? "BUY" : "SELL";
       const qty = targetQty === 0 ? curQty : Math.abs(diff);
       const r = await bingxRequest("POST", "/openApi/swap/v2/trade/order", { symbol, side, positionSide: "LONG", type: "MARKET", quantity: qty });
