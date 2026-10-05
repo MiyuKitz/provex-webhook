@@ -13,7 +13,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = "https://open-api-vst.bingx.com";
 
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v20.9";
+const SERVER_VERSION = "v21.0";
 const SIGNAL_LOG_FILE = path.join(DATA_DIR, "signals.jsonl");
 
 // ============================================================
@@ -2302,6 +2302,11 @@ ${note}`);
 // Researched: BTC, ETH (2018-2026), SUI (2023-2026). Others are untested.
 const CORE_ASSETS = (process.env.CORE_COINS || "BTC,ETH").split(",").map(c => c.trim().toUpperCase()).filter(Boolean).map(c => `${c}-USDT`);
 const CORE_LOOKBACK = 28;        // days
+// v21: CORE_SHORTS=on -> a coin whose 28-day trend is negative is SHORTED
+// (instead of sitting in cash). Research (BTC+ETH 2018-2026): about the same
+// return overall (+23-25%/yr vs +25%), better in bear years (2022: +13% vs
+// -21%), worse in bull years (2023-25: +11% vs +29%), maxDD -50% vs -44%.
+const CORE_SHORTS = (process.env.CORE_SHORTS || "off") === "on";
 const CORE_VOL_TARGET = 0.40;    // annualised
 const CORE_FEE = 0.001;          // per unit of weight traded
 const CORE_STATE_FILE = path.join(DATA_DIR, "core_state.json");
@@ -2331,7 +2336,8 @@ function coreTargetWeight(closes) {
   for (let k = n - 20; k < n; k++) ss += Math.log(closes[k].c / closes[k - 1].c) ** 2;
   const vol = Math.sqrt(ss / 20) * Math.sqrt(365);
   const size = vol > 0 ? Math.min(1, CORE_VOL_TARGET / vol) : 1;
-  return { on, mom, vol, size, ref: closes[n - 1 - CORE_LOOKBACK].c, weight: on ? size / CORE_ASSETS.length : 0 };
+  return { on, mom, vol, size, ref: closes[n - 1 - CORE_LOOKBACK].c,
+           weight: on ? size / CORE_ASSETS.length : (CORE_SHORTS ? -size / CORE_ASSETS.length : 0) };
 }
 
 function readCoreState() {
@@ -2356,7 +2362,8 @@ async function runCoreMode() {
   // Already processed this day — unless the coin list changed (CORE_COINS edited),
   // then recompute weights right away instead of waiting for the next daily close.
   const sameCoins = JSON.stringify(Object.keys(st.weights || {}).sort()) === JSON.stringify(valid.slice().sort());
-  if (st.lastDay !== null && day <= st.lastDay && sameCoins) return null;
+  const sameShorts = (st.shortsOn || false) === CORE_SHORTS;   // CORE_SHORTS toggled -> recompute now
+  if (st.lastDay !== null && day <= st.lastDay && sameCoins && sameShorts) return null;
 
   const px = {};
   for (const s of valid) px[s] = data[s].find(k => k.t === day)?.c ?? data[s][data[s].length - 1].c;
@@ -2381,7 +2388,7 @@ async function runCoreMode() {
   st.equity = prevEq * (1 + dayRet) - prevEq * cost;
   st.peak = Math.max(st.peak || st.equity, st.equity);
   st.startedAt = st.startedAt || new Date(day).toISOString();
-  st.lastDay = day; st.weights = newW; st.prices = px;
+  st.lastDay = day; st.weights = newW; st.prices = px; st.shortsOn = CORE_SHORTS;
   fs.writeFileSync(CORE_STATE_FILE, JSON.stringify(st));
 
   const entry = {
@@ -2389,7 +2396,8 @@ async function runCoreMode() {
     equity: +st.equity.toFixed(2), dayRetPct: +(dayRet * 100).toFixed(3), costPct: +(cost * 100).toFixed(3),
     drawdownPct: +((st.equity / st.peak - 1) * 100).toFixed(2),
     positions: Object.fromEntries(Object.keys(detail).map(s => [s, {
-      inMarket: detail[s].on, weightPct: +(detail[s].weight * 100).toFixed(1),
+      inMarket: detail[s].weight !== 0, side: detail[s].weight > 0 ? "LONG" : detail[s].weight < 0 ? "SHORT" : "CASH",
+      weightPct: +(detail[s].weight * 100).toFixed(1),
       vol: +(detail[s].vol * 100).toFixed(0), momPct: +(detail[s].mom * 100).toFixed(1), refPrice: detail[s].ref, price: px[s] }])),
   };
   fs.appendFileSync(CORE_LOG_FILE, JSON.stringify(entry) + "\n");
@@ -2407,7 +2415,7 @@ async function coreModeTick() {
     if (!res) return;
     const e = res.entry;
     const pos = Object.entries(e.positions)
-      .map(([s, p]) => `${s.replace("-USDT", "")}: ${p.inMarket ? `IN ${p.weightPct}%` : "cash"}`).join(" | ");
+      .map(([s, p]) => `${s.replace("-USDT", "")}: ${p.side === "SHORT" ? `SHORT ${Math.abs(p.weightPct)}%` : p.inMarket ? `IN ${p.weightPct}%` : "cash"}`).join(" | ");
     console.log(`🛡️ Core mode ${e.day}: equity ${e.equity} (${e.dayRetPct}%), DD ${e.drawdownPct}% | ${pos}`);
     if (res.changed) {
       await sendTelegram(`🛡️ <b>Core mode (paper)</b> — position change\n${pos}\nVirtual equity: ${e.equity} (DD ${e.drawdownPct}%)`);
@@ -2519,57 +2527,66 @@ async function openOrderIds(symbol) {
   return Array.isArray(orders) ? orders : null;
 }
 
-async function placeCoreStop(st, symbol, qty, price) {
+// leg = "LONG" | "SHORT". Keys: long leg uses the bare symbol (back-compat),
+// short leg uses "SYMBOL|SHORT".
+const legKey = (symbol, leg) => leg === "SHORT" ? `${symbol}|SHORT` : symbol;
+
+async function placeCoreStop(st, symbol, qty, price, leg = "LONG") {
   st.coreStopIds = st.coreStopIds || {};
-  const oldId = st.coreStopIds[symbol];
+  const key = legKey(symbol, leg);
+  const oldId = st.coreStopIds[key];
   if (oldId) await bingxRequest("DELETE", "/openApi/swap/v2/trade/order", { symbol, orderId: oldId });
-  delete st.coreStopIds[symbol];
+  delete st.coreStopIds[key];
   if (qty <= 0) return true;
-  const stopPrice = +(price * (1 - CORE_DISASTER_STOP)).toPrecision(6);
+  const stopPrice = +(price * (leg === "SHORT" ? 1 + CORE_DISASTER_STOP : 1 - CORE_DISASTER_STOP)).toPrecision(6);
   const r = await bingxRequest("POST", "/openApi/swap/v2/trade/order", {
-    symbol, side: "SELL", positionSide: "LONG", type: "STOP_MARKET", quantity: qty, stopPrice, workingType: "MARK_PRICE",
+    symbol, side: leg === "SHORT" ? "BUY" : "SELL", positionSide: leg, type: "STOP_MARKET", quantity: qty, stopPrice, workingType: "MARK_PRICE",
   });
   if (r.error || r.code !== 0) {
-    await sendTelegram(`🚨 <b>Core mode: disaster stop FAILED</b>\n${symbol} LONG ${qty}\n${JSON.stringify(r).slice(0, 200)}`);
+    await sendTelegram(`🚨 <b>Core mode: disaster stop FAILED</b>\n${symbol} ${leg} ${qty}\n${JSON.stringify(r).slice(0, 200)}`);
     return false;
   }
-  st.coreStopIds[symbol] = String(r.data?.order?.orderId ?? r.data?.order?.orderID ?? "");
+  st.coreStopIds[key] = String(r.data?.order?.orderId ?? r.data?.order?.orderID ?? "");
   return true;
 }
 
-function formatCoreTrade({ symbol, side, qty, px, targetQty, curQty, w, equity, stopOk, principal = 0, profit = 0 }) {
+function formatCoreTrade({ symbol, side, qty, px, targetQty, curQty, w, equity, stopOk, principal = 0, profit = 0, leg = "LONG" }) {
   const coin = symbol.replace("-USDT", "");
   const info = (readCoreLog().slice(-1)[0]?.positions || {})[symbol] || {};
   const fmt = (v, d = 2) => (v == null || isNaN(v)) ? "?" : Number(v).toLocaleString("en-US", { maximumFractionDigits: d });
+  const isShort = leg === "SHORT";
   const closing = targetQty === 0;
-  const action = closing ? "CLOSE" : curQty === 0 ? "OPEN" : side === "BUY" ? "ADD" : "TRIM";
+  const growing = isShort ? side === "SELL" : side === "BUY";
+  const action = closing ? "CLOSE" : curQty === 0 ? "OPEN" : growing ? "ADD" : "TRIM";
   const trend = info.momPct == null ? "?" : `${info.momPct > 0 ? "Bullish" : "Bearish"} (${info.momPct > 0 ? "+" : ""}${info.momPct}%)`;
   const sizePct = info.vol ? Math.min(100, Math.round(4000 / info.vol)) : null;
+  const ref = `$${fmt(info.refPrice)}`;
   const levels = closing
-    ? `<b>Exit:</b> $${fmt(px)}\n<b>Reason:</b> daily close fell below the 28-day reference ($${fmt(info.refPrice)})`
+    ? `<b>Exit:</b> $${fmt(px)}\n<b>Reason:</b> the 28-day trend flipped (reference ${ref})`
     : `<b>Entry:</b> $${fmt(px)}
-<b>Exit trigger:</b> daily close below $${fmt(info.refPrice)} (28-day reference, moves daily)
-<b>Disaster stop:</b> $${fmt(px * (1 - CORE_DISASTER_STOP))} (−15%)
+<b>Exit trigger:</b> daily close ${isShort ? "above" : "below"} ${ref} (28-day reference, moves daily)
+<b>Disaster stop:</b> $${fmt(px * (isShort ? 1 + CORE_DISASTER_STOP : 1 - CORE_DISASTER_STOP))} (${isShort ? "+" : "−"}15%)
 <b>Take profit:</b> none, rides the trend until the exit trigger`;
   const checklist = closing
-    ? `❌ 28-day trend negative\n✅ Position closed, disaster stop cancelled`
-    : `✅ 28-day trend positive
+    ? `🔁 28-day trend flipped\n✅ ${isShort ? "Short" : "Long"} closed, its disaster stop cancelled`
+    : `✅ 28-day trend ${isShort ? "negative" : "positive"}
 ${sizePct === 100 ? "✅" : "➖"} Volatility ${info.vol ?? "?"}% → size ${sizePct ?? "?"}% of full (target 40%)
 ${stopOk ? "✅ Disaster stop placed" : "❌ Disaster stop NOT confirmed, check BingX"}`;
   const reasoning = closing
-    ? `${coin}'s 28-day trend turned negative, so Core steps out to cash and waits for the trend to recover.`
+    ? `${coin}'s 28-day trend flipped, so Core closes this ${isShort ? "short" : "long"}.`
     : action === "OPEN"
-      ? `${coin} is above where it traded 28 days ago, so Core holds it. Size is scaled by volatility so a wild market means a smaller position.`
+      ? (isShort ? `${coin} is below where it traded 28 days ago and shorts are switched on, so Core shorts it. Size is scaled by volatility.`
+                 : `${coin} is above where it traded 28 days ago, so Core holds it. Size is scaled by volatility so a wild market means a smaller position.`)
       : `Rebalance only: volatility moved, so the position was resized to stay near the 40% volatility target. Trend unchanged.`;
   return `🛡️ <b>Core Mode Trade</b> (demo)
 
 <b>${coin}USDT</b> - 28d Trend: ${trend}
-Long  │  ${action}  │  principal ${CORE_LEVERAGE}x${profit > 0 ? ` + profits ${CORE_PROFIT_LEV}x` : ""}
+${isShort ? "Short" : "Long"}  │  ${action}  │  principal ${CORE_LEVERAGE}x${profit > 0 ? ` + profits ${CORE_PROFIT_LEV}x` : ""}
 
 ${levels}
 
 <b>Size:</b> ${side} ${qty} ${coin} → holding ${targetQty} ${coin} (≈ ${fmt(targetQty * px, 0)} VST)
-<b>Weight:</b> ${(w * 100).toFixed(1)}% of Core budget │ Core gets ${CORE_ALLOC * 100}% of ${fmt(equity, 0)} VST
+<b>Weight:</b> ${(Math.abs(w) * 100).toFixed(1)}% of Core budget │ Core gets ${CORE_ALLOC * 100}% of ${fmt(equity, 0)} VST
 <b>Profit sleeve:</b> ${profit > 0 ? `${fmt(profit, 0)} VST of profit trading at ${CORE_PROFIT_LEV}x, principal ${fmt(principal, 0)} at ${CORE_LEVERAGE}x` : `no profit above the starting balance yet, all at ${CORE_LEVERAGE}x`}
 
 <b>Checklist:</b>
@@ -2604,52 +2621,60 @@ async function coreExecute() {
   const save = () => fs.writeFileSync(CORE_STATE_FILE, JSON.stringify(st));
   save();
 
-  // coins to manage: the configured list + anything Core still holds (removed coins get sold)
-  const symbols = [...new Set([...CORE_ASSETS, ...Object.keys(st.coreQty).filter(k => st.coreQty[k] > 0)])];
+  // coins to manage: the configured list + anything Core still holds (removed coins get closed)
+  const held = Object.keys(st.coreQty).filter(k => st.coreQty[k] > 0).map(k => k.split("|")[0]);
+  const symbols = [...new Set([...CORE_ASSETS, ...held])];
   for (const symbol of symbols) {
     try {
-      const w = CORE_ASSETS.includes(symbol) ? (st.weights[symbol] || 0) : 0;
+      const wRaw = CORE_ASSETS.includes(symbol) ? (st.weights[symbol] || 0) : 0;
+      const w = (!CORE_SHORTS && wRaw < 0) ? 0 : wRaw;   // shorts switched off -> any short gets closed
       const px = await lastPrice(symbol.replace("-USDT", ""));
       if (!px) continue;
       const prec = await getQuantityPrecision(symbol);
       const principal = Math.min(equity, coreStart), profit = Math.max(0, equity - coreStart);
       const exposure = principal * CORE_LEVERAGE + profit * CORE_PROFIT_LEV;
       const effLev = Math.max(1, Math.ceil((exposure / equity) - 0.05));   // 1.001 stays 1x
-      const targetQty = Number(((w * exposure * CORE_ALLOC) / px).toFixed(prec));
-      const exLong = pos.positions.find(p => p.symbol === symbol && p.direction === "Long")?.amt || 0;
-      const curQty = Math.min(st.coreQty[symbol] || 0, exLong);   // never sell more than really exists
-      const diff = Number((targetQty - curQty).toFixed(prec));
-      const needTrade = targetQty === 0 ? curQty > 0 : Math.abs(diff) * px > 0.10 * targetQty * px;
-      if (!needTrade) {
-        if (curQty > 0 && coreLevSynced[symbol] !== effLev) {   // keep held positions' margin leverage in line
-          await bingxRequest("POST", "/openApi/swap/v2/trade/leverage", { symbol, side: "LONG", leverage: effLev });
-          coreLevSynced[symbol] = effLev;
+      const qtyAbs = Number(((Math.abs(w) * exposure * CORE_ALLOC) / px).toFixed(prec));
+      const targets = { LONG: w > 0 ? qtyAbs : 0, SHORT: w < 0 ? qtyAbs : 0 };
+      // close/shrink the leg going to zero first so margin is freed before opening the other
+      const legs = ["LONG", "SHORT"].sort((x, y) => (targets[x] === 0 ? -1 : 0) - (targets[y] === 0 ? -1 : 0));
+      for (const leg of legs) {
+        const key = legKey(symbol, leg);
+        const targetQty = targets[leg];
+        const exQty = pos.positions.find(p => p.symbol === symbol && p.direction === (leg === "SHORT" ? "Short" : "Long"))?.amt || 0;
+        const curQty = Math.min(st.coreQty[key] || 0, exQty);   // never trade more than really exists
+        const diff = Number((targetQty - curQty).toFixed(prec));
+        const needTrade = targetQty === 0 ? curQty > 0 : Math.abs(diff) * px > 0.10 * targetQty * px;
+        if (!needTrade) {
+          if (curQty > 0 && coreLevSynced[key] !== effLev) {
+            await bingxRequest("POST", "/openApi/swap/v2/trade/leverage", { symbol, side: leg, leverage: effLev });
+            coreLevSynced[key] = effLev;
+          }
+          if (curQty > 0) {   // self-heal: Core's own stop must exist
+            const oo = await openOrderIds(symbol);
+            if (oo && !oo.some(o => String(o.orderId) === st.coreStopIds?.[key])) { await placeCoreStop(st, symbol, curQty, px, leg); save(); }
+          }
+          continue;
         }
-        if (curQty > 0) {   // self-heal: Core's own stop must exist
-          const oo = await openOrderIds(symbol);
-          if (oo && !oo.some(o => String(o.orderId) === st.coreStopIds?.[symbol])) { await placeCoreStop(st, symbol, curQty, px); save(); }
+        await bingxRequest("POST", "/openApi/swap/v2/trade/leverage", { symbol, side: leg, leverage: effLev });
+        coreLevSynced[key] = effLev;
+        const grow = diff > 0;
+        const side = leg === "LONG" ? (grow ? "BUY" : "SELL") : (grow ? "SELL" : "BUY");
+        const qty = targetQty === 0 ? curQty : Math.abs(diff);
+        const r = await bingxRequest("POST", "/openApi/swap/v2/trade/order", { symbol, side, positionSide: leg, type: "MARKET", quantity: qty });
+        if (r.error || r.code !== 0) {
+          await sendTelegram(`⚠️ <b>Core mode order failed</b>\n${symbol} ${leg} ${side} ${qty}\n${JSON.stringify(r).slice(0, 200)}`);
+          continue;
         }
-        continue;
+        // use what BingX ACTUALLY filled (e.g. INJ fills whole units)
+        const filled = parseFloat(r.data?.order?.executedQty ?? qty) || 0;
+        const heldQty = Number(Math.max(0, grow ? curQty + filled : curQty - filled).toFixed(prec));
+        st.coreQty[key] = heldQty; save();
+        const stopOk = await placeCoreStop(st, symbol, heldQty, px, leg); save();
+        const msg = formatCoreTrade({ symbol, side, qty: filled || qty, px, targetQty: heldQty, curQty, w, equity, stopOk, principal, profit, leg });
+        console.log(msg.replace(/<[^>]+>/g, ""));
+        await sendTelegram(msg);
       }
-      // Exchange leverage = the account's REAL overall exposure, rounded up. A tiny
-      // profit sleeve no longer flips every position to 3x margin (v20.8).
-      await bingxRequest("POST", "/openApi/swap/v2/trade/leverage", { symbol, side: "LONG", leverage: effLev });
-      const side = diff > 0 ? "BUY" : "SELL";
-      const qty = targetQty === 0 ? curQty : Math.abs(diff);
-      const r = await bingxRequest("POST", "/openApi/swap/v2/trade/order", { symbol, side, positionSide: "LONG", type: "MARKET", quantity: qty });
-      if (r.error || r.code !== 0) {
-        await sendTelegram(`⚠️ <b>Core mode order failed</b>\n${symbol} ${side} ${qty}\n${JSON.stringify(r).slice(0, 200)}`);
-        continue;
-      }
-      // v20.9: use what BingX ACTUALLY filled (e.g. INJ fills whole units: 227.61
-      // asked -> 227 filled). A stop bigger than the position gets dropped.
-      const filled = parseFloat(r.data?.order?.executedQty ?? qty) || 0;
-      const held = Number(Math.max(0, side === "BUY" ? curQty + filled : curQty - filled).toFixed(prec));
-      st.coreQty[symbol] = held; save();
-      const stopOk = await placeCoreStop(st, symbol, held, px); save();
-      const msg = formatCoreTrade({ symbol, side, qty: filled || qty, px, targetQty: held, curQty, w, equity, stopOk, principal, profit });
-      console.log(msg.replace(/<[^>]+>/g, ""));
-      await sendTelegram(msg);
     } catch (err) {
       console.error(`Core exec ${symbol} failed (non-fatal):`, err.message);
     }
