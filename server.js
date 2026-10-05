@@ -13,7 +13,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = "https://open-api-vst.bingx.com";
 
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v20.6";
+const SERVER_VERSION = "v20.7";
 const SIGNAL_LOG_FILE = path.join(DATA_DIR, "signals.jsonl");
 
 // ============================================================
@@ -2352,7 +2352,10 @@ async function runCoreMode() {
   if (!valid.length) return null;
   const day = Math.min(...valid.map(s => data[s][data[s].length - 1].t));
   const st = readCoreState();
-  if (st.lastDay !== null && day <= st.lastDay) return null;   // already processed this day
+  // Already processed this day — unless the coin list changed (CORE_COINS edited),
+  // then recompute weights right away instead of waiting for the next daily close.
+  const sameCoins = JSON.stringify(Object.keys(st.weights || {}).sort()) === JSON.stringify(valid.slice().sort());
+  if (st.lastDay !== null && day <= st.lastDay && sameCoins) return null;
 
   const px = {};
   for (const s of valid) px[s] = data[s].find(k => k.t === day)?.c ?? data[s][data[s].length - 1].c;
