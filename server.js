@@ -24,7 +24,7 @@ const BINGX_API_KEY    = process.env.BINGX_API_KEY;
 const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = "https://open-api-vst.bingx.com";
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v24.1";
+const SERVER_VERSION = "v24.2";
 
 // v24: Aggro can run on its OWN BingX account (sub-account or second account).
 // Set AGGRO_BINGX_API_KEY + AGGRO_BINGX_API_SECRET and Aggro trades there, so
@@ -468,31 +468,32 @@ function formatCoreTrade({ symbol, side, qty, px, targetQty, curQty, w, equity, 
   const fmt = (v, d = 2) => (v == null || isNaN(v)) ? "?" : Number(v).toLocaleString("en-US", { maximumFractionDigits: d });
   const isShort = leg === "SHORT";
   const closing = targetQty === 0;
+  const removed = !CORE_ASSETS.includes(symbol);   // closed because it was taken out of CORE_COINS
   const growing = isShort ? side === "SELL" : side === "BUY";
   const action = closing ? "CLOSE" : curQty === 0 ? "OPEN" : growing ? "ADD" : "TRIM";
   const trend = info.momPct == null ? "?" : `${info.momPct > 0 ? "Bullish" : "Bearish"} (${info.momPct > 0 ? "+" : ""}${info.momPct}%)`;
   const sizePct = info.vol ? Math.min(100, Math.round(4000 / info.vol)) : null;
   const ref = `$${fmt(info.refPrice)}`;
   const levels = closing
-    ? `<b>Exit:</b> $${fmt(px)}\n<b>Reason:</b> the 28-day trend flipped (reference ${ref})`
+    ? `<b>Exit:</b> $${fmt(px)}\n<b>Reason:</b> ${removed ? "coin removed from CORE_COINS" : `the 28-day trend flipped (reference ${ref})`}`
     : `<b>Entry:</b> $${fmt(px)}
 <b>Exit trigger:</b> daily close ${isShort ? "above" : "below"} ${ref} (28-day reference, moves daily)
 <b>Disaster stop:</b> $${fmt(px * (isShort ? 1 + CORE_DISASTER_STOP : 1 - CORE_DISASTER_STOP))} (${isShort ? "+" : "−"}15%)
 <b>Take profit:</b> none, rides the trend until the exit trigger`;
   const checklist = closing
-    ? `🔁 28-day trend flipped\n✅ ${isShort ? "Short" : "Long"} closed, its disaster stop cancelled`
+    ? `${removed ? "🗂️ Removed from Core's coin list" : "🔁 28-day trend flipped"}\n✅ ${isShort ? "Short" : "Long"} closed, its disaster stop cancelled`
     : `✅ 28-day trend ${isShort ? "negative" : "positive"}
 ${sizePct === 100 ? "✅" : "➖"} Volatility ${info.vol ?? "?"}% → size ${sizePct ?? "?"}% of full (target 40%)
 ${stopOk ? "✅ Disaster stop placed" : "❌ Disaster stop NOT confirmed, check BingX"}`;
   const reasoning = closing
-    ? `${coin}'s 28-day trend flipped, so Core closes this ${isShort ? "short" : "long"}.`
+    ? (removed ? `${coin} was taken out of CORE_COINS, so Core closed its position.` : `${coin}'s 28-day trend flipped, so Core closes this ${isShort ? "short" : "long"}.`)
     : action === "OPEN"
       ? (isShort ? `${coin} is below where it traded 28 days ago and shorts are switched on, so Core shorts it. Size is scaled by volatility.`
                  : `${coin} is above where it traded 28 days ago, so Core holds it. Size is scaled by volatility so a wild market means a smaller position.`)
       : `Rebalance only: volatility moved, so the position was resized to stay near the 40% volatility target. Trend unchanged.`;
   return `🛡️ <b>Core Mode Trade</b> (demo)
 
-<b>${coin}USDT</b> - 28d Trend: ${trend}
+<b>${coin}USDT</b> - ${removed ? "removed from Core" : `28d Trend: ${trend}`}
 ${isShort ? "Short" : "Long"}  │  ${action}  │  principal ${CORE_LEVERAGE}x${profit > 0 ? ` + profits ${CORE_PROFIT_LEV}x` : ""}
 
 ${levels}
