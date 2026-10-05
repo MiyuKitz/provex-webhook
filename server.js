@@ -13,7 +13,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = "https://open-api-vst.bingx.com";
 
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v20.5";
+const SERVER_VERSION = "v20.6";
 const SIGNAL_LOG_FILE = path.join(DATA_DIR, "signals.jsonl");
 
 // ============================================================
@@ -2305,6 +2305,7 @@ const CORE_LOOKBACK = 28;        // days
 const CORE_VOL_TARGET = 0.40;    // annualised
 const CORE_FEE = 0.001;          // per unit of weight traded
 const CORE_STATE_FILE = path.join(DATA_DIR, "core_state.json");
+let coreBadWarned = "";
 const CORE_LOG_FILE = path.join(DATA_DIR, "core_log.jsonl");
 const DAY_MS = 86400000;
 
@@ -2338,27 +2339,36 @@ function readCoreState() {
 }
 
 async function runCoreMode() {
-  const data = {};
-  for (const s of CORE_ASSETS) data[s] = await fetchDailyCloses(s);
-  const day = Math.min(...CORE_ASSETS.map(s => data[s][data[s].length - 1].t));
+  const data = {}, bad = [];
+  for (const s of CORE_ASSETS) {
+    try { const d = await fetchDailyCloses(s); if (d.length >= CORE_LOOKBACK + 21) data[s] = d; else bad.push(`${s} (too new)`); }
+    catch { bad.push(s); }
+  }
+  if (bad.length && coreBadWarned !== bad.join()) {
+    coreBadWarned = bad.join();
+    await sendTelegram(`⚠️ <b>Core mode: coin(s) skipped</b>\n${bad.join(", ")}\nNot found on BingX futures or not enough history. Check the spelling in CORE_COINS (e.g. PEPE is 1000PEPE, SHIB is 1000SHIB, BONK is 1000BONK).`);
+  }
+  const valid = Object.keys(data);
+  if (!valid.length) return null;
+  const day = Math.min(...valid.map(s => data[s][data[s].length - 1].t));
   const st = readCoreState();
   if (st.lastDay !== null && day <= st.lastDay) return null;   // already processed this day
 
   const px = {};
-  for (const s of CORE_ASSETS) px[s] = data[s].find(k => k.t === day)?.c ?? data[s][data[s].length - 1].c;
+  for (const s of valid) px[s] = data[s].find(k => k.t === day)?.c ?? data[s][data[s].length - 1].c;
 
   // 1. mark yesterday's weights to today's close
   let dayRet = 0;
-  for (const s of CORE_ASSETS) {
+  for (const s of Object.keys(st.weights || {})) {
     const w = st.weights[s] || 0, p0 = st.prices[s];
-    if (w && p0) dayRet += w * (px[s] / p0 - 1);
+    if (w && p0 && px[s]) dayRet += w * (px[s] / p0 - 1);
   }
   // 2. new target weights
   const detail = {}, newW = {};
   let turnover = 0;
-  for (const s of CORE_ASSETS) {
+  for (const s of valid) {
     const tw = coreTargetWeight(data[s].filter(k => k.t <= day));
-    if (!tw) return null;
+    if (!tw) continue;
     detail[s] = tw; newW[s] = tw.weight;
     turnover += Math.abs(tw.weight - (st.weights[s] || 0));
   }
@@ -2374,7 +2384,7 @@ async function runCoreMode() {
     day: new Date(day).toISOString().slice(0, 10), serverVersion: SERVER_VERSION,
     equity: +st.equity.toFixed(2), dayRetPct: +(dayRet * 100).toFixed(3), costPct: +(cost * 100).toFixed(3),
     drawdownPct: +((st.equity / st.peak - 1) * 100).toFixed(2),
-    positions: Object.fromEntries(CORE_ASSETS.map(s => [s, {
+    positions: Object.fromEntries(Object.keys(detail).map(s => [s, {
       inMarket: detail[s].on, weightPct: +(detail[s].weight * 100).toFixed(1),
       vol: +(detail[s].vol * 100).toFixed(0), momPct: +(detail[s].mom * 100).toFixed(1), refPrice: detail[s].ref, price: px[s] }])),
   };
