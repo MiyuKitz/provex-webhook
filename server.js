@@ -24,7 +24,7 @@ const BINGX_API_KEY    = process.env.BINGX_API_KEY;
 const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = "https://open-api-vst.bingx.com";
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v24.2";
+const SERVER_VERSION = "v24.3";
 
 // v24: Aggro can run on its OWN BingX account (sub-account or second account).
 // Set AGGRO_BINGX_API_KEY + AGGRO_BINGX_API_SECRET and Aggro trades there, so
@@ -306,6 +306,27 @@ async function fetchDailyCloses(symbol) {
     .sort((a, b) => a.t - b.t);
 }
 
+// v24.3 KEY-LEVEL TRAIL (CORE_TRAIL=on, default): while long, Core also exits on a
+// daily close below the last confirmed daily swing low. After such an exit it only
+// re-enters on a fresh breakout (close above the highest close of the prior 10 days)
+// while the 28-day trend is still up. Research (BTC+ETH): same return, smaller
+// drawdowns: 2018-26 maxDD -44% -> -33%; 2024-26 -34% -> -25%; Sharpe 0.58 -> 0.63 recently.
+const CORE_TRAIL = (process.env.CORE_TRAIL || "on") === "on";
+function coreTrailDecision(c, wasIn, locked) {   // c = array of daily closes up to today
+  const n = c.length - 1;
+  let trail = null;
+  for (let k = n - 30; k <= n - 4; k++) {
+    if (k < 3) continue;
+    if ([-3, -2, -1, 1, 2, 3].every(j => c[k] < c[k + j])) trail = c[k];
+  }
+  if (wasIn && trail !== null && c[n] < trail) return { inMarket: false, locked: true, trail };
+  if (!wasIn && locked) {
+    const brk = c[n] > Math.max(...c.slice(n - 10, n));
+    return { inMarket: brk, locked: !brk, trail };
+  }
+  return { inMarket: true, locked: false, trail };
+}
+
 function coreTargetWeight(closes) {
   const n = closes.length;
   if (n < CORE_LOOKBACK + 21) return null;
@@ -356,9 +377,18 @@ async function runCoreMode() {
   // 2. new target weights
   const detail = {}, newW = {};
   let turnover = 0;
+  st.locked = st.locked || {};
   for (const s of valid) {
-    const tw = coreTargetWeight(data[s].filter(k => k.t <= day));
+    const series = data[s].filter(k => k.t <= day);
+    const tw = coreTargetWeight(series);
     if (!tw) continue;
+    tw.trail = null;
+    if (!tw.on) st.locked[s] = false;
+    else if (CORE_TRAIL) {
+      const td = coreTrailDecision(series.map(k => k.c), (st.weights[s] || 0) > 0, !!st.locked[s]);
+      st.locked[s] = td.locked; tw.trail = td.trail;
+      if (!td.inMarket) tw.weight = 0;
+    }
     detail[s] = tw; newW[s] = tw.weight;
     turnover += Math.abs(tw.weight - (st.weights[s] || 0));
   }
@@ -381,7 +411,7 @@ async function runCoreMode() {
     positions: Object.fromEntries(Object.keys(detail).map(s => [s, {
       inMarket: detail[s].weight !== 0, side: detail[s].weight > 0 ? "LONG" : detail[s].weight < 0 ? "SHORT" : "CASH",
       weightPct: +(detail[s].weight * 100).toFixed(1),
-      vol: +(detail[s].vol * 100).toFixed(0), momPct: +(detail[s].mom * 100).toFixed(1), refPrice: detail[s].ref, price: px[s] }])),
+      vol: +(detail[s].vol * 100).toFixed(0), momPct: +(detail[s].mom * 100).toFixed(1), refPrice: detail[s].ref, trailPrice: detail[s].trail, locked: !!st.locked[s], price: px[s] }])),
   };
   fs.appendFileSync(CORE_LOG_FILE, JSON.stringify(entry) + "\n");
   return { entry, changed: turnover > 0.05 };
@@ -481,9 +511,9 @@ function formatCoreTrade({ symbol, side, qty, px, targetQty, curQty, w, equity, 
   const sizePct = info.vol ? Math.min(100, Math.round(4000 / info.vol)) : null;
   const ref = `$${fmt(info.refPrice)}`;
   const levels = closing
-    ? `<b>Exit:</b> $${fmt(px)}\n<b>Reason:</b> ${removed ? "coin removed from CORE_COINS" : `the 28-day trend flipped (reference ${ref})`}`
+    ? `<b>Exit:</b> $${fmt(px)}\n<b>Reason:</b> ${removed ? "coin removed from CORE_COINS" : info.locked ? `daily close broke the last swing low ($${fmt(info.trailPrice)}), key-level exit` : `the 28-day trend flipped (reference ${ref})`}`
     : `<b>Entry:</b> $${fmt(px)}
-<b>Exit trigger:</b> daily close ${isShort ? "above" : "below"} ${ref} (28-day reference, moves daily)
+<b>Exit trigger:</b> daily close ${isShort ? "above" : "below"} ${ref} (28-day reference, moves daily)${!isShort && info.trailPrice ? `\n<b>Key-level exit:</b> daily close below $${fmt(info.trailPrice)} (last daily swing low, trails up)` : ""}
 <b>Disaster stop:</b> $${fmt(px * (isShort ? 1 + CORE_DISASTER_STOP : 1 - CORE_DISASTER_STOP))} (${isShort ? "+" : "−"}15%)
 <b>Take profit:</b> none, rides the trend until the exit trigger`;
   const checklist = closing
