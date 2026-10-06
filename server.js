@@ -184,11 +184,17 @@ async function getOpenPositions(acct = "main") {
   }
 }
 
+// Every message ends with the Melbourne date/time (+ UTC) so signals are easy to track.
+function stampNow() {
+  const d = new Date();
+  const mel = d.toLocaleString("en-AU", { timeZone: "Australia/Melbourne", weekday: "short", day: "numeric", month: "short", year: "numeric", hour: "numeric", minute: "2-digit", hour12: true, timeZoneName: "short" });
+  return `🕒 ${mel} (${d.toISOString().slice(0, 16).replace("T", " ")} UTC)`;
+}
 async function sendTelegram(message) {
   const url  = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
   const body = JSON.stringify({
     chat_id:    TELEGRAM_CHAT_ID,
-    text:       message,
+    text:       `${message}\n\n${stampNow()}`,
     parse_mode: "HTML",
   });
   return new Promise((resolve, reject) => {
@@ -490,7 +496,7 @@ ${stopOk ? "✅ Disaster stop placed" : "❌ Disaster stop NOT confirmed, check 
     : action === "OPEN"
       ? (isShort ? `${coin} is below where it traded 28 days ago and shorts are switched on, so Core shorts it. Size is scaled by volatility.`
                  : `${coin} is above where it traded 28 days ago, so Core holds it. Size is scaled by volatility so a wild market means a smaller position.`)
-      : `Rebalance only: volatility moved, so the position was resized to stay near the 40% volatility target. Trend unchanged.`;
+      : `Rebalance only: the target size changed (volatility moved, the coin list changed, or the account grew/shrank), so the position was resized. Trend unchanged.`;
   return `🛡️ <b>Core Mode Trade</b> (demo)
 
 <b>${coin}USDT</b> - ${removed ? "removed from Core" : `28d Trend: ${trend}`}
