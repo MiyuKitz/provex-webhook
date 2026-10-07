@@ -22,9 +22,18 @@ const TELEGRAM_CHAT_ID  = process.env.TELEGRAM_CHAT_ID;
 const PORT = process.env.PORT || 3000;
 const BINGX_API_KEY    = process.env.BINGX_API_KEY;
 const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
-const BINGX_BASE_URL   = "https://open-api-vst.bingx.com";
+const BINGX_BASE_URL   = process.env.BINGX_BASE_URL || "https://open-api-vst.bingx.com";   // VST demo by default
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v25.0";
+const SERVER_VERSION = "v25.1";
+
+// v25.1 — one codebase, two deployments. The demo service keeps the defaults.
+// A second Railway service runs the REAL-money "Aggro only" copy with:
+//   BINGX_BASE_URL=https://open-api.bingx.com  (live)   BOT_LABEL=💰 LIVE
+//   CORE=off  SHADOW=off  AGGRO_USE_EQUITY=on  AGGRO_COINS=SUI
+const BOT_LABEL = process.env.BOT_LABEL || "";
+const CORE_ON = (process.env.CORE || "on") === "on";
+const SHADOW_ON = (process.env.SHADOW || "on") === "on";
+const AGGRO_USE_EQUITY = (process.env.AGGRO_USE_EQUITY || "off") === "on";   // size from the account's real equity
 
 // v24: Aggro can run on its OWN BingX account (sub-account or second account).
 // Set AGGRO_BINGX_API_KEY + AGGRO_BINGX_API_SECRET and Aggro trades there, so
@@ -194,7 +203,7 @@ async function sendTelegram(message) {
   const url  = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
   const body = JSON.stringify({
     chat_id:    TELEGRAM_CHAT_ID,
-    text:       `${message}\n\n${stampNow()}`,
+    text:       `${BOT_LABEL ? BOT_LABEL + " · " : ""}${message}\n\n${stampNow()}`,
     parse_mode: "HTML",
   });
   return new Promise((resolve, reject) => {
@@ -896,7 +905,7 @@ async function agEnter(a, symbol, sig, pos) {
   const { equity: agEq, available } = await getAccountEquity(AG_ACCT);
   const prec = await getQuantityPrecision(symbol);
   const lev = Math.max(1, Math.min(AGGRO_LEVERAGE, Math.floor(1 / (1.5 * d))));
-  const bal = AGGRO_SEPARATE && agEq ? agEq : a.balance;   // own account -> real equity compounds
+  const bal = (AGGRO_SEPARATE || AGGRO_USE_EQUITY) && agEq ? agEq : a.balance;   // own/live account -> real equity compounds
   let notional = (bal * AGGRO_RISK) / d;
   const cap = (available || 0) * MAX_MARGIN_FRACTION * lev;
   if (notional > cap) notional = cap;
@@ -950,7 +959,7 @@ async function agManage(a, pos) {
         // ♻️ RECYCLE: each time Aggro doubles, half its profit is banked for Core.
         if (a.balance >= a.start * 2) {
           const bank = +((a.balance - a.start) / 2).toFixed(2);
-          if (AGGRO_SEPARATE) {
+          if (AGGRO_SEPARATE || AGGRO_USE_EQUITY) {
             const lvl = Math.floor(a.balance / a.start);
             if (lvl > (a.recycleNudged || 1)) {
               a.recycleNudged = lvl;
@@ -997,6 +1006,10 @@ async function aggroTick() {
   if (!AGGRO || !BINGX_API_KEY || !BINGX_API_SECRET) return;
   try {
     const a = readAggro(); a.lastEntryT = a.lastEntryT || {};
+    if (AGGRO_USE_EQUITY) {   // live: the scoreboard follows the real account
+      const { equity } = await getAccountEquity(AG_ACCT);
+      if (equity) { if (!a.equityStart) { a.equityStart = true; a.start = equity; a.peak = equity; } a.balance = equity; a.peak = Math.max(a.peak, equity); }
+    }
     let pos = await getOpenPositions(AG_ACCT); if (!pos.checked) return;
     await agManage(a, pos); writeAggro(a);
     if (a.busted || a.balance < a.start * 0.1) return;
@@ -1101,7 +1114,7 @@ const server = http.createServer(async (req, res) => {
   const pathname = urlObj.pathname;
   const json = (obj, code = 200) => { res.writeHead(code, { "Content-Type": "application/json" }); res.end(JSON.stringify(obj, null, 2)); };
   if (req.method === "GET" && pathname === "/") {
-    return json({ bot: "Two-Speed", version: SERVER_VERSION, regime: regimeCache.value, core: { execute: CORE_EXECUTE, coins: CORE_ASSETS, shorts: CORE_SHORTS },
+    return json({ bot: "Two-Speed", label: BOT_LABEL || "demo", exchange: BINGX_BASE_URL.includes("vst") ? "BingX DEMO (VST)" : "BingX LIVE", coreOn: CORE_ON, shadowOn: SHADOW_ON, version: SERVER_VERSION, regime: regimeCache.value, core: { execute: CORE_EXECUTE, coins: CORE_ASSETS, shorts: CORE_SHORTS },
       aggro: { on: AGGRO, account: AGGRO_SEPARATE ? "own sub-account" : "shared main account", coins: AGGRO_COINS, timeframe: AGGRO_TF, minConfluence: AGGRO_MIN_CONF, strategies: AGGRO_STRATS, maxLeverage: AGGRO_LEVERAGE },
       shadow: { coins: SHADOW_COINS, timeframes: ["1h", "4h"] } });
   }
@@ -1124,11 +1137,15 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => console.log(`Server ${SERVER_VERSION} running on port ${PORT}`));
 
-setInterval(() => coreModeTick().then(coreExecute).catch(e => console.error("core loop:", e.message)), 60 * 60 * 1000);
-setTimeout(() => coreModeTick().then(coreExecute).catch(e => console.error("core loop:", e.message)), 2 * 60 * 1000);
+if (CORE_ON) {
+  setInterval(() => coreModeTick().then(coreExecute).catch(e => console.error("core loop:", e.message)), 60 * 60 * 1000);
+  setTimeout(() => coreModeTick().then(coreExecute).catch(e => console.error("core loop:", e.message)), 2 * 60 * 1000);
+}
 setInterval(aggroTick, 5 * 60 * 1000);
 setTimeout(aggroTick, 4 * 60 * 1000);
-setInterval(shadowTick, 5 * 60 * 1000);
-setTimeout(shadowTick, 6 * 60 * 1000);
+if (SHADOW_ON) {
+  setInterval(shadowTick, 5 * 60 * 1000);
+  setTimeout(shadowTick, 6 * 60 * 1000);
+}
 setInterval(() => stopWatchdog().catch(e => console.error("stopWatchdog failed (non-fatal):", e.message)), 15 * 60 * 1000);
 setTimeout(() => stopWatchdog().catch(() => {}), 90 * 1000);
