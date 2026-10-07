@@ -24,7 +24,7 @@ const BINGX_API_KEY    = process.env.BINGX_API_KEY;
 const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = process.env.BINGX_BASE_URL || "https://open-api-vst.bingx.com";   // VST demo by default
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v25.1";
+const SERVER_VERSION = "v25.2";
 
 // v25.1 — one codebase, two deployments. The demo service keeps the defaults.
 // A second Railway service runs the REAL-money "Aggro only" copy with:
@@ -92,7 +92,7 @@ async function bingxRequest(method, path, params, acct = "main") {
 
   return new Promise((resolve) => {
     const req = https.request({
-      hostname: "open-api-vst.bingx.com",
+      hostname: new URL(BINGX_BASE_URL).hostname,   // v25.2: was hard-coded to the demo (VST) host
       path: fullPath,
       method,
       headers: {
