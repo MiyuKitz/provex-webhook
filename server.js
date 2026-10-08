@@ -24,7 +24,7 @@ const BINGX_API_KEY    = process.env.BINGX_API_KEY;
 const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = process.env.BINGX_BASE_URL || "https://open-api-vst.bingx.com";   // VST demo by default
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v25.3";
+const SERVER_VERSION = "v25.4";
 
 // v25.1 — one codebase, two deployments. The demo service keeps the defaults.
 // A second Railway service runs the REAL-money "Aggro only" copy with:
@@ -1140,6 +1140,12 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => console.log(`Server ${SERVER_VERSION} running on port ${PORT}`));
+
+// v25.4: exit cleanly when Railway stops the old container during a redeploy.
+// Without this, npm reports "signal SIGTERM" and Railway emails "Deployment crashed" on every update.
+for (const sig of ["SIGTERM", "SIGINT"]) {
+  process.on(sig, () => { console.log(`${sig} received, shutting down cleanly`); server.close(() => process.exit(0)); setTimeout(() => process.exit(0), 3000).unref(); });
+}
 
 if (CORE_ON) {
   setInterval(() => coreModeTick().then(coreExecute).catch(e => console.error("core loop:", e.message)), 60 * 60 * 1000);
