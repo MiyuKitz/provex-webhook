@@ -3,14 +3,15 @@
 //
 // Only the new strategies live here:
 //   🛡️ Core  — trend-following holds (daily, long; shorts optional, never in a bull market)
-//   🎰 Aggro — with-trend 1H break & retest, tight stop, up to 40x (never short in a bull market)
+//   🎰 Aggro — Krysie's 10-strategy confluence, long AND short (v25.5: the setup decides direction,
+//            not BTC; AGGRO_BULL_SHORTS=off brings back the old no-shorts-in-bull gate)
 // Plus the stop watchdog. The old v19 order-block system, its TradingView
 // signal pipeline, Claude explanations, paper resolvers, weekly challenge
 // report, signal backups and the funding watch were removed in v23.
 // Their research and code history stay in research/ and in git history.
 //
 // MARKET REGIME: bull market = BTC's 28-day return > 0 (checked daily).
-// In a bull market, NOTHING in this bot opens a short.
+// In a bull market Core never opens a short. Aggro ignores BTC by default (v25.5).
 // ============================================================
 const http = require("http");
 const https = require("https");
@@ -23,8 +24,9 @@ const PORT = process.env.PORT || 3000;
 const BINGX_API_KEY    = process.env.BINGX_API_KEY;
 const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = process.env.BINGX_BASE_URL || "https://open-api-vst.bingx.com";   // VST demo by default
+const IS_LIVE = !BINGX_BASE_URL.includes("vst");
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v25.4";
+const SERVER_VERSION = "v25.5";
 
 // v25.1 — one codebase, two deployments. The demo service keeps the defaults.
 // A second Railway service runs the REAL-money "Aggro only" copy with:
@@ -203,7 +205,8 @@ async function sendTelegram(message) {
   const url  = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
   const body = JSON.stringify({
     chat_id:    TELEGRAM_CHAT_ID,
-    text:       `${BOT_LABEL ? BOT_LABEL + " · " : ""}${message}\n\n${stampNow()}`,
+    // v25.5: the live account trades real USDT, so its cards say LIVE/USDT instead of demo/VST
+    text:       `${BOT_LABEL ? BOT_LABEL + " · " : ""}${IS_LIVE ? message.replace(/\(demo\)/g, "(LIVE)").replace(/ VST\b/g, " USDT") : message}\n\n${stampNow()}`,
     parse_mode: "HTML",
   });
   return new Promise((resolve, reject) => {
@@ -839,6 +842,9 @@ function cfBest(eng, i, trend, allowShort, dMin, dMax, strats = CF_NAMES) {
 // ============================================================
 // v25: Aggro trades Krysie's 10-strategy CONFLUENCE setups (was: single break & retest).
 const AGGRO_TF = (process.env.AGGRO_TF || "4h") === "1h" ? "1h" : "4h";          // timeframe Aggro trades on
+// v25.5: Aggro trades both directions on each coin's own setups. BTC's trend no longer blocks shorts
+// (shadow log Oct 6-14: the bull-market shorts it blocked were +0.05R avg, the longs it allowed -0.40R).
+const AGGRO_BULL_SHORTS = (process.env.AGGRO_BULL_SHORTS || "on") === "on";
 const AGGRO_MIN_CONF = Math.max(1, Math.min(10, Number(process.env.AGGRO_MIN_CONF || 4)));   // min strategies agreeing to trade
 const AGGRO_STRATS = (process.env.AGGRO_STRATS || CF_NAMES.join(",")).split(",").map(x => x.trim()).filter(x => CF_NAMES.includes(x));   // strategy menu
 const TF_STOP = { "1h": [0.003, 0.05], "4h": [0.005, 0.10] };
@@ -894,13 +900,13 @@ async function cfScan(symbol, tf, strats = CF_NAMES, shadow = false) {
   for (let i = 30; i < b.length - 1; i++) { eng.update(i); eng.signals(i, trend); }   // warm up state (zones, armed retests)
   const i = b.length - 1; eng.update(i);
   const [dMin, dMax] = TF_STOP[tf];
-  const best = cfBest(eng, i, trend, shadow || (await marketRegime()) !== "bull", dMin, dMax, strats);
+  const best = cfBest(eng, i, trend, shadow || AGGRO_BULL_SHORTS || (await marketRegime()) !== "bull", dMin, dMax, strats);
   return { best, bars: b };
 }
 
 async function agEnter(a, symbol, sig, pos) {
   const coin = symbol.replace("-USDT", ""), side = sig.side, leg = side === "Long" ? "LONG" : "SHORT";
-  if (side === "Short" && (await marketRegime()) === "bull") { console.log(`Aggro: ${symbol} short skipped, bull market (BTC 28d trend up)`); return; }
+  if (side === "Short" && !AGGRO_BULL_SHORTS && (await marketRegime()) === "bull") { console.log(`Aggro: ${symbol} short skipped, bull market (BTC 28d trend up)`); return; }
   const px = await lastPrice(coin); if (!px) return;
   const d = Math.abs(px - sig.stop) / px;
   const [dMin, dMax] = TF_STOP[sig.tf || "1h"];
@@ -913,10 +919,21 @@ async function agEnter(a, symbol, sig, pos) {
   let notional = (bal * AGGRO_RISK) / d;
   const cap = (available || 0) * MAX_MARGIN_FRACTION * lev;
   if (notional > cap) notional = cap;
-  const qty = Number((notional / px).toFixed(prec));
+  let qty = Number((notional / px).toFixed(prec));
   if (!(qty > 0)) return;
   await bingxRequest("POST", "/openApi/swap/v2/trade/leverage", { symbol, side: leg, leverage: lev }, AG_ACCT);
-  const e = await agOrder({ symbol, side: side === "Long" ? "BUY" : "SELL", positionSide: leg, type: "MARKET", quantity: qty });
+  let e = await agOrder({ symbol, side: side === "Long" ? "BUY" : "SELL", positionSide: leg, type: "MARKET", quantity: qty });
+  // v25.5: BingX caps position size per leverage tier (e.g. 200k USDT at 40x). The demo's 20k budget at 50% risk
+  // asks for more than that on tight stops, so the order was rejected and the trade silently missed.
+  // Shrink to just under the tier cap and retry once (risk ends up a bit lower than 50%, the setup is still taken).
+  if (!e.ok && e.r?.code === 101209) {
+    const capVal = parseFloat(String(e.r.msg || "").replace(/,/g, "").match(/([\d.]+)\s*USDT/)?.[1]);
+    if (capVal > 0) {
+      qty = Number(((capVal * 0.95) / px).toFixed(prec));
+      console.log(`Aggro: ${symbol} size above BingX's ${capVal} USDT cap at ${lev}x, retrying with ${qty}`);
+      if (qty > 0) e = await agOrder({ symbol, side: side === "Long" ? "BUY" : "SELL", positionSide: leg, type: "MARKET", quantity: qty });
+    }
+  }
   if (!e.ok) { await sendTelegram(`⚠️ <b>Aggro order failed</b>\n${symbol} ${side} ${qty} @${lev}x\n${JSON.stringify(e.r).slice(0, 200)}`); return; }
   const filled = Number(e.filled.toFixed(prec)), R = Math.abs(px - sig.stop), sgn = side === "Long" ? 1 : -1;
   const exitSide = side === "Long" ? "SELL" : "BUY";
@@ -1080,7 +1097,7 @@ async function shadowTick() {
             const d = Math.abs(best.entry - best.stop) / best.entry;
             sh.open.push({ symbol, tf, t: best.t, side: best.side, score: best.score, agree: best.agree, triggers: best.triggers, withTrend: best.withTrend,
               entry: best.entry, stop: best.stop, d: +d.toFixed(5), regime, bullShortBlocked: best.side === "Short" && regime === "bull",
-              aggroWouldTrade: tf === AGGRO_TF && best.score >= AGGRO_MIN_CONF && AGGRO_COINS.includes(coin) && !(best.side === "Short" && regime === "bull"),
+              aggroWouldTrade: tf === AGGRO_TF && best.score >= AGGRO_MIN_CONF && AGGRO_COINS.includes(coin) && (AGGRO_BULL_SHORTS || !(best.side === "Short" && regime === "bull")),
               logged: new Date().toISOString() });
           }
           // resolve this coin/timeframe's open shadow setups with the bars we already have

@@ -1,4 +1,4 @@
-# Two-Speed bot (v25.0)
+# Two-Speed bot (v25.5)
 
 Crypto trading bot on Railway, executing on the BingX demo (VST) account. Clean build: only the two new strategies + safety.
 (Repo/service are still named `provex-webhook` so the deploy doesn't break.)
@@ -26,8 +26,9 @@ Each setup's **confluence score** = how many agree on the direction. Aggro trade
 Every setup on 1H and 4H (score 1+, traded or not) for all Aggro + Core coins is logged and tracked with Aggro's exits.
 `/shadow` shows win rate and average R by score, by strategy and by trigger — used at each review to tune the settings.
 
-**No shorts in a bull market.** Bull market = BTC's 28-day return > 0. While that's true, neither strategy opens a short.
-Core shorts only exist if `CORE_SHORTS=on` **and** the market is bearish.
+**Aggro trades both directions.** Each coin's own setup decides long or short; BTC doesn't block anything (v25.5).
+`AGGRO_BULL_SHORTS=off` brings back the old rule (no Aggro shorts while BTC's 28-day return > 0).
+**Core** is a long holder: its shorts only exist if `CORE_SHORTS=on` **and** BTC's 28-day return is negative.
 
 ## Two accounts (hold + hunt on the same coin)
 Set `AGGRO_BINGX_API_KEY` + `AGGRO_BINGX_API_SECRET` (a BingX sub-account) and Aggro trades on its own account.
@@ -62,13 +63,13 @@ Every setup the 10 strategies find (score 1+, on 1H and 4H, all Core + Aggro coi
 | `SHADOW_COINS` | Aggro + Core coins | Coins the shadow log watches |
 | `AGGRO_BUDGET` / `AGGRO_RISK` / `AGGRO_LEVERAGE` | `20000` / `0.5` / `40` | Budget (shared mode) / risk per trade (max 0.5) / max leverage (max 50) |
 | `AGGRO_BINGX_API_KEY` / `AGGRO_BINGX_API_SECRET` | — | Aggro's own sub-account keys |
-| `AGGRO_TF` | `4h` | Aggro's timeframe (`4h` or `1h`) |
-| `AGGRO_MIN_SCORE` | `4` | How many strategies must agree to trade |
-| `AGGRO_STRATEGIES` | all 10 | Strategy menu: `sr,zone,structure,retest,reversal,trendline,fib,consolidation,volume,crt` |
+| `AGGRO_BULL_SHORTS` | `on` | `on` = Aggro shorts allowed whatever BTC does; `off` = no Aggro shorts in a bull market |
+| `AGGRO_USE_EQUITY` | `off` | `on` = size from the account's real equity (live service) |
+| `BINGX_BASE_URL` / `BOT_LABEL` | demo / — | Live service only: `https://open-api.bingx.com` and a Telegram prefix |
 | `CORE_TRAIL` | `on` | Core's swing-low key-level exit |
 
 ## Pages
-`/` status · `/core` Core equity & positions · `/aggro` Aggro balance, open trades, history · `/shadow` every setup + results · `/shadow` every setup the 10 strategies found and how it did
+`/` status · `/core` Core equity & positions · `/aggro` Aggro balance, open trades, history · `/shadow` every setup the 10 strategies found and how it did
 
 ## Removed in v23
 The v19 order-block system and TradingView pipeline, Claude explanations, paper resolvers, weekly challenge report, signal backups, funding watch and kill switch. Research behind every decision stays in `research/`; old code is in git history.
