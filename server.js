@@ -26,7 +26,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = process.env.BINGX_BASE_URL || "https://open-api-vst.bingx.com";   // VST demo by default
 const IS_LIVE = !BINGX_BASE_URL.includes("vst");
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v25.5";
+const SERVER_VERSION = "v25.6";
 
 // v25.1 — one codebase, two deployments. The demo service keeps the defaults.
 // A second Railway service runs the REAL-money "Aggro only" copy with:
@@ -920,7 +920,17 @@ async function agEnter(a, symbol, sig, pos) {
   const cap = (available || 0) * MAX_MARGIN_FRACTION * lev;
   if (notional > cap) notional = cap;
   let qty = Number((notional / px).toFixed(prec));
-  if (!(qty > 0)) return;
+  if (!(qty > 0)) {
+    // v25.6: no free margin (e.g. a manual trade on the same account is using it). Tell Krysie once per setup
+    // and keep the setup alive, so the bot takes it on a later scan if margin frees up while it's still valid.
+    console.log(`Aggro: ${symbol} ${side} skipped, free margin ${available} too small`);
+    a.marginAlertT = a.marginAlertT || {};
+    if (a.marginAlertT[symbol] !== sig.t) {
+      a.marginAlertT[symbol] = sig.t; writeAggro(a);
+      await sendTelegram(`⏸️ <b>Aggro setup skipped: no free margin</b>\n${coin}USDT ${side} │ ${sig.tf.toUpperCase()} │ ${sig.score}/${AGGRO_STRATS.length} strategies agree\nFree margin on the account: ${(+available || 0).toFixed(2)} USDT. Other open positions are using it.\nThe bot keeps checking and enters if margin frees up while the setup is still valid.`);
+    }
+    return "nomargin";
+  }
   await bingxRequest("POST", "/openApi/swap/v2/trade/leverage", { symbol, side: leg, leverage: lev }, AG_ACCT);
   let e = await agOrder({ symbol, side: side === "Long" ? "BUY" : "SELL", positionSide: leg, type: "MARKET", quantity: qty });
   // v25.5: BingX caps position size per leverage tier (e.g. 200k USDT at 40x). The demo's 20k budget at 50% risk
@@ -1042,7 +1052,8 @@ async function aggroTick() {
         const { best } = await cfScan(symbol, AGGRO_TF, AGGRO_STRATS);
         if (!best || best.score < AGGRO_MIN_CONF || a.lastEntryT[symbol] === best.t) continue;
         a.lastEntryT[symbol] = best.t; writeAggro(a);
-        await agEnter(a, symbol, { ...best, tf: AGGRO_TF }, pos);
+        const res = await agEnter(a, symbol, { ...best, tf: AGGRO_TF }, pos);
+        if (res === "nomargin") { delete a.lastEntryT[symbol]; writeAggro(a); }   // v25.6: retry this setup next scan
       } catch (err) { console.error(`Aggro scan ${symbol} failed (non-fatal):`, err.message); }
       await new Promise(r => setTimeout(r, 200));
     }
