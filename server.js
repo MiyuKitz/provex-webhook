@@ -26,7 +26,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = process.env.BINGX_BASE_URL || "https://open-api-vst.bingx.com";   // VST demo by default
 const IS_LIVE = !BINGX_BASE_URL.includes("vst");
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v25.6";
+const SERVER_VERSION = "v25.7";
 
 // v25.1 — one codebase, two deployments. The demo service keeps the defaults.
 // A second Railway service runs the REAL-money "Aggro only" copy with:
@@ -147,16 +147,16 @@ const MAX_MARGIN_FRACTION = 0.5;    // never commit more than half of free margi
 let equityCache = { equity: null, available: null, at: 0 };
 const EQUITY_TTL_MS = 60000;
 const equityCaches = {};
-async function getAccountEquity(acct = "main") {
+async function getAccountEquity(acct = "main", fresh = false) {
   const equityCache = equityCaches[acct] || { equity: null, available: null, at: 0 };
-  if (equityCache.equity && Date.now() - equityCache.at < EQUITY_TTL_MS) return equityCache;
+  if (!fresh && equityCache.equity && Date.now() - equityCache.at < EQUITY_TTL_MS) return equityCache;
   try {
     const res = await bingxRequest("GET", "/openApi/swap/v2/user/balance", {}, acct);
     const b = res?.data?.balance ?? res?.data;
     const equity = parseFloat(b?.equity ?? b?.balance);
     const available = parseFloat(b?.availableMargin ?? b?.balance ?? equity);
     if (equity > 0) {
-      equityCaches[acct] = { equity, available: available > 0 ? available : equity, at: Date.now() };
+      equityCaches[acct] = { equity, available: available >= 0 ? available : equity, at: Date.now() };   // v25.7: 0 free margin means 0, not "all of it"
       return equityCaches[acct];
     }
     console.error("Equity lookup returned no usable figure:", JSON.stringify(res).slice(0, 200));
@@ -985,7 +985,11 @@ async function agManage(a, pos) {
         const runnerR = sgn * (t.stop - t.entry) / t.R;
         const R = +((t.part ? 0.4 * 1 + 0.6 * runnerR : runnerR) - 0.001 / t.d).toFixed(3);
         const pnl = t.riskVST * R;
-        a.balance = +(a.balance + pnl).toFixed(2); a.trades += 1; if (R > 0) a.wins += 1;
+        // v25.7: on a real/own account the balance IS the account equity, which already includes this loss/profit.
+        // Adding pnl on top double-counted it (live card said 27 USDT when the account had 33.78).
+        if (AGGRO_SEPARATE || AGGRO_USE_EQUITY) { const { equity } = await getAccountEquity(AG_ACCT, true); if (equity) a.balance = +equity.toFixed(2); }
+        else a.balance = +(a.balance + pnl).toFixed(2);
+        a.trades += 1; if (R > 0) a.wins += 1;
         a.peak = Math.max(a.peak, a.balance); if (a.balance < a.start * 0.1) a.busted = true;
         // ♻️ RECYCLE: each time Aggro doubles, half its profit is banked for Core.
         if (a.balance >= a.start * 2) {
