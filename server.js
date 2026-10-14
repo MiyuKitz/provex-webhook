@@ -26,7 +26,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = process.env.BINGX_BASE_URL || "https://open-api-vst.bingx.com";   // VST demo by default
 const IS_LIVE = !BINGX_BASE_URL.includes("vst");
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v25.7";
+const SERVER_VERSION = "v25.8";
 
 // v25.1 — one codebase, two deployments. The demo service keeps the defaults.
 // A second Railway service runs the REAL-money "Aggro only" copy with:
@@ -1155,6 +1155,7 @@ const server = http.createServer(async (req, res) => {
       shadow: { coins: SHADOW_COINS, timeframes: ["1h", "4h"] } });
   }
   if (req.method === "GET" && pathname === "/shadow") return json(shadowSummary());
+  if (req.method === "GET" && pathname === "/shadow/all") { const sh = readShadow(); return json({ since: sh.since, closed: sh.closed, open: sh.open }); }   // v25.8: full list for reviews
   if (req.method === "GET" && pathname === "/core") {
     const log = readCoreLog();
     return json({ strategy: "28d trend filter, 40% vol target, daily", state: readCoreState(), days: log.length, log: log.slice(-60) });
