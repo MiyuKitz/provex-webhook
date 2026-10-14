@@ -26,7 +26,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = process.env.BINGX_BASE_URL || "https://open-api-vst.bingx.com";   // VST demo by default
 const IS_LIVE = !BINGX_BASE_URL.includes("vst");
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v25.8";
+const SERVER_VERSION = "v26.0";
 
 // v25.1 — one codebase, two deployments. The demo service keeps the defaults.
 // A second Railway service runs the REAL-money "Aggro only" copy with:
@@ -793,7 +793,11 @@ class ConfEngine {
     out.volume = vv;
     // 10 CRT
     let cr = null; const hr = nyHour(x.t + 3600000);
-    if ((hr === 13 || hr === 5) && i >= 8) {
+    if (this.tf === "4h") {   // v26: on 4H bars, the NY-morning candle sweeps the prior candle's low (L) / NY-midnight sweeps its high (S)
+      const h0 = nyHour(x.t), p = b[i - 1];
+      if ((h0 === 8 || h0 === 9) && x.l < p.l && p.l < x.c && x.c < p.h) { cr = "L"; trig.push(["crt", "L", x.l]); }
+      if ((h0 === 0 || h0 === 1) && x.h > p.h && p.l < x.c && x.c < p.h) { cr = "S"; trig.push(["crt", "S", x.h]); }
+    } else if ((hr === 13 || hr === 5) && i >= 8) {
       const c2 = b.slice(i - 3, i + 1), c1 = b.slice(i - 7, i - 3);
       const h1 = Math.max(...c1.map(z => z.h)), l1 = Math.min(...c1.map(z => z.l)), h2 = Math.max(...c2.map(z => z.h)), l2 = Math.min(...c2.map(z => z.l)), cl = c2[3].c;
       if (hr === 13 && l2 < l1 && l1 < cl && cl < h1) { cr = "L"; trig.push(["crt", "L", l2]); }
@@ -805,18 +809,21 @@ class ConfEngine {
   }
 }
 // Pick the best setup on bar i: direction with triggers, tightest valid stop, highest score.
-function cfBest(eng, i, trend, allowShort, dMin, dMax, strats = CF_NAMES) {
+function cfBest(eng, i, trend, allow, dMin, dMax, strats = CF_NAMES, floor = 0) {
+  if (typeof allow === "boolean") allow = { L: true, S: allow };
   const r = eng.signals(i, trend), out = r.out, trig = r.trig.filter(t => strats.includes(t[0]));
   if (!trig.length) return null;
   const x = eng.b[i]; let best = null;
   for (const d of ["L", "S"]) {
-    if (d === "S" && !allowShort) continue;
+    if (!allow[d]) continue;
     const tg = trig.filter(t => t[1] === d); if (!tg.length) continue;
     const score = strats.filter(n => out[n] === d).length;
     const entry = x.c;
-    const stops = tg.map(t => t[2] * (d === "L" ? 0.999 : 1.001)).filter(s => { const dd = Math.abs(entry - s) / entry; return dd >= dMin && dd <= dMax && (d === "L" ? s < entry : s > entry); });
+    const stops = tg.map(t => t[2] * (d === "L" ? 0.999 : 1.001)).filter(s => d === "L" ? s < entry : s > entry);
     if (!stops.length) continue;
-    const stop = d === "L" ? Math.max(...stops) : Math.min(...stops);
+    let stop = d === "L" ? Math.max(...stops) : Math.min(...stops);
+    if (Math.abs(entry - stop) / entry < floor) stop = d === "L" ? entry * (1 - floor) : entry * (1 + floor);   // v26: min stop distance
+    const dd = Math.abs(entry - stop) / entry; if (dd < dMin || dd > dMax) continue;
     if (!best || score > best.score) best = { side: d === "L" ? "Long" : "Short", d, score, stop, entry, triggers: [...new Set(tg.map(t => t[0]))], agree: strats.filter(n => out[n] === d), withTrend: out.trend4h === d, t: x.t };
   }
   return best;
@@ -845,6 +852,25 @@ const AGGRO_TF = (process.env.AGGRO_TF || "4h") === "1h" ? "1h" : "4h";         
 // v25.5: Aggro trades both directions on each coin's own setups. BTC's trend no longer blocks shorts
 // (shadow log Oct 6-14: the bull-market shorts it blocked were +0.05R avg, the longs it allowed -0.40R).
 const AGGRO_BULL_SHORTS = (process.env.AGGRO_BULL_SHORTS || "on") === "on";
+// v26 (3-year test on 13 coins, see research/aggro_v26_test.py): score 4+, trade only with the coin's OWN 28-day trend,
+// stop at least 1.5% away, no TP1: at +2R the stop locks +1R, then trails under 4H swings (max 20 days).
+const AGGRO_DIR = (process.env.AGGRO_DIR || "coin28").toLowerCase();        // coin28 | btc28 | none
+const AGGRO_MIN_STOP = Math.max(0, Math.min(0.05, Number(process.env.AGGRO_MIN_STOP ?? 0.015)));
+const AGGRO_EXIT = (process.env.AGGRO_EXIT || "trail2").toLowerCase();       // trail2 | tp1 (old: 40% at 1R, then breakeven)
+const AGGRO_MAX_DAYS = Number(process.env.AGGRO_MAX_DAYS || 20);
+const coinTrendCache = {};
+async function coinTrend28(symbol) {   // the coin's own 28-day return from closed daily candles
+  const c = coinTrendCache[symbol];
+  if (c && Date.now() - c.at < 3600000) return c.v;
+  const d = await agKlines(symbol, "1d", 40);
+  const v = d.length > 29 ? d[d.length - 1].c / d[d.length - 29].c - 1 : null;
+  coinTrendCache[symbol] = { v, at: Date.now() }; return v;
+}
+async function aggroAllow(symbol) {   // which directions Aggro may trade on this coin right now
+  if (AGGRO_DIR === "coin28") { const r = await coinTrend28(symbol); return r == null ? { L: false, S: false, r } : { L: r > 0, S: r < 0, r }; }
+  if (AGGRO_DIR === "btc28") { const bull = (await marketRegime()) === "bull"; return { L: true, S: !bull || AGGRO_BULL_SHORTS }; }
+  return { L: true, S: true };
+}
 const AGGRO_MIN_CONF = Math.max(1, Math.min(10, Number(process.env.AGGRO_MIN_CONF || 4)));   // min strategies agreeing to trade
 const AGGRO_STRATS = (process.env.AGGRO_STRATS || CF_NAMES.join(",")).split(",").map(x => x.trim()).filter(x => CF_NAMES.includes(x));   // strategy menu
 const TF_STOP = { "1h": [0.003, 0.05], "4h": [0.005, 0.10] };
@@ -855,7 +881,7 @@ async function agKlines(symbol, interval, limit) {
   const r = await fetch(`https://open-api.bingx.com/openApi/swap/v3/quote/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
   const j = await r.json();
   if (!Array.isArray(j.data)) throw new Error(`no ${interval} klines for ${symbol}`);
-  const ms = interval === "4h" ? 4 * 3600000 : 3600000, now = Date.now();
+  const ms = { "1h": 3600000, "4h": 4 * 3600000, "1d": 86400000 }[interval] || 3600000, now = Date.now();
   return j.data.map(k => ({ t: +k.time, o: +k.open, h: +k.high, l: +k.low, c: +k.close, v: +k.volume }))
     .filter(k => k.t + ms <= now).sort((a, b) => a.t - b.t);   // closed bars only
 }
@@ -896,18 +922,22 @@ async function cfScan(symbol, tf, strats = CF_NAMES, shadow = false) {
   const b = await agKlines(symbol, tf, 300);
   let trend = null;
   if (tf === "1h") { const b4 = await agKlines(symbol, "4h", 120); const tr = agTrend4h(b4); const key = Math.floor((b[b.length - 1].t + 3600000) / 14400000) * 14400000; trend = tr.get(key) ?? [...tr.values()].pop(); }
-  const eng = new ConfEngine(b);
+  else trend = [...agTrend4h(b).values()].pop();   // v26: the 4H trend was never computed on 4H (box always unticked)
+  const eng = new ConfEngine(b); eng.tf = tf;
   for (let i = 30; i < b.length - 1; i++) { eng.update(i); eng.signals(i, trend); }   // warm up state (zones, armed retests)
   const i = b.length - 1; eng.update(i);
   const [dMin, dMax] = TF_STOP[tf];
-  const best = cfBest(eng, i, trend, shadow || AGGRO_BULL_SHORTS || (await marketRegime()) !== "bull", dMin, dMax, strats);
+  const allow = shadow ? { L: true, S: true } : await aggroAllow(symbol);
+  const best = cfBest(eng, i, trend, allow, dMin, dMax, strats, tf === "4h" ? AGGRO_MIN_STOP : 0);
   return { best, bars: b };
 }
 
 async function agEnter(a, symbol, sig, pos) {
   const coin = symbol.replace("-USDT", ""), side = sig.side, leg = side === "Long" ? "LONG" : "SHORT";
-  if (side === "Short" && !AGGRO_BULL_SHORTS && (await marketRegime()) === "bull") { console.log(`Aggro: ${symbol} short skipped, bull market (BTC 28d trend up)`); return; }
+  const allow = await aggroAllow(symbol);
+  if (!allow[sig.d || (side === "Long" ? "L" : "S")]) { console.log(`Aggro: ${symbol} ${side} skipped, against the coin's 28-day trend`); return; }
   const px = await lastPrice(coin); if (!px) return;
+  if ((sig.tf || "1h") === "4h" && Math.abs(px - sig.stop) / px < AGGRO_MIN_STOP) sig = { ...sig, stop: side === "Long" ? px * (1 - AGGRO_MIN_STOP) : px * (1 + AGGRO_MIN_STOP) };
   const d = Math.abs(px - sig.stop) / px;
   const [dMin, dMax] = TF_STOP[sig.tf || "1h"];
   if (d < dMin || d > dMax || (side === "Long" ? sig.stop >= px : sig.stop <= px)) { console.log(`Aggro: ${symbol} ${side} skipped, stop distance ${(d * 100).toFixed(2)}%`); return; }
@@ -948,10 +978,11 @@ async function agEnter(a, symbol, sig, pos) {
   const filled = Number(e.filled.toFixed(prec)), R = Math.abs(px - sig.stop), sgn = side === "Long" ? 1 : -1;
   const exitSide = side === "Long" ? "SELL" : "BUY";
   const stop = await agOrder({ symbol, side: exitSide, positionSide: leg, type: "STOP_MARKET", quantity: filled, stopPrice: +sig.stop.toPrecision(6), workingType: "MARK_PRICE" });
-  const tp1Qty = Number((filled * 0.4).toFixed(prec)), tp1 = px + sgn * R;
+  const trail2 = AGGRO_EXIT === "trail2";
+  const tp1Qty = trail2 ? 0 : Number((filled * 0.4).toFixed(prec)), tp1 = px + sgn * R;
   const tp = tp1Qty > 0 ? await agOrder({ symbol, side: exitSide, positionSide: leg, type: "TAKE_PROFIT_MARKET", quantity: tp1Qty, stopPrice: +tp1.toPrecision(6), workingType: "MARK_PRICE" }) : { ok: false };
   const t = { symbol, side, leg, entry: px, stop: sig.stop, R, qty: filled, tp1, tp1Qty, stopId: stop.ok ? stop.id : null, tp1Id: tp.ok ? tp.id : null,
-              part: false, riskVST: +(filled * R).toFixed(2), lev, d, openedAt: Date.now(), signalT: sig.t, tf: sig.tf || "1h", score: sig.score, agree: sig.agree };
+              part: false, exit: trail2 ? "trail2" : "tp1", trail: false, riskVST: +(filled * R).toFixed(2), lev, d, openedAt: Date.now(), signalT: sig.t, tf: sig.tf || "1h", score: sig.score, agree: sig.agree };
   a.open = a.open || []; a.open.push(t); writeAggro(a);
   const tfU = (sig.tf || "1h").toUpperCase();
   await sendTelegram(`📊 <b>Trade Setup 🎰 AGGRO</b> (demo)
@@ -961,16 +992,18 @@ async function agEnter(a, symbol, sig, pos) {
 
 <b>Entry:</b> $${agFmt(px)}
 <b>Stop loss:</b> $${agFmt(sig.stop)} (${(d * 100).toFixed(2)}% away, beyond the trigger candle / zone)
-<b>TP1:</b> $${agFmt(tp1)} (1R, closes 40%, then stop → breakeven)
-<b>Runner:</b> 60% trails under each new ${tfU} swing ${side === "Long" ? "low" : "high"}, no fixed TP
+${trail2 ? `<b>Lock-in:</b> at +2R ($${agFmt(px + sgn * 2 * R)}) the stop jumps to +1R ($${agFmt(px + sgn * R)})
+<b>Then:</b> stop trails under each new ${tfU} swing ${side === "Long" ? "low" : "high"}, no fixed TP (max ${AGGRO_MAX_DAYS} days)
+<b>Coin's 28-day trend:</b> ${allow.r != null ? (allow.r * 100).toFixed(1) + "%" : "n/a"} → ${side === "Long" ? "longs" : "shorts"} only` : `<b>TP1:</b> $${agFmt(tp1)} (1R, closes 40%, then stop → breakeven)
+<b>Runner:</b> 60% trails under each new ${tfU} swing ${side === "Long" ? "low" : "high"}, no fixed TP`}
 
 <b>Checklist:</b>
 ${AGGRO_STRATS.map(n => `${sig.agree.includes(n) ? "✅" : "▫️"} ${CF_LABEL[n]}${sig.triggers.includes(n) ? " ← trigger" : ""}`).join("\n")}
 ${sig.withTrend ? "✅" : "▫️"} With the 4H trend
 
 <b>Size:</b> ${filled} ${coin} (≈ ${agFmt(+(filled * px).toFixed(0))} VST) │ risk ≈ ${agFmt(+(filled * R).toFixed(0))} VST
-<b>Aggro balance:</b> ${agFmt(+a.balance.toFixed(0))} VST │ ${(AGGRO_RISK * 100).toFixed(0)}% at risk per trade
-${stop.ok ? "✅ Stop placed" : "❌ Stop NOT placed, check BingX"} │ ${tp.ok ? "✅ TP1 placed" : "❌ TP1 not placed"}`);
+<b>Aggro balance:</b> ${agFmt(+a.balance.toFixed(0))} VST │ ${+(AGGRO_RISK * 100).toFixed(2)}% at risk per trade
+${stop.ok ? "✅ Stop placed" : "❌ Stop NOT placed, check BingX"}${trail2 ? "" : ` │ ${tp.ok ? "✅ TP1 placed" : "❌ TP1 not placed"}`}`);
 }
 
 
@@ -1007,9 +1040,40 @@ async function agManage(a, pos) {
             await sendTelegram(`♻️ <b>Profit banked for Core</b>\nAggro doubled, so ${bank.toFixed(0)} VST of its profit is locked away from 40x and handed to Core (same account, Core sizes from total equity).\nAggro now trades from ${a.balance.toFixed(0)} VST │ banked so far: ${a.banked.toFixed(0)} VST`);
           }
         }
-        (a.history = a.history || []).push({ symbol: t.symbol, side: t.side, R, pnl: +pnl.toFixed(2), closedAt: new Date().toISOString() });
-        await sendTelegram(`🎰 <b>Aggro v2 trade closed</b> (demo)\n${t.symbol} ${t.side} ${t.lev}x: ≈ ${R > 0 ? "+" : ""}${R}R = ${pnl > 0 ? "+" : ""}${pnl.toFixed(0)} VST${t.part ? " (TP1 hit, runner stopped)" : ""}\nAggro balance: ${a.balance.toFixed(0)} VST (${((a.balance / a.start - 1) * 100).toFixed(0)}% from start) │ ${a.wins}W / ${a.trades - a.wins}L${a.busted ? "\n💀 Below 10% of the starting budget, Aggro has stopped." : ""}`);
+        (a.history = a.history || []).push({ symbol: t.symbol, side: t.side, R, pnl: +pnl.toFixed(2), exit: t.exit || "tp1", closedAt: new Date().toISOString() });
+        await sendTelegram(`🎰 <b>Aggro v2 trade closed</b> (demo)\n${t.symbol} ${t.side} ${t.lev}x: ≈ ${R > 0 ? "+" : ""}${R}R = ${pnl > 0 ? "+" : ""}${pnl.toFixed(0)} VST${t.part ? " (TP1 hit, runner stopped)" : t.trail ? " (locked +1R, then trailed)" : ""}\nAggro balance: ${a.balance.toFixed(0)} VST (${((a.balance / a.start - 1) * 100).toFixed(0)}% from start) │ ${a.wins}W / ${a.trades - a.wins}L${a.busted ? "\n💀 Below 10% of the starting budget, Aggro has stopped." : ""}`);
         continue;
+      }
+      if (t.exit === "trail2") {   // v26 exit: at +2R lock +1R, then trail under 4H swings; time exit after AGGRO_MAX_DAYS
+        const tfms = (t.tf || "4h") === "4h" ? 14400000 : 3600000, coin = t.symbol.replace("-USDT", "");
+        const exitSide = t.side === "Long" ? "SELL" : "BUY";
+        const b = await agKlines(t.symbol, t.tf || "4h", 60), { H, L } = agPivots(b);
+        const after = b.filter(x => x.t + tfms > t.openedAt);
+        let best = t.stop, lock = false;
+        if (!t.trail && after.length) {
+          const fav = sgn > 0 ? Math.max(...after.map(x => x.h)) : Math.min(...after.map(x => x.l));
+          if (sgn * (fav - t.entry) >= 2 * t.R) { t.trail = true; lock = true; best = t.entry + sgn * t.R; }
+        }
+        if (t.trail) for (let k = 0; k < b.length; k++) {
+          if (b[k].t + tfms <= t.openedAt) continue;
+          if (sgn > 0 && L[k] && b[k].l * 0.999 > best) best = b[k].l * 0.999;
+          if (sgn < 0 && H[k] && b[k].h * 1.001 < best) best = b[k].h * 1.001;
+        }
+        const px = await lastPrice(coin);
+        const timeUp = Date.now() - t.openedAt > AGGRO_MAX_DAYS * 86400000;
+        if (px && (timeUp || (best !== t.stop && (sgn > 0 ? px <= best : px >= best)))) {   // time's up, or price already through the new stop
+          await agCancel(t.symbol, t.stopId);
+          const c = await agOrder({ symbol: t.symbol, side: exitSide, positionSide: t.leg, type: "MARKET", quantity: now });
+          if (c.ok) { t.stop = px; t.stopId = null; console.log(`Aggro v26: ${t.symbol} ${t.side} closed at market (${timeUp ? "time exit" : "locked level already passed"})`); }
+        } else if (best !== t.stop) {
+          await agCancel(t.symbol, t.stopId);
+          const st = await agOrder({ symbol: t.symbol, side: exitSide, positionSide: t.leg, type: "STOP_MARKET", quantity: now, stopPrice: +best.toPrecision(6), workingType: "MARK_PRICE" });
+          t.stopId = st.ok ? st.id : null; t.stop = best;
+          if (!st.ok) await sendTelegram(`🚨 <b>Aggro stop move failed</b> ${t.symbol} ${t.side}: ${JSON.stringify(st.r).slice(0, 150)}\nCheck BingX, the watchdog will flag it if there is no stop.`);
+          if (lock) await sendTelegram(`🔒 <b>Aggro +2R reached</b> ${t.symbol} ${t.side}: stop moved to +1R ($${agFmt(best)}). Profit locked, now trailing under each 4H swing.`);
+          else console.log(`Aggro v26: ${t.symbol} ${t.side} stop trailed to ${best}`);
+        }
+        still.push(t); continue;
       }
       if (!t.part && now <= t.qty * 0.65) {   // TP1 filled -> stop to breakeven on the runner
         t.part = true; await agCancel(t.symbol, t.stopId);
@@ -1041,6 +1105,13 @@ async function aggroTick() {
   if (!AGGRO || !BINGX_API_KEY || !BINGX_API_SECRET) return;
   try {
     const a = readAggro(); a.lastEntryT = a.lastEntryT || {};
+    const RESET = process.env.AGGRO_RESET || "";   // v26: new tag = fresh scoreboard (old one archived, open trades kept)
+    if (RESET && a.resetTag !== RESET && !AGGRO_USE_EQUITY) {
+      (a.archive = a.archive || []).push({ tag: a.resetTag || "v25", start: a.start, balance: a.balance, trades: a.trades, wins: a.wins, history: a.history, until: new Date().toISOString() });
+      Object.assign(a, { resetTag: RESET, start: AGGRO_BUDGET, balance: AGGRO_BUDGET, peak: AGGRO_BUDGET, trades: 0, wins: 0, history: [], busted: false, lastEntryT: {}, startedAt: new Date().toISOString() });
+      writeAggro(a);
+      await sendTelegram(`🆕 <b>Aggro ${RESET} started</b> (demo)\nFresh ${AGGRO_BUDGET} VST scoreboard. Rules: score ${AGGRO_MIN_CONF}+, only with each coin's own 28-day trend, stop ≥ ${(AGGRO_MIN_STOP * 100).toFixed(1)}%, lock +1R at +2R then trail, ${+(AGGRO_RISK * 100).toFixed(2)}% risk per trade.\nCoins: ${AGGRO_COINS.join(", ")}`);
+    }
     if (AGGRO_USE_EQUITY) {   // live: the scoreboard follows the real account
       const { equity } = await getAccountEquity(AG_ACCT);
       if (equity) { if (!a.equityStart) { a.equityStart = true; a.start = equity; a.peak = equity; } a.balance = equity; a.peak = Math.max(a.peak, equity); }
@@ -1076,7 +1147,7 @@ async function aggroTick() {
 const SHADOW_FILE = path.join(DATA_DIR, "shadow.json");
 const SHADOW_COINS = (process.env.SHADOW_COINS || [...new Set([...AGGRO_COINS, ...CORE_ASSETS.map(s => s.replace("-USDT", ""))])].join(","))
   .split(",").map(c => c.trim().toUpperCase()).filter(Boolean);
-const SHADOW_MAX_BARS = { "1h": 240, "4h": 180 };
+const SHADOW_MAX_BARS = { "1h": 240, "4h": 120 };   // v26: 4H = 20 days, same as the live time exit
 function readShadow() { try { return JSON.parse(fs.readFileSync(SHADOW_FILE, "utf8")); } catch { return { open: [], closed: [], since: new Date().toISOString() }; } }
 function writeShadow(sh) { fs.writeFileSync(SHADOW_FILE, JSON.stringify(sh)); }
 
@@ -1086,6 +1157,21 @@ function shadowWalk(t, b) {
   if (i0 < 0) return { R: null, note: "entry bar no longer in the window" };
   const { H, L } = agPivots(b), long = t.side === "Long", sg = long ? 1 : -1, R = Math.abs(t.entry - t.stop);
   let s = t.stop, part = false, got = 0, j = i0;
+  if (t.exit === "trail2") {   // v26 exit
+    let trail = false;
+    for (j = i0 + 1; j < b.length && j <= i0 + SHADOW_MAX_BARS[t.tf]; j++) {
+      const y = b[j], hit = long ? y.l <= s : y.h >= s;
+      if (hit) return { R: +(sg * (s - t.entry) / R - 0.0015 / t.d).toFixed(3) };
+      if (!trail && sg * ((long ? y.h : y.l) - t.entry) >= 2 * R) { trail = true; s = t.entry + sg * R; }
+      const kk = j - AG_PIV;
+      if (trail && kk > i0) {
+        if (long && L[kk] && b[kk].l * 0.999 > s) s = b[kk].l * 0.999;
+        if (!long && H[kk] && b[kk].h * 1.001 < s) s = b[kk].h * 1.001;
+      }
+    }
+    if (j > i0 + SHADOW_MAX_BARS[t.tf]) return { R: +(sg * (b[i0 + SHADOW_MAX_BARS[t.tf]].c - t.entry) / R - 0.0015 / t.d).toFixed(3), note: "time exit" };
+    return null;
+  }
   for (j = i0 + 1; j < b.length && j <= i0 + SHADOW_MAX_BARS[t.tf]; j++) {
     const y = b[j], hit = long ? y.l <= s : y.h >= s, tp1 = t.entry + sg * R;
     if (!part && !hit && (long ? y.h >= tp1 : y.l <= tp1)) { part = true; got += 0.4; s = t.entry; }
@@ -1112,7 +1198,8 @@ async function shadowTick() {
             const d = Math.abs(best.entry - best.stop) / best.entry;
             sh.open.push({ symbol, tf, t: best.t, side: best.side, score: best.score, agree: best.agree, triggers: best.triggers, withTrend: best.withTrend,
               entry: best.entry, stop: best.stop, d: +d.toFixed(5), regime, bullShortBlocked: best.side === "Short" && regime === "bull",
-              aggroWouldTrade: tf === AGGRO_TF && best.score >= AGGRO_MIN_CONF && AGGRO_COINS.includes(coin) && (AGGRO_BULL_SHORTS || !(best.side === "Short" && regime === "bull")),
+              exit: tf === "4h" ? "trail2" : undefined, coin28: (await coinTrend28(symbol).catch(() => null)),
+              aggroWouldTrade: tf === AGGRO_TF && best.score >= AGGRO_MIN_CONF && AGGRO_COINS.includes(coin) && !!(await aggroAllow(symbol).catch(() => ({})))[best.d],
               logged: new Date().toISOString() });
           }
           // resolve this coin/timeframe's open shadow setups with the bars we already have

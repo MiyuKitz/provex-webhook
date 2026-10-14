@@ -109,14 +109,13 @@ class Engine:
         elif x['v']>3*av and (min(x['o'],x['c'])-x['l'])>0.6*(x['h']-x['l']): vv='L'
         elif x['v']>3*av and (x['h']-max(x['o'],x['c']))>0.6*(x['h']-x['l']): vv='S'
         out['volume']=vv
-        # 10 CRT (NY): this bar closes the 09:00 4H candle that swept the 05:00 candle's low & closed inside (L); 01:00 vs 21:00 (S)
+        # 10 CRT on 4H bars: NY-morning candle sweeps the prior 4H candle's low and closes back inside (L);
+        # NY-midnight candle sweeps the prior candle's high and closes back inside (S)
         cr=None
-        d=datetime.fromtimestamp((x['t']+3600000)/1000,timezone.utc).astimezone(NY)
-        if d.hour in (13,5) and i>=8:
-            c2=b[i-3:i+1]; c1=b[i-7:i-3]
-            h1,l1=max(z['h'] for z in c1),min(z['l'] for z in c1); h2,l2=max(z['h'] for z in c2),min(z['l'] for z in c2); cl=c2[-1]['c']
-            if d.hour==13 and l2<l1 and l1<cl<h1: cr='L'; trig.append(('crt','L',l2))
-            if d.hour==5 and h2>h1 and l1<cl<h1: cr='S'; trig.append(('crt','S',h2))
+        h0=datetime.fromtimestamp(x['t']/1000,timezone.utc).astimezone(NY).hour
+        p=b[i-1]
+        if h0 in (8,9) and x['l']<p['l'] and p['l']<x['c']<p['h']: cr='L'; trig.append(('crt','L',x['l']))
+        if h0 in (0,1) and x['h']>p['h'] and p['l']<x['c']<p['h']: cr='S'; trig.append(('crt','S',x['h']))
         out['crt']=cr
         out['trend4h']='L' if trend4h=='up' else 'S' if trend4h=='down' else None
         return out,trig
