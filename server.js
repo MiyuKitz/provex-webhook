@@ -26,7 +26,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = process.env.BINGX_BASE_URL || "https://open-api-vst.bingx.com";   // VST demo by default
 const IS_LIVE = !BINGX_BASE_URL.includes("vst");
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v26.0";
+const SERVER_VERSION = "v26.1";
 
 // v25.1 — one codebase, two deployments. The demo service keeps the defaults.
 // A second Railway service runs the REAL-money "Aggro only" copy with:
@@ -877,13 +877,33 @@ const TF_STOP = { "1h": [0.003, 0.05], "4h": [0.005, 0.10] };
 const AGGRO_COINS = (process.env.AGGRO_COINS || "ZRO,XRP,LINK,AVAX,ADA,OP").split(",").map(c => c.trim().toUpperCase()).filter(Boolean);
 const AG_PIV = 3;
 
+// v26.1: candles are cached until the next bar closes (a 4H candle can't change before then) and every
+// download retries up to 3 times. Before this, ~40 calls every 5 min hit BingX's limits and scans failed
+// right after each 4H close, which is exactly when setups appear.
+const klineCache = new Map();
 async function agKlines(symbol, interval, limit) {
-  const r = await fetch(`https://open-api.bingx.com/openApi/swap/v3/quote/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
-  const j = await r.json();
-  if (!Array.isArray(j.data)) throw new Error(`no ${interval} klines for ${symbol}`);
-  const ms = { "1h": 3600000, "4h": 4 * 3600000, "1d": 86400000 }[interval] || 3600000, now = Date.now();
-  return j.data.map(k => ({ t: +k.time, o: +k.open, h: +k.high, l: +k.low, c: +k.close, v: +k.volume }))
-    .filter(k => k.t + ms <= now).sort((a, b) => a.t - b.t);   // closed bars only
+  const ms = { "1h": 3600000, "4h": 4 * 3600000, "1d": 86400000 }[interval] || 3600000;
+  const key = `${symbol}|${interval}|${limit}`, now = Date.now(), lastClose = Math.floor(now / ms) * ms;
+  const hit = klineCache.get(key);
+  if (hit && hit.lastClose === lastClose && hit.rows.length && hit.rows[hit.rows.length - 1].t + ms >= lastClose) return hit.rows;
+  let lastErr = "";
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const r = await fetch(`https://open-api.bingx.com/openApi/swap/v3/quote/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
+      const j = await r.json();
+      if (Array.isArray(j.data) && j.data.length) {
+        const rows = j.data.map(k => ({ t: +k.time, o: +k.open, h: +k.high, l: +k.low, c: +k.close, v: +k.volume }))
+          .filter(k => k.t + ms <= Date.now()).sort((a, b) => a.t - b.t);   // closed bars only
+        // only cache once the bar that just closed is in the data (BingX can lag a few seconds at the close)
+        if (rows.length && rows[rows.length - 1].t + ms >= lastClose) klineCache.set(key, { lastClose, rows });
+        return rows;
+      }
+      lastErr = `${r.status} ${JSON.stringify(j).slice(0, 120)}`;
+    } catch (e) { lastErr = e.message; }
+    await new Promise(res => setTimeout(res, 1000 * (attempt + 1)));
+  }
+  if (hit) return hit.rows;   // last good copy beats nothing
+  throw new Error(`no ${interval} klines for ${symbol} (${lastErr})`);
 }
 function agEma(v, n) { const a = 2 / (n + 1); const o = [v[0]]; for (let i = 1; i < v.length; i++) o.push(o[i - 1] + a * (v[i] - o[i - 1])); return o; }
 function agPivots(b) {
