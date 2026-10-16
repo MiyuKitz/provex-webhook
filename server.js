@@ -26,7 +26,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = process.env.BINGX_BASE_URL || "https://open-api-vst.bingx.com";   // VST demo by default
 const IS_LIVE = !BINGX_BASE_URL.includes("vst");
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v26.2";
+const SERVER_VERSION = "v26.3";
 
 // v25.1 — one codebase, two deployments. The demo service keeps the defaults.
 // A second Railway service runs the REAL-money "Aggro only" copy with:
@@ -300,22 +300,14 @@ const CORE_SHORTS = (process.env.CORE_SHORTS || "off") === "on";
 const CORE_VOL_TARGET = 0.40;    // annualised
 const CORE_FEE = 0.001;          // per unit of weight traded
 const CORE_STATE_FILE = path.join(DATA_DIR, "core_state.json");
-let coreBadWarned = "";
+let coreFailStreak = 0, coreBadWarned = "";
 const coreLevSynced = {};
 const coreForeignWarned = {};
 const CORE_LOG_FILE = path.join(DATA_DIR, "core_log.jsonl");
 const DAY_MS = 86400000;
 
-async function fetchDailyCloses(symbol) {
-  const url = `https://open-api.bingx.com/openApi/swap/v3/quote/klines?symbol=${symbol}&interval=1d&limit=80`;
-  const r = await fetch(url);
-  const j = await r.json();
-  if (!Array.isArray(j.data)) throw new Error(`no daily data for ${symbol}`);
-  const now = Date.now();
-  return j.data
-    .map(k => ({ t: +k.time, c: +k.close }))
-    .filter(k => k.t + DAY_MS <= now)          // closed candles only
-    .sort((a, b) => a.t - b.t);
+async function fetchDailyCloses(symbol) {   // v26.3: same cached + retrying downloader as Aggro (closed candles only)
+  return (await agKlines(symbol, "1d", 80)).map(k => ({ t: k.t, c: k.c }));
 }
 
 // v24.3 KEY-LEVEL TRAIL (CORE_TRAIL=on, default): while long, Core also exits on a
@@ -359,10 +351,21 @@ function readCoreState() {
 
 async function runCoreMode() {
   const data = {}, bad = [];
+  const failed = [];
   for (const s of CORE_ASSETS) {
     try { const d = await fetchDailyCloses(s); if (d.length >= CORE_LOOKBACK + 21) data[s] = d; else bad.push(`${s} (too new)`); }
-    catch { bad.push(s); }
+    catch (e) {
+      // v26.3: a download hiccup is not "coin not found". Don't run Core with a coin missing (it would look like
+      // that coin should be sold); skip this run, the next loop in 5 min retries. Only warn if it keeps failing.
+      failed.push(s); console.error(`Core: ${s} daily candles failed (${e.message})`);
+    }
   }
+  if (failed.length) {
+    coreFailStreak = (coreFailStreak || 0) + 1;
+    if (coreFailStreak === 6) await sendTelegram(`⚠️ <b>Core: can't download candles</b>\n${failed.join(", ")} has failed for 30 min. BingX's data service may be having issues. Core is paused (no trades) until it comes back.`);
+    return null;
+  }
+  coreFailStreak = 0;
   if (bad.length && coreBadWarned !== bad.join()) {
     coreBadWarned = bad.join();
     await sendTelegram(`⚠️ <b>Core mode: coin(s) skipped</b>\n${bad.join(", ")}\nNot found on BingX futures or not enough history. Check the spelling in CORE_COINS (e.g. PEPE is 1000PEPE, SHIB is 1000SHIB, BONK is 1000BONK).`);
