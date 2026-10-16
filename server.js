@@ -26,7 +26,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = process.env.BINGX_BASE_URL || "https://open-api-vst.bingx.com";   // VST demo by default
 const IS_LIVE = !BINGX_BASE_URL.includes("vst");
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v26.1";
+const SERVER_VERSION = "v26.2";
 
 // v25.1 — one codebase, two deployments. The demo service keeps the defaults.
 // A second Railway service runs the REAL-money "Aggro only" copy with:
@@ -933,7 +933,21 @@ function agFmt(v) { return (v == null || isNaN(v)) ? "?" : Number(v).toLocaleStr
 async function agOrder(params) {
   const r = await bingxRequest("POST", "/openApi/swap/v2/trade/order", params, AG_ACCT);
   if (r.error || r.code !== 0) return { ok: false, r };
-  return { ok: true, id: String(r.data?.order?.orderId ?? ""), filled: parseFloat(r.data?.order?.executedQty ?? params.quantity) || 0 };
+  return { ok: true, id: String(r.data?.order?.orderId ?? ""), filled: parseFloat(r.data?.order?.executedQty ?? params.quantity) || 0, avgPrice: parseFloat(r.data?.order?.avgPrice) || 0 };
+}
+// v26.2: the trade's REAL result from BingX's position history (actual fills, fees, funding), instead of
+// estimating from planned prices. The demo card said +1,692 when BingX showed +2,421 for the same ETH short.
+async function agRealPnl(t) {
+  try {
+    const r = await bingxRequest("GET", "/openApi/swap/v1/trade/positionHistory",
+      { symbol: t.symbol, startTs: t.openedAt - 120000, endTs: Date.now(), pageIndex: 1, pageSize: 50 }, AG_ACCT);
+    const list = r?.data?.positionHistory ?? r?.data?.list ?? (Array.isArray(r?.data) ? r.data : []);
+    const mine = list.filter(p => String(p.positionSide).toUpperCase() === t.leg && Math.abs(Number(p.openTime) - t.openedAt) < 15 * 60000);
+    if (!mine.length) { console.log(`Aggro: no position-history match for ${t.symbol} ${t.leg}:`, JSON.stringify(r).slice(0, 300)); return null; }
+    const pick = k => mine.reduce((s, p) => s + (parseFloat(p[k]) || 0), 0);
+    const net = mine.some(p => p.netProfit != null) ? pick("netProfit") : pick("realisedProfit");
+    return { pnl: net, closePx: parseFloat(mine[0].avgClosePrice) || null, entryPx: parseFloat(mine[0].avgPrice) || null };
+  } catch (e) { console.error("positionHistory failed (non-fatal):", e.message); return null; }
 }
 async function agCancel(symbol, id) { if (id) await bingxRequest("DELETE", "/openApi/swap/v2/trade/order", { symbol, orderId: id }, AG_ACCT); }
 
@@ -995,13 +1009,14 @@ async function agEnter(a, symbol, sig, pos) {
     }
   }
   if (!e.ok) { await sendTelegram(`⚠️ <b>Aggro order failed</b>\n${symbol} ${side} ${qty} @${lev}x\n${JSON.stringify(e.r).slice(0, 200)}`); return; }
-  const filled = Number(e.filled.toFixed(prec)), R = Math.abs(px - sig.stop), sgn = side === "Long" ? 1 : -1;
+  const fillPx = e.avgPrice > 0 ? e.avgPrice : px;   // v26.2: real fill, not the quote before the order
+  const filled = Number(e.filled.toFixed(prec)), R = Math.abs(fillPx - sig.stop), sgn = side === "Long" ? 1 : -1;
   const exitSide = side === "Long" ? "SELL" : "BUY";
   const stop = await agOrder({ symbol, side: exitSide, positionSide: leg, type: "STOP_MARKET", quantity: filled, stopPrice: +sig.stop.toPrecision(6), workingType: "MARK_PRICE" });
   const trail2 = AGGRO_EXIT === "trail2";
-  const tp1Qty = trail2 ? 0 : Number((filled * 0.4).toFixed(prec)), tp1 = px + sgn * R;
+  const tp1Qty = trail2 ? 0 : Number((filled * 0.4).toFixed(prec)), tp1 = fillPx + sgn * R;
   const tp = tp1Qty > 0 ? await agOrder({ symbol, side: exitSide, positionSide: leg, type: "TAKE_PROFIT_MARKET", quantity: tp1Qty, stopPrice: +tp1.toPrecision(6), workingType: "MARK_PRICE" }) : { ok: false };
-  const t = { symbol, side, leg, entry: px, stop: sig.stop, R, qty: filled, tp1, tp1Qty, stopId: stop.ok ? stop.id : null, tp1Id: tp.ok ? tp.id : null,
+  const t = { symbol, side, leg, entry: fillPx, stop: sig.stop, R, qty: filled, tp1, tp1Qty, stopId: stop.ok ? stop.id : null, tp1Id: tp.ok ? tp.id : null,
               part: false, exit: trail2 ? "trail2" : "tp1", trail: false, riskVST: +(filled * R).toFixed(2), lev, d, openedAt: Date.now(), signalT: sig.t, tf: sig.tf || "1h", score: sig.score, agree: sig.agree };
   a.open = a.open || []; a.open.push(t); writeAggro(a);
   const tfU = (sig.tf || "1h").toUpperCase();
@@ -1036,8 +1051,10 @@ async function agManage(a, pos) {
       if (now <= 0) {   // closed
         await agCancel(t.symbol, t.tp1Id); await agCancel(t.symbol, t.stopId);
         const runnerR = sgn * (t.stop - t.entry) / t.R;
-        const R = +((t.part ? 0.4 * 1 + 0.6 * runnerR : runnerR) - 0.001 / t.d).toFixed(3);
-        const pnl = t.riskVST * R;
+        let R = +((t.part ? 0.4 * 1 + 0.6 * runnerR : runnerR) - 0.001 / t.d).toFixed(3);
+        let pnl = t.riskVST * R, real = false;
+        const rp = await agRealPnl(t);
+        if (rp && Number.isFinite(rp.pnl) && rp.pnl !== 0) { pnl = rp.pnl; R = +(pnl / t.riskVST).toFixed(3); real = true; }
         // v25.7: on a real/own account the balance IS the account equity, which already includes this loss/profit.
         // Adding pnl on top double-counted it (live card said 27 USDT when the account had 33.78).
         if (AGGRO_SEPARATE || AGGRO_USE_EQUITY) { const { equity } = await getAccountEquity(AG_ACCT, true); if (equity) a.balance = +equity.toFixed(2); }
@@ -1060,7 +1077,7 @@ async function agManage(a, pos) {
             await sendTelegram(`♻️ <b>Profit banked for Core</b>\nAggro doubled, so ${bank.toFixed(0)} VST of its profit is locked away from 40x and handed to Core (same account, Core sizes from total equity).\nAggro now trades from ${a.balance.toFixed(0)} VST │ banked so far: ${a.banked.toFixed(0)} VST`);
           }
         }
-        (a.history = a.history || []).push({ symbol: t.symbol, side: t.side, R, pnl: +pnl.toFixed(2), exit: t.exit || "tp1", closedAt: new Date().toISOString() });
+        (a.history = a.history || []).push({ symbol: t.symbol, side: t.side, R, pnl: +pnl.toFixed(2), exit: t.exit || "tp1", real, closedAt: new Date().toISOString() });
         await sendTelegram(`🎰 <b>Aggro v2 trade closed</b> (demo)\n${t.symbol} ${t.side} ${t.lev}x: ≈ ${R > 0 ? "+" : ""}${R}R = ${pnl > 0 ? "+" : ""}${pnl.toFixed(0)} VST${t.part ? " (TP1 hit, runner stopped)" : t.trail ? " (locked +1R, then trailed)" : ""}\nAggro balance: ${a.balance.toFixed(0)} VST (${((a.balance / a.start - 1) * 100).toFixed(0)}% from start) │ ${a.wins}W / ${a.trades - a.wins}L${a.busted ? "\n💀 Below 10% of the starting budget, Aggro has stopped." : ""}`);
         continue;
       }
