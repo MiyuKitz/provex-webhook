@@ -14,6 +14,13 @@ asks() { local v; read -r -s -p "$1" v </dev/tty; echo >&2; printf '%s' "$v"; }
 
 [ "$(id -u)" = 0 ] || { echo "Please run as root (the DigitalOcean console logs you in as root)."; exit 1; }
 
+# Small droplets ($4 = 512 MB RAM): add 1 GB swap so installs and the bot never run out of memory
+if ! swapon --show | grep -q . ; then
+  say "Adding 1 GB swap (small server safety)"
+  fallocate -l 1G /swapfile && chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile
+  grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+
 say "Installing system packages (1-2 min)"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y -qq
