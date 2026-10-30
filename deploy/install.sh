@@ -60,16 +60,26 @@ ENV
   chmod 600 "$ENVF"
 fi
 
-if [ ! -f "$DATA/core_state.json" ]; then
-  say "Copying the bot's saved state (Core, Aggro, shadow log) from the old Railway bot"
-  if curl -fsS -m 30 "$OLD/core" -o /tmp/core.json; then
-    jq '.state' /tmp/core.json > "$DATA/core_state.json"
-    jq -c '.log[]' /tmp/core.json > "$DATA/core_log.jsonl"
-    curl -fsS -m 30 "$OLD/aggro" | jq 'del(.on,.account,.accountEquity,.coins,.riskPerTrade,.maxLeverage,.returnPct)' > "$DATA/aggro_state.json" || true
-    curl -fsS -m 60 "$OLD/shadow/all" > "$DATA/shadow.json" || true
-    chown -R provex:provex "$DATA"; echo "State copied."
-  else echo "Old bot not reachable, starting fresh."; fi
+if [ ! -f "$DATA/shadow.json" ]; then
+  say "Copying the setup history (shadow log) from the old Railway bot"
+  curl -fsS -m 60 "$OLD/shadow/all" > "$DATA/shadow.json" 2>/dev/null && echo "Shadow log copied." || { rm -f "$DATA/shadow.json"; echo "Old bot not reachable, shadow log starts fresh."; }
 fi
+if [ ! -f "$DATA/core_state.json" ] && [ ! -f "$DATA/aggro_state.json" ]; then
+  echo
+  echo "Is this bot trading the SAME BingX account as the old Railway bot?"
+  echo "  y = same account: copy Core holdings + Aggro scoreboard/open trades"
+  echo "  n = NEW account or sub-account: start Core + Aggro fresh (recommended for a new sub-account)"
+  SAME=$(ask "Same account? (y/N): ")
+  if [ "$SAME" = "y" ] || [ "$SAME" = "Y" ]; then
+    if curl -fsS -m 30 "$OLD/core" -o /tmp/core.json; then
+      jq '.state' /tmp/core.json > "$DATA/core_state.json"
+      jq -c '.log[]' /tmp/core.json > "$DATA/core_log.jsonl"
+      curl -fsS -m 30 "$OLD/aggro" | jq 'del(.on,.account,.accountEquity,.coins,.riskPerTrade,.maxLeverage,.returnPct)' > "$DATA/aggro_state.json" || true
+      echo "Core + Aggro state copied."
+    else echo "Old bot not reachable, starting fresh."; fi
+  else echo "Starting Core + Aggro fresh."; fi
+fi
+chown -R provex:provex "$DATA"
 
 say "Setting up the 24/7 service + auto-updates from GitHub"
 cat > /etc/systemd/system/provex-bot.service <<UNIT
