@@ -15,3 +15,5 @@ every 2 minutes (restarts only if the code changed and passes `node --check`), c
 saved state once, keeps secrets in /etc/provex-bot.env (root-only), and opens only SSH + port 8080.
 
 Logs: `journalctl -u provex-bot -f` · Restart: `systemctl restart provex-bot` · New keys: rerun with `bash -s -- --keys`
+
+Strategy settings (non-secret) live in `settings.json` at the repo root and override the env file; change them by commit, the server applies them within ~2 min.

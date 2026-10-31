@@ -1,0 +1,10 @@
+{
+  "_note": "Strategy settings (no secrets). These override the server's env file. Changed by commit; the server picks them up within 2 minutes.",
+  "_why_v26_5": "Oct 31 2026: 39 setups/day found but 0 traded at score 4 while 12/13 coins trend down. 3-year test: score 3 + coin trend + 1% min stop = +0.12R/trade, ~70 trades/month. Core shorts on in bear markets (Krysie's rule).",
+  "AGGRO_MIN_CONF": 3,
+  "AGGRO_MIN_STOP": 0.01,
+  "AGGRO_RISK": 0.01,
+  "AGGRO_DIR": "coin28",
+  "AGGRO_EXIT": "trail2",
+  "CORE_SHORTS": "on"
+}

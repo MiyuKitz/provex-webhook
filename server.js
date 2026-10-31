@@ -18,6 +18,18 @@ const https = require("https");
 const fs = require("fs");
 const path = require("path");
 
+// v26.5: non-secret settings from settings.json in the repo. The server pulls GitHub every 2 min,
+// so strategy settings can be tuned by a commit, without logging into the server. Secrets
+// (keys, tokens) are refused here and stay only in the server's private env file.
+try {
+  const st = JSON.parse(fs.readFileSync(path.join(__dirname, "settings.json"), "utf8"));
+  for (const [k, v] of Object.entries(st)) {
+    if (k.startsWith("_") || /KEY|SECRET|TOKEN|CHAT_ID|BASE_URL|DATA_DIR|PORT/.test(k)) continue;
+    process.env[k] = String(v);
+  }
+  console.log("settings.json applied:", Object.keys(st).filter(k => !k.startsWith("_")).join(", "));
+} catch (e) { if (e.code !== "ENOENT") console.error("settings.json ignored:", e.message); }
+
 const TELEGRAM_TOKEN    = process.env.TELEGRAM_TOKEN;
 const TELEGRAM_CHAT_ID  = process.env.TELEGRAM_CHAT_ID;
 const PORT = process.env.PORT || 3000;
@@ -26,7 +38,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = process.env.BINGX_BASE_URL || "https://open-api-vst.bingx.com";   // VST demo by default
 const IS_LIVE = !BINGX_BASE_URL.includes("vst");
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v26.4";
+const SERVER_VERSION = "v26.5";
 
 // v25.1 — one codebase, two deployments. The demo service keeps the defaults.
 // A second Railway service runs the REAL-money "Aggro only" copy with:
