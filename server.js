@@ -26,7 +26,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = process.env.BINGX_BASE_URL || "https://open-api-vst.bingx.com";   // VST demo by default
 const IS_LIVE = !BINGX_BASE_URL.includes("vst");
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v26.3";
+const SERVER_VERSION = "v26.4";
 
 // v25.1 — one codebase, two deployments. The demo service keeps the defaults.
 // A second Railway service runs the REAL-money "Aggro only" copy with:
@@ -1282,6 +1282,7 @@ const server = http.createServer(async (req, res) => {
       shadow: { coins: SHADOW_COINS, timeframes: ["1h", "4h"] } });
   }
   if (req.method === "GET" && pathname === "/shadow") return json(shadowSummary());
+  if (req.method === "GET" && pathname === "/checkin") { const msg = await buildCheckin(); if (urlObj.searchParams.get("send") === "1") await sendTelegram(msg); return json({ preview: msg.replace(/<[^>]+>/g, "") }); }   // v26.4
   if (req.method === "GET" && pathname === "/shadow/all") { const sh = readShadow(); return json({ since: sh.since, closed: sh.closed, open: sh.open }); }   // v25.8: full list for reviews
   if (req.method === "GET" && pathname === "/core") {
     const log = readCoreLog();
@@ -1317,5 +1318,66 @@ if (SHADOW_ON) {
   setInterval(shadowTick, 5 * 60 * 1000);
   setTimeout(shadowTick, 6 * 60 * 1000);
 }
+// ============================================================
+// 📋 DAILY CHECK-IN (v26.4) — one Telegram message every morning (9am Melbourne) so a quiet bot
+// never looks like a broken bot: what it holds, what it's allowed to trade, and what it saw.
+// ============================================================
+const CHECKIN_FILE = path.join(DATA_DIR, "checkin.json");
+function melNow() {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-AU", { timeZone: "Australia/Melbourne", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", hour12: false }).formatToParts(new Date()).map(x => [x.type, x.value]));
+  return { day: `${parts.year}-${parts.month}-${parts.day}`, hour: Number(parts.hour) % 24 };
+}
+async function buildCheckin() {
+  const pct = v => (v == null ? "?" : `${v > 0 ? "+" : ""}${(v * 100).toFixed(1)}%`);
+  const coins = [...new Set([...CORE_ASSETS.map(s => s.replace("-USDT", "")), ...AGGRO_COINS])];
+  const tr = {};
+  for (const c of coins) { try { tr[c] = await coinTrend28(`${c}-USDT`); } catch { tr[c] = null; } }
+  const up = coins.filter(c => tr[c] > 0), down = coins.filter(c => tr[c] < 0);
+  const regime = await marketRegime().catch(() => "?");
+  // Core
+  const cs = readCoreState() || {};
+  const held = Object.entries(cs.weights || {}).filter(([, w]) => w > 0).map(([k, w]) => `${k.replace("-USDT", "")} ${(w * 100).toFixed(1)}%`);
+  const coreLine = CORE_ON
+    ? `🛡️ <b>Core</b> (paper ${agFmt(+(cs.equity || 0).toFixed(0))}${cs.peak ? `, DD ${pct(cs.equity / cs.peak - 1)}` : ""}): ${held.length ? "holding " + held.join(", ") : "all cash"}\n   Core coins trending up: ${CORE_ASSETS.map(s => s.replace("-USDT", "")).filter(c => tr[c] > 0).join(", ") || "none, so it waits"}`
+    : "🛡️ Core: off";
+  // Aggro
+  const a = readAggro();
+  const openL = (a.open || []).map(t => `${t.symbol.replace("-USDT", "")} ${t.side}${t.trail ? " 🔒" : ""}`);
+  const aggroLine = AGGRO
+    ? `🎰 <b>Aggro</b>: ${agFmt(+(a.balance || 0).toFixed(0))} (${pct((a.balance || 0) / (a.start || 1) - 1)} since start) │ ${a.wins || 0}W / ${(a.trades || 0) - (a.wins || 0)}L\n   Open: ${openL.length ? openL.join(", ") : "none"}\n   Allowed now: shorts on ${down.filter(c => AGGRO_COINS.includes(c)).length} coins, longs on ${up.filter(c => AGGRO_COINS.includes(c)).length} (${up.filter(c => AGGRO_COINS.includes(c)).join(", ") || "-"})`
+    : "🎰 Aggro: off";
+  // What the strategies saw on 4H in the last 24h
+  const sh = readShadow(), since = Date.now() - 86400000;
+  const seen = [...(sh.open || []), ...(sh.closed || [])].filter(t => t.tf === "4h" && Date.parse(t.logged) >= since);
+  const best = seen.reduce((m, t) => (!m || t.score > m.score ? t : m), null);
+  const near = seen.filter(t => t.score === AGGRO_MIN_CONF - 1).map(t => `${t.symbol.replace("-USDT", "")} ${t.side}`);
+  const taken = seen.filter(t => t.aggroWouldTrade).length;
+  const seenLine = `👁️ <b>Last 24h on 4H</b>: ${seen.length} setups found, ${taken} passed all rules${best ? `, best: ${best.symbol.replace("-USDT", "")} ${best.side} ${best.score}/10` : ""}${near.length ? `\n   Close calls (${AGGRO_MIN_CONF - 1}/10): ${[...new Set(near)].slice(0, 8).join(", ")}` : ""}`;
+  return `📋 <b>Daily check-in</b> · ${SERVER_VERSION} · ${BINGX_BASE_URL.includes("vst") ? "DEMO" : "LIVE"}
+✅ Bot running
+
+📉📈 <b>Market</b>: BTC 28d ${pct(tr.BTC ?? null)} (${regime}) │ coins up ${up.length} / down ${down.length}
+${coins.map(c => `${c} ${pct(tr[c])}`).join(" · ")}
+
+${coreLine}
+
+${aggroLine}
+
+${seenLine}
+
+${(a.open || []).length || held.length ? "" : "Quiet = no setup passed the rules yet. Not broken, just waiting."}`.trim();
+}
+async function dailyCheckin(force = false) {
+  try {
+    const { day, hour } = melNow();
+    let st = {}; try { st = JSON.parse(fs.readFileSync(CHECKIN_FILE, "utf8")); } catch {}
+    if (!force && (hour !== 9 || st.day === day)) return;
+    await sendTelegram(await buildCheckin());
+    fs.writeFileSync(CHECKIN_FILE, JSON.stringify({ day, at: new Date().toISOString() }));
+  } catch (e) { console.error("daily check-in failed (non-fatal):", e.message); }
+}
+setInterval(() => dailyCheckin(), 10 * 60 * 1000);
+setTimeout(() => { if (!fs.existsSync(CHECKIN_FILE)) dailyCheckin(true); }, 8 * 60 * 1000);   // first one right after install
+
 setInterval(() => stopWatchdog().catch(e => console.error("stopWatchdog failed (non-fatal):", e.message)), 15 * 60 * 1000);
 setTimeout(() => stopWatchdog().catch(() => {}), 90 * 1000);
