@@ -7,5 +7,8 @@
   "AGGRO_RISK": 0.005,
   "AGGRO_DIR": "coin28",
   "AGGRO_EXIT": "trail2",
-  "CORE_SHORTS": "off"
+  "CORE_SHORTS": "off",
+  "_why_v26_7": "Nov 5 2026: live losses were bigger than wins (avg -237 vs +190). Causes: demo slippage widened stops (fixed: stop re-anchored to fill), no breakeven (XRP reached +1.2R then hit full stop), swing-only trail gave back ~65% of big moves (SUI/LINK/ZRO). 3-yr test, 28 coins: breakeven at +1.5R + 2xATR trail after +2R = win 41% (was 35%), maxDD -31% (was -34%), +0.143R/trade, both halves positive.",
+  "AGGRO_BE_R": 1.5,
+  "AGGRO_ATR_MULT": 2
 }

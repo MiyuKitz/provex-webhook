@@ -38,7 +38,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = process.env.BINGX_BASE_URL || "https://open-api-vst.bingx.com";   // VST demo by default
 const IS_LIVE = !BINGX_BASE_URL.includes("vst");
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v26.6";
+const SERVER_VERSION = "v26.7";
 
 // v25.1 — one codebase, two deployments. The demo service keeps the defaults.
 // A second Railway service runs the REAL-money "Aggro only" copy with:
@@ -237,7 +237,7 @@ async function sendTelegram(message) {
 }
 
 async function lastPrice(coin) {
-  const r = await fetch(`https://open-api.bingx.com/openApi/swap/v2/quote/price?symbol=${coin}-USDT`);
+  const r = await fetch(`${new URL(BINGX_BASE_URL).origin}/openApi/swap/v2/quote/price?symbol=${coin}-USDT`);   // v26.7: same venue the orders fill on
   const j = await r.json();
   return +j?.data?.price;
 }
@@ -873,6 +873,13 @@ const AGGRO_DIR = (process.env.AGGRO_DIR || "coin28").toLowerCase();        // c
 const AGGRO_MIN_STOP = Math.max(0, Math.min(0.05, Number(process.env.AGGRO_MIN_STOP ?? 0.015)));
 const AGGRO_EXIT = (process.env.AGGRO_EXIT || "trail2").toLowerCase();       // trail2 | tp1 (old: 40% at 1R, then breakeven)
 const AGGRO_MAX_DAYS = Number(process.env.AGGRO_MAX_DAYS || 20);
+// v26.7 exit upgrades (3-year test, 28 coins: win rate 35% -> 41%, maxDD -34% -> -31%, +0.130R -> +0.143R/trade):
+//  at +AGGRO_BE_R (1.5R) the stop moves to entry +0.1R (no more winners turning into full losses, like XRP),
+//  and once +2R is locked the stop also trails AGGRO_ATR_MULT (2) x ATR(14) behind the close (keeps more of big moves,
+//  SUI/LINK/ZRO gave back ~65% of their best move under the swing-only trail).
+const AGGRO_BE_R = Number(process.env.AGGRO_BE_R ?? 1.5);
+const AGGRO_ATR_MULT = Number(process.env.AGGRO_ATR_MULT ?? 2);
+function agAtr(b, i, n = 14) { let s = 0; for (let k = i - n + 1; k <= i; k++) s += Math.max(b[k].h - b[k].l, Math.abs(b[k].h - b[k - 1].c), Math.abs(b[k].l - b[k - 1].c)); return s / n; }
 const coinTrendCache = {};
 async function coinTrend28(symbol) {   // the coin's own 28-day return from closed daily candles
   const c = coinTrendCache[symbol];
@@ -1025,6 +1032,9 @@ async function agEnter(a, symbol, sig, pos) {
   }
   if (!e.ok) { await sendTelegram(`⚠️ <b>Aggro order failed</b>\n${symbol} ${side} ${qty} @${lev}x\n${JSON.stringify(e.r).slice(0, 200)}`); return; }
   const fillPx = e.avgPrice > 0 ? e.avgPrice : px;   // v26.2: real fill, not the quote before the order
+  // v26.7: keep the PLANNED stop distance from the actual fill. Demo market orders slipped 0.3-0.85%, which turned
+  // a planned 1R loss into 1.3-1.8R (ETH -351 instead of ~-200). Same % distance from the fill = same planned risk.
+  sig = { ...sig, stop: side === "Long" ? fillPx * (1 - d) : fillPx * (1 + d) };
   const filled = Number(e.filled.toFixed(prec)), R = Math.abs(fillPx - sig.stop), sgn = side === "Long" ? 1 : -1;
   const exitSide = side === "Long" ? "SELL" : "BUY";
   const stop = await agOrder({ symbol, side: exitSide, positionSide: leg, type: "STOP_MARKET", quantity: filled, stopPrice: +sig.stop.toPrecision(6), workingType: "MARK_PRICE" });
@@ -1042,8 +1052,9 @@ async function agEnter(a, symbol, sig, pos) {
 
 <b>Entry:</b> $${agFmt(px)}
 <b>Stop loss:</b> $${agFmt(sig.stop)} (${(d * 100).toFixed(2)}% away, beyond the trigger candle / zone)
-${trail2 ? `<b>Lock-in:</b> at +2R ($${agFmt(px + sgn * 2 * R)}) the stop jumps to +1R ($${agFmt(px + sgn * R)})
-<b>Then:</b> stop trails under each new ${tfU} swing ${side === "Long" ? "low" : "high"}, no fixed TP (max ${AGGRO_MAX_DAYS} days)
+${trail2 ? `<b>Breakeven:</b> at +${AGGRO_BE_R}R ($${agFmt(fillPx + sgn * AGGRO_BE_R * R)}) the stop moves to entry, so it can't become a loss
+<b>Lock-in:</b> at +2R ($${agFmt(fillPx + sgn * 2 * R)}) the stop jumps to +1R ($${agFmt(fillPx + sgn * R)})
+<b>Then:</b> stop trails under each new ${tfU} swing ${side === "Long" ? "low" : "high"}, no fixed TP and ${AGGRO_ATR_MULT}× ATR behind price (max ${AGGRO_MAX_DAYS} days)
 <b>Coin's 28-day trend:</b> ${allow.r != null ? (allow.r * 100).toFixed(1) + "%" : "n/a"} → ${side === "Long" ? "longs" : "shorts"} only` : `<b>TP1:</b> $${agFmt(tp1)} (1R, closes 40%, then stop → breakeven)
 <b>Runner:</b> 60% trails under each new ${tfU} swing ${side === "Long" ? "low" : "high"}, no fixed TP`}
 
@@ -1101,15 +1112,22 @@ async function agManage(a, pos) {
         const exitSide = t.side === "Long" ? "SELL" : "BUY";
         const b = await agKlines(t.symbol, t.tf || "4h", 60), { H, L } = agPivots(b);
         const after = b.filter(x => x.t + tfms > t.openedAt);
-        let best = t.stop, lock = false;
+        let best = t.stop, lock = false, beMove = false;
+        const tighter = v => (sgn > 0 ? v > best : v < best);
         if (!t.trail && after.length) {
           const fav = sgn > 0 ? Math.max(...after.map(x => x.h)) : Math.min(...after.map(x => x.l));
-          if (sgn * (fav - t.entry) >= 2 * t.R) { t.trail = true; lock = true; best = t.entry + sgn * t.R; }
+          const favR = sgn * (fav - t.entry) / t.R;
+          if (favR >= 2) { t.trail = true; t.be = true; lock = true; const v = t.entry + sgn * t.R; if (tighter(v)) best = v; }
+          else if (!t.be && AGGRO_BE_R > 0 && favR >= AGGRO_BE_R) { t.be = true; beMove = true; const v = t.entry + sgn * 0.1 * t.R; if (tighter(v)) best = v; }
         }
-        if (t.trail) for (let k = 0; k < b.length; k++) {
-          if (b[k].t + tfms <= t.openedAt) continue;
-          if (sgn > 0 && L[k] && b[k].l * 0.999 > best) best = b[k].l * 0.999;
-          if (sgn < 0 && H[k] && b[k].h * 1.001 < best) best = b[k].h * 1.001;
+        if (t.trail) {
+          for (let k = 0; k < b.length; k++) {
+            if (b[k].t + tfms <= t.openedAt) continue;
+            if (sgn > 0 && L[k] && b[k].l * 0.999 > best) best = b[k].l * 0.999;
+            if (sgn < 0 && H[k] && b[k].h * 1.001 < best) best = b[k].h * 1.001;
+          }
+          const li = b.length - 1;
+          if (AGGRO_ATR_MULT > 0 && li > 15) { const v = b[li].c - sgn * AGGRO_ATR_MULT * agAtr(b, li); if (tighter(v)) best = v; }
         }
         const px = await lastPrice(coin);
         const timeUp = Date.now() - t.openedAt > AGGRO_MAX_DAYS * 86400000;
@@ -1122,6 +1140,7 @@ async function agManage(a, pos) {
           const st = await agOrder({ symbol: t.symbol, side: exitSide, positionSide: t.leg, type: "STOP_MARKET", quantity: now, stopPrice: +best.toPrecision(6), workingType: "MARK_PRICE" });
           t.stopId = st.ok ? st.id : null; t.stop = best;
           if (!st.ok) await sendTelegram(`🚨 <b>Aggro stop move failed</b> ${t.symbol} ${t.side}: ${JSON.stringify(st.r).slice(0, 150)}\nCheck BingX, the watchdog will flag it if there is no stop.`);
+          if (beMove) await sendTelegram(`🛡️ <b>Aggro +${AGGRO_BE_R}R reached</b> ${t.symbol} ${t.side}: stop moved to breakeven +0.1R ($${agFmt(best)}). This trade can't turn into a loss now.`);
           if (lock) await sendTelegram(`🔒 <b>Aggro +2R reached</b> ${t.symbol} ${t.side}: stop moved to +1R ($${agFmt(best)}). Profit locked, now trailing under each 4H swing.`);
           else console.log(`Aggro v26: ${t.symbol} ${t.side} stop trailed to ${best}`);
         }
@@ -1214,7 +1233,10 @@ function shadowWalk(t, b) {
     for (j = i0 + 1; j < b.length && j <= i0 + SHADOW_MAX_BARS[t.tf]; j++) {
       const y = b[j], hit = long ? y.l <= s : y.h >= s;
       if (hit) return { R: +(sg * (s - t.entry) / R - 0.0015 / t.d).toFixed(3) };
-      if (!trail && sg * ((long ? y.h : y.l) - t.entry) >= 2 * R) { trail = true; s = t.entry + sg * R; }
+      const favR = sg * ((long ? y.h : y.l) - t.entry) / R;
+      if (!trail && favR >= 2) { trail = true; s = t.entry + sg * R; }
+      else if (!trail && AGGRO_BE_R > 0 && favR >= AGGRO_BE_R && sg * (t.entry + sg * 0.1 * R - s) > 0) s = t.entry + sg * 0.1 * R;
+      if (trail && AGGRO_ATR_MULT > 0 && j > 15) { const v = y.c - sg * AGGRO_ATR_MULT * agAtr(b, j); if (long ? v > s : v < s) s = v; }
       const kk = j - AG_PIV;
       if (trail && kk > i0) {
         if (long && L[kk] && b[kk].l * 0.999 > s) s = b[kk].l * 0.999;
