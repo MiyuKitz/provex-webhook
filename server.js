@@ -1069,7 +1069,7 @@ async function agEnter(a, symbol, sig, pos) {
   const tp1Qty = trail2 ? 0 : Number((filled * 0.4).toFixed(prec)), tp1 = fillPx + sgn * R;
   const tp = tp1Qty > 0 ? await agOrder({ symbol, side: exitSide, positionSide: leg, type: "TAKE_PROFIT_MARKET", quantity: tp1Qty, stopPrice: +tp1.toPrecision(6), workingType: "MARK_PRICE" }) : { ok: false };
   const t = { symbol, side, leg, entry: fillPx, stop: sig.stop, R, qty: filled, tp1, tp1Qty, stopId: stop.ok ? stop.id : null, tp1Id: tp.ok ? tp.id : null,
-              part: false, exit: trail2 ? "trail2" : "tp1", trail: false, riskVST: +(filled * R).toFixed(2), lev, d, openedAt: Date.now(), signalT: sig.t, tf: sig.tf || "1h", score: sig.score, agree: sig.agree };
+              part: false, exit: trail2 ? "trail2" : "tp1", trail: false, canAdd: true, riskVST: +(filled * R).toFixed(2), lev, d, openedAt: Date.now(), signalT: sig.t, tf: sig.tf || "1h", score: sig.score, agree: sig.agree };
   a.open = a.open || []; a.open.push(t); writeAggro(a);
   const tfU = (sig.tf || "1h").toUpperCase();
   await sendTelegram(`📊 <b>Trade Setup 🎰 AGGRO</b> (demo)
@@ -1159,7 +1159,7 @@ async function agManage(a, pos) {
         let qtyNow = now;
         // ➕ v26.8: add to the winner (pyramiding), only after profit is locked and on a 4H close at the next +R level
         t.adds = t.adds || [];
-        if (AGGRO_ADD_SIZE > 0 && t.trail && t.adds.length < AGGRO_ADD_MAX && b.length) {
+        if (AGGRO_ADD_SIZE > 0 && t.canAdd && t.trail && t.adds.length < AGGRO_ADD_MAX && b.length) {   // canAdd: only trades opened from v26.8 on
           const li = b.length - 1, closeR = sgn * (b[li].c - t.entry) / t.R, lvl = AGGRO_ADD_AT * (t.adds.length + 1);
           if (b[li].t + tfms > t.openedAt && closeR >= lvl && t.lastAddBar !== b[li].t) {
             t.lastAddBar = b[li].t;
