@@ -4,7 +4,7 @@
   "AGGRO_COINS": "BTC,ETH,SOL,SUI,DOGE,NEAR,INJ,1000PEPE,FLOKI,ZRO,XRP,LINK,AVAX,ADA,LTC,BNB,AAVE,UNI,ARB,OP,APT,DOT,SEI,TIA,WIF,HBAR,TRX,BCH",
   "AGGRO_MIN_CONF": 4,
   "AGGRO_MIN_STOP": 0.015,
-  "AGGRO_RISK": 0.01,
+  "AGGRO_RISK": 0.005,
   "AGGRO_DIR": "coin28",
   "AGGRO_EXIT": "trail2",
   "CORE_SHORTS": "off",
@@ -15,5 +15,8 @@
   "AGGRO_ADD_SIZE": 0,
   "AGGRO_ADD_AT": 2,
   "AGGRO_ADD_MAX": 2,
-  "_why_pause_adds": "Nov 12 2026: pyramiding paused (size 0) until the offline portfolio-concentration test is done; adds would increase correlated same-direction exposure. Entry/exit rules frozen at v26.7 for the forward test."
+  "_why_pause_adds": "Nov 12 2026: pyramiding paused (size 0) until the offline portfolio-concentration test is done; adds would increase correlated same-direction exposure. Entry/exit rules frozen at v26.7 for the forward test.",
+  "_why_v26_9": "Nov 12 2026 (candidate, deploy only with Krysie's approval): portfolio replay, 3 yrs, 28 coins, costs split into taker fee 0.05%/side + slippage on entry AND exit + funding 0.01%/8h. Max 6 same-direction trades vs no cap: drawdown about a third smaller at every cost level, return equal or better. At 0.05%/side slippage + funding: 0.5% risk + max6 = +26%/yr, maxDD -32% (1% risk: +38%/yr, -56%). Edge gone at ~0.2%/side slippage, so live fills must be measured. New scoreboard tag v26.9 so v26.7 results stay separate.",
+  "AGGRO_MAX_SAME": 6,
+  "AGGRO_RESET": "v26.9"
 }

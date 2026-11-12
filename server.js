@@ -55,7 +55,8 @@ const AGGRO_USE_EQUITY = (process.env.AGGRO_USE_EQUITY || "off") === "on";   // 
 // own leverage (hold + hunt on the same coin). Without them, Aggro shares the
 // main account and skips any coin+side Core already holds.
 const AGGRO_KEY = process.env.AGGRO_BINGX_API_KEY, AGGRO_SECRET = process.env.AGGRO_BINGX_API_SECRET;
-const BOT_VERSION = "v26.9-safety";
+const BOT_VERSION = "v26.9";
+const AGGRO_MAX_SAME = parseInt(process.env.AGGRO_MAX_SAME || "0", 10);   // v26.9: max open Aggro trades in one direction (0 = no cap)
 const AGGRO_SEPARATE = !!(AGGRO_KEY && AGGRO_SECRET);
 const AG_ACCT = AGGRO_SEPARATE ? "aggro" : "main";
 const acctKeys = acct => acct === "aggro" && AGGRO_SEPARATE ? { key: AGGRO_KEY, secret: AGGRO_SECRET } : { key: BINGX_API_KEY, secret: BINGX_API_SECRET };
@@ -1058,6 +1059,14 @@ async function agEnter(a, symbol, sig, pos) {
   const [dMin, dMax] = TF_STOP[sig.tf || "1h"];
   if (d < dMin || d > dMax || (side === "Long" ? sig.stop >= px : sig.stop <= px)) { console.log(`Aggro: ${symbol} ${side} skipped, stop distance ${(d * 100).toFixed(2)}%`); return; }
   if (pos.positions.some(p => p.symbol === symbol && p.direction === side)) { console.log(`Aggro v2: ${symbol} ${side} skipped, that side is already held${AGGRO_SEPARATE ? " on the Aggro account" : " (Core or another trade)"}`); return; }
+  // v26.9 position cap: checked only after every other filter passed, so a skip here is a real lost setup
+  const same = (a.open || []).filter(t => t.side === side).length;
+  if (AGGRO_MAX_SAME > 0 && same >= AGGRO_MAX_SAME) {
+    a.capSkips = (a.capSkips || 0) + 1; writeAggro(a);
+    console.log(`Aggro: ${symbol} ${side} skipped, already ${same} ${side} trades open (cap ${AGGRO_MAX_SAME})`);
+    await sendTelegram(`⏸️ <b>Aggro setup skipped: position cap</b>\n${coin}USDT ${side} │ ${sig.score}/${AGGRO_STRATS.length}\nAlready ${same} ${side.toLowerCase()} trades open (cap ${AGGRO_MAX_SAME}), to limit one-direction market risk.`);
+    return "cap";
+  }
   const { equity: agEq, available } = await getAccountEquity(AG_ACCT);
   const prec = await getQuantityPrecision(symbol);
   const lev = Math.max(1, Math.min(AGGRO_LEVERAGE, Math.floor(1 / (1.5 * d))));
@@ -1276,17 +1285,25 @@ async function aggroTick() {
     await agManage(a, pos); writeAggro(a);
     if (a.busted || a.balance < a.start * 0.1) return;
     pos = await getOpenPositions(AG_ACCT); if (!pos.checked) return;
+    // v26.9: scan every coin first, then enter the strongest setups first (same order the portfolio backtest used),
+    // and skip a setup when AGGRO_MAX_SAME open Aggro trades already point the same way (0 = no cap).
+    const found = [];
     for (const coin of AGGRO_COINS) {
       const symbol = `${coin}-USDT`;
       if ((a.open || []).some(t => t.symbol === symbol)) continue;
       try {
         const { best } = await cfScan(symbol, AGGRO_TF, AGGRO_STRATS);
-        if (!best || best.score < AGGRO_MIN_CONF || a.lastEntryT[symbol] === best.t) continue;
+        if (best && best.score >= AGGRO_MIN_CONF && a.lastEntryT[symbol] !== best.t) found.push({ symbol, best });
+      } catch (err) { console.error(`Aggro scan ${symbol} failed (non-fatal):`, err.message); }
+      await new Promise(r => setTimeout(r, 200));
+    }
+    found.sort((x, y) => y.best.score - x.best.score);
+    for (const { symbol, best } of found) {
+      try {
         a.lastEntryT[symbol] = best.t; writeAggro(a);
         const res = await agEnter(a, symbol, { ...best, tf: AGGRO_TF }, pos);
         if (res === "nomargin") { delete a.lastEntryT[symbol]; writeAggro(a); }   // v25.6: retry this setup next scan
-      } catch (err) { console.error(`Aggro scan ${symbol} failed (non-fatal):`, err.message); }
-      await new Promise(r => setTimeout(r, 200));
+      } catch (err) { console.error(`Aggro enter ${symbol} failed (non-fatal):`, err.message); }
     }
   } catch (err) { console.error("aggroTick failed (non-fatal):", err.message); }
 }
