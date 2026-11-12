@@ -55,6 +55,7 @@ const AGGRO_USE_EQUITY = (process.env.AGGRO_USE_EQUITY || "off") === "on";   // 
 // own leverage (hold + hunt on the same coin). Without them, Aggro shares the
 // main account and skips any coin+side Core already holds.
 const AGGRO_KEY = process.env.AGGRO_BINGX_API_KEY, AGGRO_SECRET = process.env.AGGRO_BINGX_API_SECRET;
+const BOT_VERSION = "v26.9-safety";
 const AGGRO_SEPARATE = !!(AGGRO_KEY && AGGRO_SECRET);
 const AG_ACCT = AGGRO_SEPARATE ? "aggro" : "main";
 const acctKeys = acct => acct === "aggro" && AGGRO_SEPARATE ? { key: AGGRO_KEY, secret: AGGRO_SECRET } : { key: BINGX_API_KEY, secret: BINGX_API_SECRET };
@@ -272,11 +273,12 @@ async function stopWatchdogFor(acct) {
     orders = res?.data?.orders;
     if (!Array.isArray(orders)) { console.error("Stop watchdog: openOrders returned no list:", JSON.stringify(res).slice(0, 200)); return; }
   } catch (err) { console.error("Stop watchdog failed (non-fatal):", err.message); return; }
-  const unprotected = pos.positions.filter(p => {
-    const side = p.direction === "Short" ? "SHORT" : "LONG";
-    return !orders.some(o => o.symbol === p.symbol && o.positionSide === side
-      && /STOP/.test(o.type || "") && !/TAKE_PROFIT/.test(o.type || ""));
-  });
+  // v26.9 SAFETY: a stop must cover the FULL position size, not just exist (a stop for part of the size
+  // after an add, or a leftover partial stop, used to count as "protected").
+  const stopsOf = p => orders.filter(o => o.symbol === p.symbol && o.positionSide === (p.direction === "Short" ? "SHORT" : "LONG")
+    && /STOP/.test(o.type || "") && !/TAKE_PROFIT/.test(o.type || ""));
+  const covered = p => stopsOf(p).reduce((q, o) => q + (parseFloat(o.origQty ?? o.quantity) || 0), 0);
+  const unprotected = pos.positions.filter(p => covered(p) < p.amt * 0.999);
   console.log(`Stop watchdog${acct === "aggro" ? " (Aggro account)" : ""}: ${pos.positions.length} position(s), ${unprotected.length} without a stop`);
   // v26.8 self-repair: if the unprotected position is an Aggro trade, put its stop back (or close it if price is
   // already past the stop) instead of only alerting. BNB/ZRO/WIF were found without stops on Nov 12.
@@ -290,7 +292,10 @@ async function stopWatchdogFor(acct) {
     const exitSide = long ? "SELL" : "BUY";
     let o;
     if (px && (long ? px <= t.stop : px >= t.stop)) o = await agOrder({ symbol: p.symbol, side: exitSide, positionSide: t.leg, type: "MARKET", quantity: p.amt });
-    else o = await agOrder({ symbol: p.symbol, side: exitSide, positionSide: t.leg, type: "STOP_MARKET", quantity: p.amt, stopPrice: +t.stop.toPrecision(6), workingType: "MARK_PRICE" });
+    else {
+      o = await agOrder({ symbol: p.symbol, side: exitSide, positionSide: t.leg, type: "STOP_MARKET", quantity: p.amt, stopPrice: +t.stop.toPrecision(6), workingType: "MARK_PRICE" });
+      if (o.ok) for (const old of stopsOf(p)) await agCancel(p.symbol, old.orderId).catch(() => {});   // v26.9: full-size stop placed first, then partial/stale ones removed
+    }
     if (o.ok) {
       if (o.id && !(px && (long ? px <= t.stop : px >= t.stop))) t.stopId = o.id; else t.stop = px;
       repaired = true; unprotected.splice(unprotected.indexOf(p), 1);
@@ -1000,6 +1005,34 @@ async function agRealPnl(t) {
 }
 async function agCancel(symbol, id) { if (id) await bingxRequest("DELETE", "/openApi/swap/v2/trade/order", { symbol, orderId: id }, AG_ACCT); }
 
+// v26.9 SAFETY: never leave a position naked while moving a stop. Old code cancelled the stop FIRST and then
+// placed the new one; if the new order failed, the position had no stop until someone noticed (BNB/ZRO/WIF, Nov 12).
+// Now: place the new stop first, cancel the old one only after the new one is confirmed. If BingX refuses a
+// second stop, fall back to cancel-then-place with retries, and as a last resort put the OLD stop back.
+const agSleep = ms => new Promise(r => setTimeout(r, ms));
+async function agMoveStop(t, exitSide, qty, price) {
+  const p = { symbol: t.symbol, side: exitSide, positionSide: t.leg, type: "STOP_MARKET", quantity: qty, stopPrice: +price.toPrecision(6), workingType: "MARK_PRICE" };
+  const oldId = t.stopId, oldStop = t.stop;
+  let st = await agOrder(p);
+  if (st.ok) { if (oldId) await agCancel(t.symbol, oldId).catch(() => {}); t.stopId = st.id; t.stop = price; return st; }
+  console.log(`Stop move ${t.symbol}: new-before-cancel refused (${JSON.stringify(st.r).slice(0, 150)}), falling back to cancel-then-place`);
+  if (oldId) await agCancel(t.symbol, oldId).catch(() => {});
+  for (let k = 0; k < 3 && !st.ok; k++) { await agSleep(1500); st = await agOrder(p); }
+  if (st.ok) { t.stopId = st.id; t.stop = price; return st; }
+  if (oldStop > 0) {
+    const back = await agOrder({ ...p, stopPrice: +oldStop.toPrecision(6) });
+    if (back.ok) { t.stopId = back.id; return { ok: false, r: st.r, restored: true }; }
+  }
+  t.stopId = null; return { ok: false, r: st.r };
+}
+// v26.9 SAFETY: initial stop after an entry, retried; if it still can't be placed the position is closed.
+async function agPlaceEntryStop(symbol, exitSide, leg, qty, price) {
+  const p = { symbol, side: exitSide, positionSide: leg, type: "STOP_MARKET", quantity: qty, stopPrice: +price.toPrecision(6), workingType: "MARK_PRICE" };
+  let st = await agOrder(p);
+  for (let k = 0; k < 3 && !st.ok; k++) { await agSleep(1500); st = await agOrder(p); }
+  return st;
+}
+
 // Replays the confluence engine over the last closed bars and returns the setup on the LAST bar (if any).
 async function cfScan(symbol, tf, strats = CF_NAMES, shadow = false) {
   const b = await agKlines(symbol, tf, 300);
@@ -1064,7 +1097,12 @@ async function agEnter(a, symbol, sig, pos) {
   sig = { ...sig, stop: side === "Long" ? fillPx * (1 - d) : fillPx * (1 + d) };
   const filled = Number(e.filled.toFixed(prec)), R = Math.abs(fillPx - sig.stop), sgn = side === "Long" ? 1 : -1;
   const exitSide = side === "Long" ? "SELL" : "BUY";
-  const stop = await agOrder({ symbol, side: exitSide, positionSide: leg, type: "STOP_MARKET", quantity: filled, stopPrice: +sig.stop.toPrecision(6), workingType: "MARK_PRICE" });
+  const stop = await agPlaceEntryStop(symbol, exitSide, leg, filled, sig.stop);
+  if (!stop.ok) {   // v26.9 SAFETY: no stop = no trade. Close it rather than hold an unprotected position.
+    const c = await agOrder({ symbol, side: exitSide, positionSide: leg, type: "MARKET", quantity: filled });
+    await sendTelegram(`🚨 <b>Aggro: stop could not be placed</b> ${symbol} ${side}\nBingX refused the stop 4 times: ${JSON.stringify(stop.r).slice(0, 150)}\n${c.ok ? "The position was closed at market so it is not left unprotected." : "Closing it ALSO failed. Close it in the BingX app now."}`);
+    return;
+  }
   const trail2 = AGGRO_EXIT === "trail2";
   const tp1Qty = trail2 ? 0 : Number((filled * 0.4).toFixed(prec)), tp1 = fillPx + sgn * R;
   const tp = tp1Qty > 0 ? await agOrder({ symbol, side: exitSide, positionSide: leg, type: "TAKE_PROFIT_MARKET", quantity: tp1Qty, stopPrice: +tp1.toPrecision(6), workingType: "MARK_PRICE" }) : { ok: false };
@@ -1184,10 +1222,12 @@ async function agManage(a, pos) {
           const c = await agOrder({ symbol: t.symbol, side: exitSide, positionSide: t.leg, type: "MARKET", quantity: qtyNow });
           if (c.ok) { t.stop = px; t.stopId = null; console.log(`Aggro v26: ${t.symbol} ${t.side} closed at market (${timeUp ? "time exit" : "locked level already passed"})`); }
         } else if (best !== t.stop || t.forceStop) {
-          await agCancel(t.symbol, t.stopId);
-          const st = await agOrder({ symbol: t.symbol, side: exitSide, positionSide: t.leg, type: "STOP_MARKET", quantity: qtyNow, stopPrice: +best.toPrecision(6), workingType: "MARK_PRICE" });
-          t.stopId = st.ok ? st.id : null; t.stop = best; t.forceStop = false;
-          if (!st.ok) await sendTelegram(`🚨 <b>Aggro stop move failed</b> ${t.symbol} ${t.side}: ${JSON.stringify(st.r).slice(0, 150)}\nCheck BingX, the watchdog will flag it if there is no stop.`);
+          const st = await agMoveStop(t, exitSide, qtyNow, best);
+          if (!st.ok) {   // v26.9: t.stop is NOT advanced, so the next tick tries again
+            await sendTelegram(`🚨 <b>Aggro stop move failed</b> ${t.symbol} ${t.side}: ${JSON.stringify(st.r).slice(0, 150)}\n${st.restored ? `The previous stop ($${agFmt(t.stop)}) is still in place. Retrying next check.` : "NO stop could be placed. The watchdog retries every 5 min; check BingX."}`);
+            still.push(t); continue;
+          }
+          t.forceStop = false;
           if (beMove) await sendTelegram(`🛡️ <b>Aggro +${AGGRO_BE_R}R reached</b> ${t.symbol} ${t.side}: stop moved to breakeven +0.1R ($${agFmt(best)}). This trade can't turn into a loss now.`);
           if (lock) await sendTelegram(`🔒 <b>Aggro +2R reached</b> ${t.symbol} ${t.side}: stop moved to +1R ($${agFmt(best)}). Profit locked, now trailing under each 4H swing.`);
           else console.log(`Aggro v26: ${t.symbol} ${t.side} stop trailed to ${best}`);
@@ -1195,9 +1235,8 @@ async function agManage(a, pos) {
         still.push(t); continue;
       }
       if (!t.part && now <= t.qty * 0.65) {   // TP1 filled -> stop to breakeven on the runner
-        t.part = true; await agCancel(t.symbol, t.stopId);
-        const s = await agOrder({ symbol: t.symbol, side: t.side === "Long" ? "SELL" : "BUY", positionSide: t.leg, type: "STOP_MARKET", quantity: now, stopPrice: +t.entry.toPrecision(6), workingType: "MARK_PRICE" });
-        t.stopId = s.ok ? s.id : null; t.stop = t.entry;
+        t.part = true;
+        await agMoveStop(t, t.side === "Long" ? "SELL" : "BUY", now, t.entry);
         await sendTelegram(`🎯 <b>Aggro TP1 hit</b> ${t.symbol} ${t.side}: 40% closed at +1R, runner stop moved to breakeven ($${agFmt(t.entry)}). Now trailing.`);
       } else if (t.part) {   // trail under new confirmed 1H swing lows / above swing highs
         const b = await agKlines(t.symbol, t.tf || "1h", 60), { H, L } = agPivots(b);
@@ -1208,9 +1247,7 @@ async function agManage(a, pos) {
           if (t.side === "Short" && H[k] && b[k].h * 1.001 < best) best = b[k].h * 1.001;
         }
         if (best !== t.stop) {
-          await agCancel(t.symbol, t.stopId);
-          const s = await agOrder({ symbol: t.symbol, side: t.side === "Long" ? "SELL" : "BUY", positionSide: t.leg, type: "STOP_MARKET", quantity: now, stopPrice: +best.toPrecision(6), workingType: "MARK_PRICE" });
-          t.stopId = s.ok ? s.id : null; t.stop = best;
+          await agMoveStop(t, t.side === "Long" ? "SELL" : "BUY", now, best);
           console.log(`Aggro v2: ${t.symbol} ${t.side} runner stop trailed to ${best}`);
         }
       }
@@ -1365,6 +1402,21 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "GET" && pathname === "/shadow") return json(shadowSummary());
   if (req.method === "GET" && pathname === "/checkin") { const msg = await buildCheckin(); if (urlObj.searchParams.get("send") === "1") await sendTelegram(msg); return json({ preview: msg.replace(/<[^>]+>/g, "") }); }   // v26.4
+  if (req.method === "GET" && pathname === "/safety") {   // v26.9: every open position and the stop(s) covering it
+    const out = [];
+    for (const acct of AGGRO_SEPARATE ? ["main", "aggro"] : ["main"]) {
+      const pos = await getOpenPositions(acct);
+      const r = await bingxRequest("GET", "/openApi/swap/v2/trade/openOrders", {}, acct).catch(() => null);
+      const orders = r?.data?.orders;
+      if (!pos.checked || !Array.isArray(orders)) { out.push({ acct, error: "could not read positions or orders" }); continue; }
+      for (const p of pos.positions) {
+        const st = orders.filter(o => o.symbol === p.symbol && o.positionSide === (p.direction === "Short" ? "SHORT" : "LONG") && /STOP/.test(o.type || "") && !/TAKE_PROFIT/.test(o.type || ""));
+        const q = st.reduce((x, o) => x + (parseFloat(o.origQty ?? o.quantity) || 0), 0);
+        out.push({ acct, symbol: p.symbol, side: p.direction, size: p.amt, stopQty: +q.toFixed(6), stopPrices: st.map(o => +o.stopPrice), status: q >= p.amt * 0.999 ? "PROTECTED" : q > 0 ? "PARTIAL" : "NO STOP" });
+      }
+    }
+    return json({ checkedAt: new Date().toISOString(), allProtected: out.every(x => x.status === "PROTECTED"), positions: out });
+  }
   if (req.method === "GET" && pathname === "/shadow/all") { const sh = readShadow(); return json({ since: sh.since, closed: sh.closed, open: sh.open }); }   // v25.8: full list for reviews
   if (req.method === "GET" && pathname === "/core") {
     const log = readCoreLog();
@@ -1461,5 +1513,5 @@ async function dailyCheckin(force = false) {
 setInterval(() => dailyCheckin(), 10 * 60 * 1000);
 setTimeout(() => { if (!fs.existsSync(CHECKIN_FILE)) dailyCheckin(true); }, 8 * 60 * 1000);   // first one right after install
 
-setInterval(() => stopWatchdog().catch(e => console.error("stopWatchdog failed (non-fatal):", e.message)), 15 * 60 * 1000);
+setInterval(() => stopWatchdog().catch(e => console.error("stopWatchdog failed (non-fatal):", e.message)), 5 * 60 * 1000);   // v26.9: every 5 min (was 15)
 setTimeout(() => stopWatchdog().catch(() => {}), 90 * 1000);
