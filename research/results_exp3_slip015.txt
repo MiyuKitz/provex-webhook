@@ -1,0 +1,8 @@
+=== slippage 0.15%/side ===
+BASELINE (current live rules)            n=2407 exp +0.014R (t=0.2) PF 1.02 win  34% | 0.5%risk   +1%/yr DD  -53% | worst trade -1.48R worst day -12.6R | H1 +0.015 H2 +0.013 | BTC up +0.037 down -0.018 | coins+ 16/28
+E1a entry: next candle confirms          n=1386 exp +0.118R (t=1.6) PF 1.18 win  37% | 0.5%risk  +25%/yr DD  -35% | worst trade -1.47R worst day -8.7R | H1 +0.191 H2 +0.037 | BTC up +0.178 down +0.035 | coins+ 19/28
+E1b entry: close breaks signal candle    n=1132 exp +0.151R (t=1.9) PF 1.24 win  39% | 0.5%risk  +27%/yr DD  -35% | worst trade -1.47R worst day -8.0R | H1 +0.263 H2 +0.029 | BTC up +0.234 down +0.035 | coins+ 19/28
+E1c entry: skip if into a >1ATR rally    n=2315 exp +0.033R (t=0.5) PF 1.05 win  35% | 0.5%risk   +7%/yr DD  -45% | worst trade -1.57R worst day -12.6R | H1 +0.051 H2 +0.012 | BTC up +0.062 down -0.008 | coins+ 17/28
+E2a exit: 4H-close stop, hard 1.5x       n=2288 exp +0.022R (t=0.3) PF 1.03 win  39% | 0.5%risk   +2%/yr DD  -66% | worst trade -1.93R worst day -17.4R | H1 -0.036 H2 +0.087 | BTC up +0.030 down +0.010 | coins+ 15/28
+E2b exit: 4H-close stop, hard 2x         n=2279 exp +0.007R (t=0.1) PF 1.01 win  40% | 0.5%risk   -3%/yr DD  -67% | worst trade -2.43R worst day -18.8R | H1 -0.038 H2 +0.058 | BTC up +0.013 down -0.001 | coins+ 15/28
+E3  re-entry on fresh structure          n=2454 exp +0.007R (t=0.1) PF 1.01 win  35% | 0.5%risk   -2%/yr DD  -54% | worst trade -1.48R worst day -11.6R | H1 -0.000 H2 +0.014 | BTC up +0.036 down -0.035 | coins+ 15/28
