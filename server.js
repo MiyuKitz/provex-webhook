@@ -38,7 +38,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = process.env.BINGX_BASE_URL || "https://open-api-vst.bingx.com";   // VST demo by default
 const IS_LIVE = !BINGX_BASE_URL.includes("vst");
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v26.7";
+const SERVER_VERSION = "v26.8";
 
 // v25.1 — one codebase, two deployments. The demo service keeps the defaults.
 // A second Railway service runs the REAL-money "Aggro only" copy with:
@@ -278,6 +278,26 @@ async function stopWatchdogFor(acct) {
       && /STOP/.test(o.type || "") && !/TAKE_PROFIT/.test(o.type || ""));
   });
   console.log(`Stop watchdog${acct === "aggro" ? " (Aggro account)" : ""}: ${pos.positions.length} position(s), ${unprotected.length} without a stop`);
+  // v26.8 self-repair: if the unprotected position is an Aggro trade, put its stop back (or close it if price is
+  // already past the stop) instead of only alerting. BNB/ZRO/WIF were found without stops on Nov 12.
+  let ag = null; try { ag = readAggro(); } catch {}
+  let repaired = false;
+  for (const p of [...unprotected]) {
+    const t = (ag?.open || []).find(x => x.symbol === p.symbol && x.side === p.direction);
+    if (!t || !(t.stop > 0)) continue;
+    const coin = p.symbol.replace("-USDT", ""), long = p.direction === "Long";
+    const px = await lastPrice(coin).catch(() => 0);
+    const exitSide = long ? "SELL" : "BUY";
+    let o;
+    if (px && (long ? px <= t.stop : px >= t.stop)) o = await agOrder({ symbol: p.symbol, side: exitSide, positionSide: t.leg, type: "MARKET", quantity: p.amt });
+    else o = await agOrder({ symbol: p.symbol, side: exitSide, positionSide: t.leg, type: "STOP_MARKET", quantity: p.amt, stopPrice: +t.stop.toPrecision(6), workingType: "MARK_PRICE" });
+    if (o.ok) {
+      if (o.id && !(px && (long ? px <= t.stop : px >= t.stop))) t.stopId = o.id; else t.stop = px;
+      repaired = true; unprotected.splice(unprotected.indexOf(p), 1);
+      await sendTelegram(`🔧 <b>Stop re-placed automatically</b>\n${p.symbol} ${p.direction}: the stop was missing, ${px && (long ? px <= t.stop : px >= t.stop) ? "price was already past it, so the position was closed" : `put back at $${agFmt(t.stop)}`}.`);
+    } else console.error(`Stop repair failed ${p.symbol}:`, JSON.stringify(o.r).slice(0, 200));
+  }
+  if (repaired) writeAggro(ag);
   for (const p of unprotected) {
     const key = `${p.symbol}|${p.direction}`;
     if (stopAlertAt[key] && Date.now() - stopAlertAt[key] < 6 * 3600 * 1000) continue;
@@ -674,7 +694,7 @@ async function coreExecute() {
 // ---------------- Aggro state ----------------
 const AGGRO = (process.env.AGGRO || "on") === "on";
 const AGGRO_BUDGET = Number(process.env.AGGRO_BUDGET || 20000);
-const AGGRO_RISK = Math.min(0.5, Math.max(0.01, Number(process.env.AGGRO_RISK || 0.5)));
+const AGGRO_RISK = Math.min(0.5, Math.max(0.001, Number(process.env.AGGRO_RISK || 0.01)));   // v26.8: floor was 1%, which silently overrode 0.5%
 const AGGRO_LEVERAGE = Math.min(50, Math.max(1, Number(process.env.AGGRO_LEVERAGE || 40)));
 const AGGRO_FILE = path.join(DATA_DIR, "aggro_state.json");
 function readAggro() {
@@ -879,6 +899,13 @@ const AGGRO_MAX_DAYS = Number(process.env.AGGRO_MAX_DAYS || 20);
 //  SUI/LINK/ZRO gave back ~65% of their best move under the swing-only trail).
 const AGGRO_BE_R = Number(process.env.AGGRO_BE_R ?? 1.5);
 const AGGRO_ATR_MULT = Number(process.env.AGGRO_ATR_MULT ?? 2);
+// v26.8 pyramiding: once a trade has locked +1R (reached +2R), add AGGRO_ADD_SIZE x the original size each time a 4H
+// candle closes at another +AGGRO_ADD_AT R (at +2R, then +4R), max AGGRO_ADD_MAX adds. The whole position keeps the
+// trailed stop. 3-year test, 28 coins, 1% risk: +0.143R -> +0.239R per trade (0.5x adds), maxDD -55% -> -58%,
+// both halves of the data positive. Only winners get bigger, so losers stay the same size.
+const AGGRO_ADD_SIZE = Number(process.env.AGGRO_ADD_SIZE ?? 0.5);
+const AGGRO_ADD_AT = Number(process.env.AGGRO_ADD_AT ?? 2);
+const AGGRO_ADD_MAX = Number(process.env.AGGRO_ADD_MAX ?? 2);
 function agAtr(b, i, n = 14) { let s = 0; for (let k = i - n + 1; k <= i; k++) s += Math.max(b[k].h - b[k].l, Math.abs(b[k].h - b[k - 1].c), Math.abs(b[k].l - b[k - 1].c)); return s / n; }
 const coinTrendCache = {};
 async function coinTrend28(symbol) {   // the coin's own 28-day return from closed daily candles
@@ -1129,16 +1156,37 @@ async function agManage(a, pos) {
           const li = b.length - 1;
           if (AGGRO_ATR_MULT > 0 && li > 15) { const v = b[li].c - sgn * AGGRO_ATR_MULT * agAtr(b, li); if (tighter(v)) best = v; }
         }
+        let qtyNow = now;
+        // ➕ v26.8: add to the winner (pyramiding), only after profit is locked and on a 4H close at the next +R level
+        t.adds = t.adds || [];
+        if (AGGRO_ADD_SIZE > 0 && t.trail && t.adds.length < AGGRO_ADD_MAX && b.length) {
+          const li = b.length - 1, closeR = sgn * (b[li].c - t.entry) / t.R, lvl = AGGRO_ADD_AT * (t.adds.length + 1);
+          if (b[li].t + tfms > t.openedAt && closeR >= lvl && t.lastAddBar !== b[li].t) {
+            t.lastAddBar = b[li].t;
+            const prec = await getQuantityPrecision(t.symbol);
+            const addQty = Number((t.qty * AGGRO_ADD_SIZE).toFixed(prec));
+            if (addQty > 0) {
+              const o = await agOrder({ symbol: t.symbol, side: t.side === "Long" ? "BUY" : "SELL", positionSide: t.leg, type: "MARKET", quantity: addQty });
+              if (o.ok) {
+                const addPx = o.avgPrice > 0 ? o.avgPrice : b[li].c;
+                t.adds.push({ px: addPx, qty: Number(o.filled.toFixed(prec)) || addQty, at: Date.now() });
+                qtyNow = +(now + (Number(o.filled.toFixed(prec)) || addQty)).toFixed(prec);
+                t.forceStop = true;   // re-place the stop for the bigger size
+                await sendTelegram(`➕ <b>Aggro added to a winner</b> ${t.symbol} ${t.side}\nAdd #${t.adds.length}: +${agFmt(addQty)} at $${agFmt(addPx)} (trade is +${closeR.toFixed(1)}R)\nWhole position now ${agFmt(qtyNow)}, protected by the trailed stop at $${agFmt(best)} (profit already locked).`);
+              } else console.log(`Aggro add failed ${t.symbol}:`, JSON.stringify(o.r).slice(0, 150));
+            }
+          }
+        }
         const px = await lastPrice(coin);
         const timeUp = Date.now() - t.openedAt > AGGRO_MAX_DAYS * 86400000;
         if (px && (timeUp || (best !== t.stop && (sgn > 0 ? px <= best : px >= best)))) {   // time's up, or price already through the new stop
           await agCancel(t.symbol, t.stopId);
-          const c = await agOrder({ symbol: t.symbol, side: exitSide, positionSide: t.leg, type: "MARKET", quantity: now });
+          const c = await agOrder({ symbol: t.symbol, side: exitSide, positionSide: t.leg, type: "MARKET", quantity: qtyNow });
           if (c.ok) { t.stop = px; t.stopId = null; console.log(`Aggro v26: ${t.symbol} ${t.side} closed at market (${timeUp ? "time exit" : "locked level already passed"})`); }
-        } else if (best !== t.stop) {
+        } else if (best !== t.stop || t.forceStop) {
           await agCancel(t.symbol, t.stopId);
-          const st = await agOrder({ symbol: t.symbol, side: exitSide, positionSide: t.leg, type: "STOP_MARKET", quantity: now, stopPrice: +best.toPrecision(6), workingType: "MARK_PRICE" });
-          t.stopId = st.ok ? st.id : null; t.stop = best;
+          const st = await agOrder({ symbol: t.symbol, side: exitSide, positionSide: t.leg, type: "STOP_MARKET", quantity: qtyNow, stopPrice: +best.toPrecision(6), workingType: "MARK_PRICE" });
+          t.stopId = st.ok ? st.id : null; t.stop = best; t.forceStop = false;
           if (!st.ok) await sendTelegram(`🚨 <b>Aggro stop move failed</b> ${t.symbol} ${t.side}: ${JSON.stringify(st.r).slice(0, 150)}\nCheck BingX, the watchdog will flag it if there is no stop.`);
           if (beMove) await sendTelegram(`🛡️ <b>Aggro +${AGGRO_BE_R}R reached</b> ${t.symbol} ${t.side}: stop moved to breakeven +0.1R ($${agFmt(best)}). This trade can't turn into a loss now.`);
           if (lock) await sendTelegram(`🔒 <b>Aggro +2R reached</b> ${t.symbol} ${t.side}: stop moved to +1R ($${agFmt(best)}). Profit locked, now trailing under each 4H swing.`);

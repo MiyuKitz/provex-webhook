@@ -4,11 +4,15 @@
   "AGGRO_COINS": "BTC,ETH,SOL,SUI,DOGE,NEAR,INJ,1000PEPE,FLOKI,ZRO,XRP,LINK,AVAX,ADA,LTC,BNB,AAVE,UNI,ARB,OP,APT,DOT,SEI,TIA,WIF,HBAR,TRX,BCH",
   "AGGRO_MIN_CONF": 4,
   "AGGRO_MIN_STOP": 0.015,
-  "AGGRO_RISK": 0.005,
+  "AGGRO_RISK": 0.01,
   "AGGRO_DIR": "coin28",
   "AGGRO_EXIT": "trail2",
   "CORE_SHORTS": "off",
   "_why_v26_7": "Nov 5 2026: live losses were bigger than wins (avg -237 vs +190). Causes: demo slippage widened stops (fixed: stop re-anchored to fill), no breakeven (XRP reached +1.2R then hit full stop), swing-only trail gave back ~65% of big moves (SUI/LINK/ZRO). 3-yr test, 28 coins: breakeven at +1.5R + 2xATR trail after +2R = win 41% (was 35%), maxDD -31% (was -34%), +0.143R/trade, both halves positive.",
   "AGGRO_BE_R": 1.5,
-  "AGGRO_ATR_MULT": 2
+  "AGGRO_ATR_MULT": 2,
+  "_why_v26_8": "Nov 12 2026: live ran at 1% risk all along (a 1% floor in code overrode 0.5%); keep 1% on demo since live results so far reflect it. Pyramiding test (3 yrs, 28 coins, 1% risk): add 0.5x at +2R and +4R once profit is locked = +0.239R/trade (was +0.143), maxDD -58% (was -55%), both halves positive. A cooldown after losses tested worse, not added.",
+  "AGGRO_ADD_SIZE": 0.5,
+  "AGGRO_ADD_AT": 2,
+  "AGGRO_ADD_MAX": 2
 }
