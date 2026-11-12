@@ -38,7 +38,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = process.env.BINGX_BASE_URL || "https://open-api-vst.bingx.com";   // VST demo by default
 const IS_LIVE = !BINGX_BASE_URL.includes("vst");
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v26.8";
+const SERVER_VERSION = "v26.9-safety+paper";
 
 // v25.1 — one codebase, two deployments. The demo service keeps the defaults.
 // A second Railway service runs the REAL-money "Aggro only" copy with:
@@ -1390,6 +1390,70 @@ function shadowSummary() {
     byScore, byStrategyAgreeing: byStrategy, byTriggerStrategy: byTrigger, last20: c.slice(-20) };
 }
 
+// ============================================================
+// 🧪 PAPER TEST E1b (v26.9) — NO ORDERS. For every setup the live Aggro rules would take on 4H, track two versions:
+//   base = enter at the signal close (what live does)
+//   e1b  = wait up to 3 candles for a 4H CLOSE past the signal candle (below its low for a short, above its high for a
+//          long); cancelled if price hits the stop first. Same stop price (1.5% floor re-applied), same v26.7 exit.
+// Offline test (3 yrs, 28 coins): e1b +0.217R/trade vs +0.099R, max DD -31% vs -39%. Read it at /paper.
+// ============================================================
+const PAPER_FILE = path.join(DATA_DIR, "paper_e1b.json");
+function readPaper() { try { return JSON.parse(fs.readFileSync(PAPER_FILE, "utf8")); } catch { return { since: new Date().toISOString(), setups: [] }; } }
+function writePaper(p) { fs.writeFileSync(PAPER_FILE, JSON.stringify(p)); }
+async function paperTick() {
+  try {
+    const p = readPaper(), have = new Set(p.setups.map(x => `${x.symbol}|${x.t}|${x.side}`));
+    const [dMin, dMax] = TF_STOP["4h"];
+    for (const coin of AGGRO_COINS) {
+      const symbol = `${coin}-USDT`;
+      try {
+        const { best, bars } = await cfScan(symbol, "4h", AGGRO_STRATS);
+        if (best && best.score >= AGGRO_MIN_CONF && !have.has(`${symbol}|${best.t}|${best.side}`)) {
+          const sb = bars.find(x => x.t === best.t);
+          if (sb) p.setups.push({ symbol, t: best.t, side: best.side, score: best.score, stop: best.stop, lvl: best.side === "Short" ? sb.l : sb.h,
+            logged: new Date().toISOString(), base: { t: best.t, side: best.side, entry: best.entry, stop: best.stop, d: Math.abs(best.entry - best.stop) / best.entry, exit: "trail2", tf: "4h" }, e1b: null, e1bStatus: "waiting" });
+        }
+        for (const x of p.setups.filter(x => x.symbol === symbol)) {
+          if (x.base && x.baseR == null) { const r = shadowWalk(x.base, bars); if (r && r.R != null) { x.baseR = r.R; x.baseNote = r.note; } }
+          if (x.e1bStatus === "waiting") {
+            const i0 = bars.findIndex(b => b.t === x.t);
+            if (i0 < 0) { x.e1bStatus = "lost bars"; continue; }
+            const short = x.side === "Short";
+            for (let k = i0 + 1; k <= i0 + 3 && k < bars.length; k++) {
+              const y = bars[k];
+              if (short ? y.h >= x.stop : y.l <= x.stop) { x.e1bStatus = "stop hit before confirmation"; break; }
+              if (short ? y.c < x.lvl : y.c > x.lvl) {
+                let st = x.stop; const e = y.c;
+                if (Math.abs(e - st) / e < AGGRO_MIN_STOP) st = short ? e * (1 + AGGRO_MIN_STOP) : e * (1 - AGGRO_MIN_STOP);
+                const d = Math.abs(e - st) / e;
+                if (d < dMin || d > dMax) { x.e1bStatus = "stop distance out of range"; break; }
+                x.e1b = { t: y.t, side: x.side, entry: e, stop: st, d, exit: "trail2", tf: "4h" }; x.e1bStatus = "entered"; break;
+              }
+              if (k === i0 + 3) x.e1bStatus = "no confirmation in 3 candles";
+            }
+          }
+          if (x.e1b && x.e1bR == null) { const r = shadowWalk(x.e1b, bars); if (r && r.R != null) { x.e1bR = r.R; x.e1bNote = r.note; } }
+        }
+      } catch (err) { console.error(`Paper E1b ${symbol} failed (non-fatal):`, err.message); }
+      await new Promise(r => setTimeout(r, 150));
+    }
+    p.setups = p.setups.slice(-3000);
+    writePaper(p);
+  } catch (err) { console.error("paperTick failed (non-fatal):", err.message); }
+}
+function paperSummary() {
+  const p = readPaper(), S = p.setups;
+  const stat = v => { const n = v.length; if (!n) return { closed: 0 }; const tot = v.reduce((a, b) => a + b, 0);
+    return { closed: n, winRatePct: Math.round(v.filter(r => r > 0).length / n * 100), avgR: +(tot / n).toFixed(3), totalR: +tot.toFixed(2) }; };
+  const both = S.filter(x => x.baseR != null && (x.e1bR != null || (x.e1bStatus !== "waiting" && x.e1bStatus !== "entered")));
+  const count = st => S.filter(x => x.e1bStatus === st).length;
+  return { since: p.since, setupsSeen: S.length, note: "base = live rule (enter at signal). e1b = wait for a 4H close past the signal candle. Paper only, no orders. Review after 30+ closed.",
+    base: stat(S.filter(x => x.baseR != null).map(x => x.baseR)), e1b: stat(S.filter(x => x.e1bR != null).map(x => x.e1bR)),
+    sameSetupsCompared: { n: both.length, baseTotalR: +both.reduce((a, x) => a + x.baseR, 0).toFixed(2), e1bTotalR: +both.reduce((a, x) => a + (x.e1bR || 0), 0).toFixed(2) },
+    e1bOutcomes: { entered: count("entered"), waiting: count("waiting"), skippedStopHitFirst: count("stop hit before confirmation"), skippedNoConfirmation: count("no confirmation in 3 candles"), skippedOther: count("stop distance out of range") + count("lost bars") },
+    last20: S.slice(-20).map(x => ({ symbol: x.symbol, side: x.side, signal: new Date(x.t + 14400000).toISOString(), baseR: x.baseR ?? "open", e1b: x.e1bStatus, e1bR: x.e1bR ?? (x.e1b ? "open" : "-") })) };
+}
+
 // ---------------- HTTP ----------------
 const server = http.createServer(async (req, res) => {
   const urlObj = new URL(req.url, `http://${req.headers.host}`);
@@ -1401,6 +1465,7 @@ const server = http.createServer(async (req, res) => {
       shadow: { coins: SHADOW_COINS, timeframes: ["1h", "4h"] } });
   }
   if (req.method === "GET" && pathname === "/shadow") return json(shadowSummary());
+  if (req.method === "GET" && pathname === "/paper") return json(paperSummary());   // v26.9 paper test E1b
   if (req.method === "GET" && pathname === "/checkin") { const msg = await buildCheckin(); if (urlObj.searchParams.get("send") === "1") await sendTelegram(msg); return json({ preview: msg.replace(/<[^>]+>/g, "") }); }   // v26.4
   if (req.method === "GET" && pathname === "/safety") {   // v26.9: every open position and the stop(s) covering it
     const out = [];
@@ -1448,6 +1513,8 @@ if (CORE_ON) {
 }
 setInterval(aggroTick, 5 * 60 * 1000);
 setTimeout(aggroTick, 4 * 60 * 1000);
+setInterval(paperTick, 5 * 60 * 1000);   // v26.9 paper test, no orders
+setTimeout(paperTick, 7 * 60 * 1000);
 if (SHADOW_ON) {
   setInterval(shadowTick, 5 * 60 * 1000);
   setTimeout(shadowTick, 6 * 60 * 1000);
@@ -1498,6 +1565,8 @@ ${coreLine}
 ${aggroLine}
 
 ${seenLine}
+
+${(() => { const ps = paperSummary(); return `🧪 <b>Paper test (wait for confirmation)</b>: ${ps.setupsSeen} setups │ live rule ${ps.base.closed ? `${ps.base.totalR}R over ${ps.base.closed}` : "0 closed"} vs wait-to-confirm ${ps.e1b.closed ? `${ps.e1b.totalR}R over ${ps.e1b.closed}` : "0 closed"}`; })()}
 
 ${(a.open || []).length || held.length ? "" : "Quiet = no setup passed the rules yet. Not broken, just waiting."}`.trim();
 }
