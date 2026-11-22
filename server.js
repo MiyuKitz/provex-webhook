@@ -38,7 +38,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = process.env.BINGX_BASE_URL || "https://open-api-vst.bingx.com";   // VST demo by default
 const IS_LIVE = !BINGX_BASE_URL.includes("vst");
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v26.9-safety+paper";
+const SERVER_VERSION = "v27.0-paper-combo";
 
 // v25.1 — one codebase, two deployments. The demo service keeps the defaults.
 // A second Railway service runs the REAL-money "Aggro only" copy with:
@@ -1400,6 +1400,24 @@ function shadowSummary() {
 const PAPER_FILE = path.join(DATA_DIR, "paper_e1b.json");
 function readPaper() { try { return JSON.parse(fs.readFileSync(PAPER_FILE, "utf8")); } catch { return { since: new Date().toISOString(), setups: [] }; } }
 function writePaper(p) { fs.writeFileSync(PAPER_FILE, JSON.stringify(p)); }
+// v27.0 COMBO PAPER TEST: Two-Speed Flow as the bot's analyst (no orders). For each setup the live rules would take,
+// record what TS Flow says: its 1H trade direction (skip-if-opposite idea) and its 4H opinion (AVOID = strong momentum idea).
+const { runPhoenix } = require("./tsflow");
+async function flowTag(symbol, t, side) {
+  try {
+    const d = side === "Long" ? 1 : -1;
+    const [b4, h1, d1] = await Promise.all([agKlines(symbol, "4h", 500), agKlines(symbol, "1h", 1000), agKlines(symbol, "1d", 120)]);
+    if (!b4?.length || !h1?.length || !d1?.length) return { err: "klines" };
+    const tr4 = [], tr1 = [];
+    runPhoenix(b4, h1, d1, { trace: tr4 });
+    runPhoenix(h1, h1, d1, { trace: tr1 });
+    const s4 = tr4.find(s => s.t === t), s1 = tr1.find(s => s.t === t + 3 * 3600000);
+    if (!s4 || !s1) return { err: "no flow state" };
+    const op4 = d === 1 ? s4.evLb : s4.evSb;
+    return { flow1h: s1.act, flow4h: s4.act, op4h: op4, oppose1h: s1.act === -d, momentum: op4 === "AVOID" };
+  } catch (e) { return { err: e.message }; }
+}
+
 async function paperTick() {
   try {
     const p = readPaper(), have = new Set(p.setups.map(x => `${x.symbol}|${x.t}|${x.side}`));
@@ -1411,6 +1429,7 @@ async function paperTick() {
         if (best && best.score >= AGGRO_MIN_CONF && !have.has(`${symbol}|${best.t}|${best.side}`)) {
           const sb = bars.find(x => x.t === best.t);
           if (sb) p.setups.push({ symbol, t: best.t, side: best.side, score: best.score, stop: best.stop, lvl: best.side === "Short" ? sb.l : sb.h,
+            flow: await flowTag(symbol, best.t, best.side),
             logged: new Date().toISOString(), base: { t: best.t, side: best.side, entry: best.entry, stop: best.stop, d: Math.abs(best.entry - best.stop) / best.entry, exit: "trail2", tf: "4h" }, e1b: null, e1bStatus: "waiting" });
         }
         for (const x of p.setups.filter(x => x.symbol === symbol)) {
@@ -1449,6 +1468,10 @@ function paperSummary() {
   const count = st => S.filter(x => x.e1bStatus === st).length;
   return { since: p.since, setupsSeen: S.length, note: "base = live rule (enter at signal). e1b = wait for a 4H close past the signal candle. Paper only, no orders. Review after 30+ closed.",
     base: stat(S.filter(x => x.baseR != null).map(x => x.baseR)), e1b: stat(S.filter(x => x.e1bR != null).map(x => x.e1bR)),
+    combo: (() => { const C = S.filter(x => x.baseR != null && x.flow && !x.flow.err); const sum = v => +v.reduce((a, x) => a + x.baseR, 0).toFixed(2);
+      const g = f => { const v = C.filter(f); return { n: v.length, totalR: sum(v), avgR: v.length ? +(sum(v) / v.length).toFixed(3) : 0 }; };
+      return { note: "Same live-rule trades, judged by what Two-Speed Flow said at entry. No orders.", allTrades: g(() => true),
+        skipIf1hOpposite: g(x => !x.flow.oppose1h), wouldBeSkipped: g(x => x.flow.oppose1h), strongMomentum4hAvoid: g(x => x.flow.momentum), otherTrades: g(x => !x.flow.momentum) }; })(),
     sameSetupsCompared: { n: both.length, baseTotalR: +both.reduce((a, x) => a + x.baseR, 0).toFixed(2), e1bTotalR: +both.reduce((a, x) => a + (x.e1bR || 0), 0).toFixed(2) },
     e1bOutcomes: { entered: count("entered"), waiting: count("waiting"), skippedStopHitFirst: count("stop hit before confirmation"), skippedNoConfirmation: count("no confirmation in 3 candles"), skippedOther: count("stop distance out of range") + count("lost bars") },
     last20: S.slice(-20).map(x => ({ symbol: x.symbol, side: x.side, signal: new Date(x.t + 14400000).toISOString(), baseR: x.baseR ?? "open", e1b: x.e1bStatus, e1bR: x.e1bR ?? (x.e1b ? "open" : "-") })) };
