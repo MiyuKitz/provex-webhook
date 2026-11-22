@@ -671,7 +671,8 @@ if boxOn
                 box.set_right(aBox, rightEdge)
             else
                 bLive := false
-        else if boxMode != "AI Dynamic Compression Engine" and not na(bHi)
+        // breakout check also runs on the candle where box tracking ends (needed on 4H, where a session is ~2 candles)
+        if not bLive and boxMode != "AI Dynamic Compression Engine" and not na(bHi)
             if not bUpDone and close > bHi and close > open and body >= dispReq
                 boxBreakUp := true
                 bUpDone := true

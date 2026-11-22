@@ -83,10 +83,10 @@ function runPhoenix(b, htf, daily, opts = {}) {
     // session box
     let boxUp = false, boxDn = false;
     if (sessStart) { st.bHi = x.h; st.bLo = x.l; st.bStart = x.t; st.bLive = true; st.bUp = false; st.bDn = false; }
-    else if (st.bLive) { if (x.t - st.bStart < P.boxHours * H1) { st.bHi = Math.max(st.bHi, x.h); st.bLo = Math.min(st.bLo, x.l); } else st.bLive = false; }
-    else if (isFinite(st.bHi)) {
+    else { if (st.bLive) { if (x.t - st.bStart < P.boxHours * H1) { st.bHi = Math.max(st.bHi, x.h); st.bLo = Math.min(st.bLo, x.l); } else st.bLive = false; }
+    if (!st.bLive && isFinite(st.bHi)) {
       if (!st.bUp && x.c > st.bHi && x.c > x.o && body >= dispReq) { boxUp = true; st.bUp = true; }
-      if (!st.bDn && x.c < st.bLo && x.c < x.o && body >= dispReq) { boxDn = true; st.bDn = true; } }
+      if (!st.bDn && x.c < st.bLo && x.c < x.o && body >= dispReq) { boxDn = true; st.bDn = true; } } }
     // volume profile (session reset)
     if (sessStart || !isFinite(st.step)) { st.vp.clear(); st.step = Math.max(a * 0.05, 1e-12); st.pocB = NaN; st.pocV = 0; }
     if (x.v > 0) { const lb = Math.floor(x.l / st.step), hb = Math.floor(x.h / st.step), nb = hb - lb + 1, ch = Math.min(nb, 40);
