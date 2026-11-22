@@ -276,6 +276,9 @@ var string lastOpin = "Scanning"
 var string lastLook = "Scanning for confluence"
 var bool lastOk     = true
 var int waitDir     = 0
+var int exitBar     = -100000
+var string tName    = ""
+var string resName  = ""
 var int waitBar     = 0
 var float waitTop   = na
 var float waitBot   = na
@@ -492,10 +495,10 @@ bullGap = low > high[2] and (low - high[2]) >= fvgMinAtr * atr14
 bearGap = high < low[2] and (low[2] - high) >= fvgMinAtr * atr14
 if showFVG and bullGap
     b = box.new(bar_index - 2, low, bar_index + liqExt, high[2], border_color = color.new(cBullLbl, 60), border_style = fvgStyle, bgcolor = cBullFVG, text = "VOID (FVG)", text_size = size.tiny, text_color = color.new(#b2b5be, fvgTxtT), text_halign = text.align_right, text_valign = text.align_center)
-    array.push(fvgs, Zone.new(b, low, high[2], 1, bar_index, "Liquidity Void (FVG)"))
+    array.push(fvgs, Zone.new(b, low, high[2], 1, bar_index, "Fair Value Gap (FVG)"))
 if showFVG and bearGap
     b = box.new(bar_index - 2, low[2], bar_index + liqExt, high, border_color = color.new(cBearLbl, 60), border_style = fvgStyle, bgcolor = cBearFVG, text = "VOID (FVG)", text_size = size.tiny, text_color = color.new(#b2b5be, fvgTxtT), text_halign = text.align_right, text_valign = text.align_center)
-    array.push(fvgs, Zone.new(b, low[2], high, -1, bar_index, "Liquidity Void (FVG)"))
+    array.push(fvgs, Zone.new(b, low[2], high, -1, bar_index, "Fair Value Gap (FVG)"))
 f_trim(fvgs, fvgMax * 2)
 
 [obBH, obSH, obBT, obBB, obST, obSB, obKB, obKS] = f_update(obs, false, true)
@@ -825,8 +828,10 @@ useR = engine != "Breakout Only"
 useV = engine == "Sweep-OB / Void Retest Only"
 useS = engine == "Sweep-OB / Void Retest Only"
 
-zBullHit = obBH or mtBH or (useV and fvBH)
-zBearHit = obSH or mtSH or (useV and fvSH)
+zBullHit = obBH or mtBH or fvBH
+zBearHit = obSH or mtSH or fvSH
+zBullKind = obBH ? obKB : mtBH ? mtKB : fvKB
+zBearKind = obSH ? obKS : mtSH ? mtKS : fvKS
 swL = useS and sweepBull and lowerWick >= 0.35 and buyPct >= 50
 swS = useS and sweepBear and upperWick >= 0.35 and buyPct <= 50
 rtL = useR and zBullHit and close > open
@@ -841,8 +846,9 @@ slS = f_sl(-1)
 [qL, scL, whyL, lkL] = f_eval(1, lType, math.abs(close - slL))
 [qS, scS, whyS, lkS] = f_eval(-1, sType, math.abs(close - slS))
 
-gateL = barstate.isconfirmed and lType != "" and sType == "" and sessionOk and (tDir != 1 or (allowCont and bar_index - lastSigBar >= minBetween))
-gateS = barstate.isconfirmed and sType != "" and lType == "" and sessionOk and (tDir != -1 or (allowCont and bar_index - lastSigBar >= minBetween))
+coolOk = bar_index - exitBar >= 3   // "Cycle Cooldown: x/3 bars elapsed before next hunt"
+gateL = barstate.isconfirmed and coolOk and lType != "" and sType == "" and sessionOk and (tDir != 1 or (allowCont and bar_index - lastSigBar >= minBetween))
+gateS = barstate.isconfirmed and coolOk and sType != "" and lType == "" and sessionOk and (tDir != -1 or (allowCont and bar_index - lastSigBar >= minBetween))
 
 bool recL = false
 bool recS = false
@@ -922,6 +928,8 @@ if not na(exitPx)
     array.clear(tLines)
     array.clear(tLabels)
     tDir := 0
+    exitBar := bar_index
+    resName := tName
 
 f_lvl(float y, color c, string st, int w, string txt) =>
     l = line.new(bar_index, y, bar_index + tgtExt, y, color = c, style = f_style(st), width = w)
@@ -940,6 +948,9 @@ if takeL or takeS
     tTP2   := close + d * tp2M * tRisk
     tTP3   := close + d * tp3M * tRisk
     tStage := 0
+    lNm = lType == "retest" ? zBullKind + " Retest" : boxBreakUp and not bullBreak ? "Session Breakout" : "Structure Breakout"
+    sNm = sType == "retest" ? zBearKind + " Retest" : boxBreakDn and not bearBreak ? "Session Breakout" : "Structure Breakout"
+    tName := (takeL ? lNm + " (" + (recL ? "RETEST TAKE" : qL) + ")" : sNm + " (" + (recS ? "RETEST TAKE" : qS) + ")")
     lastSigDir := d
     lastSigBar := bar_index
     [l0, b0] = f_lvl(tSL, cSL, slStyleIn, slW, "SL")
@@ -1116,6 +1127,15 @@ if barstate.islast and hudOn
             f_cell(0, 6, "   What To Look For: " + lookTxt, lookCol)
             f_cell(0, 7, "• Trailing SL: Move Stop " + str.tostring(pips, "#.#") + " pips from entry → Set SL at " + f_px(trailSug), cWhite)
             f_cell(0, 8, "• Target Expansion: Seeking continuation to " + nextTgt, cTeal)
+        else if bar_index - exitBar <= 3 and resName != ""
+            gateTxt = isChoppy ? "CHOPPY RANGE" : isWeak ? "WEAK TREND" : "CLEAN TREND"
+            f_cell(0, 0, "🔄  TS FLOW AI: TRADE RESOLVED", #ffa726)
+            f_cell(0, 1, "• Position State: Setup closed / resolved", cWhite)
+            f_cell(0, 2, "   Cycle Cooldown: " + str.tostring(math.min(bar_index - exitBar, 3)) + "/3 bars elapsed before next hunt", cGray)
+            f_cell(0, 3, "• Resolved Setup: " + resName, cWhite)
+            f_cell(0, 4, "• ADR Range: " + str.tostring(adrPct, "#.#") + "% | Gate: " + gateTxt, cWhite)
+            f_cell(0, 5, "• Sweeps: " + sweepTxt, cWhite)
+            f_cell(0, 6, "• Next Seeking Setup: Stand by for next session cycle", cTeal)
         else
             f_cell(0, 0, "🤖  TS ORDER FLOW: CONSOLIDATING", structTrend == 1 ? #ffa726 : cTeal)
             f_cell(0, 1, "• Bias: " + biasTxt + " | HTF: " + htfTxt, cWhite)

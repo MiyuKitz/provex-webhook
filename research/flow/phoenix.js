@@ -35,7 +35,7 @@ function runPhoenix(b, htf, daily, opts = {}) {
   const dAtr = rma(trs(daily), P.adrLen);
   const htfPools = htfMs > tf && P.htfOn;
   let hi = -1, di = -1;
-  const st = { obs: [], mits: [], pools: [], recHi: [], recLo: [], swHi: NaN, swHiDone: true, swLo: NaN, swLoDone: true, trend: 0,
+  const st = { obs: [], mits: [], fvgs: [], exitI: -1e9, pools: [], recHi: [], recLo: [], swHi: NaN, swHiDone: true, swLo: NaN, swLoDone: true, trend: 0,
     bHi: NaN, bLo: NaN, bStart: 0, bLive: false, bUp: false, bDn: false, prevSess: -1, vp: new Map(), step: NaN, pocB: NaN, pocV: 0, dayKey: null, dHi: 0, dLo: 0,
     lastSigDir: 0, lastSigBar: -1e9, T: null };
   const trades = [];
@@ -72,7 +72,15 @@ function runPhoenix(b, htf, daily, opts = {}) {
     const upd = (zs, mk) => { let B = false, S = false; for (let k = zs.length - 1; k >= 0; k--) { const z = zs[k]; let dead;
       if (z.dir === 1) { if (i > z.born && x.l <= z.top && x.c >= z.bot) B = true; dead = x.c < z.bot; } else { if (i > z.born && x.h >= z.bot && x.c <= z.top) S = true; dead = x.c > z.top; }
       if (dead && i > z.born) { if (mk) st.mits.push({ top: z.top, bot: z.bot, dir: -z.dir, born: i }); zs.splice(k, 1); } } return [B, S]; };
-    const [obB, obS] = upd(st.obs, true), [mtB, mtS] = upd(st.mits, false); while (st.mits.length > P.mitMax) st.mits.shift();
+    const b2 = b[i - 2];
+    if (x.l > b2.h && x.l - b2.h >= P.fvgMinAtr * a) st.fvgs.push({ top: x.l, bot: b2.h, dir: 1, born: i, fvg: true });
+    if (x.h < b2.l && b2.l - x.h >= P.fvgMinAtr * a) st.fvgs.push({ top: b2.l, bot: x.h, dir: -1, born: i, fvg: true });
+    while (st.fvgs.length > P.fvgMax * 2) st.fvgs.shift();
+    const updF = zs => { let B = false, S = false; for (let k = zs.length - 1; k >= 0; k--) { const z = zs[k]; let dead;
+      if (z.dir === 1) { if (i > z.born && x.l <= z.top && x.c >= z.bot) B = true; dead = x.l <= z.bot; } else { if (i > z.born && x.h >= z.bot && x.c <= z.top) S = true; dead = x.h >= z.top; }
+      if (dead && i > z.born) zs.splice(k, 1); } return [B, S]; };
+    const [obB, obS] = upd(st.obs, true), [mtB, mtS] = upd(st.mits, false);
+    const [fvB, fvS] = updF(st.fvgs); while (st.mits.length > P.mitMax) st.mits.shift();
     // pools
     for (const [L, maj] of [[P.minorLen, false], [P.majorLen, true]]) { const a1 = pivot(b, i, L, true), a2 = pivot(b, i, L, false); if (isFinite(a1)) addPool(a1, 1, maj, false); if (isFinite(a2)) addPool(a2, -1, maj, false); }
     let nB = NaN, nS = NaN, nBH = false, nSH = false;
@@ -93,7 +101,7 @@ function runPhoenix(b, htf, daily, opts = {}) {
       for (let c = 0; c < ch; c++) { const k = lb + Math.floor(c * nb / ch), v = (st.vp.get(k) || 0) + x.v / ch; st.vp.set(k, v); if (v > st.pocV) { st.pocV = v; st.pocB = k; } } }
     const poc = isFinite(st.pocB) ? (st.pocB + 0.5) * st.step : NaN;
     // setups (engine: Hybrid = breakout + OB/mitigation retest)
-    const rtL = (obB || mtB) && x.c > x.o, rtS = (obS || mtS) && x.c < x.o;
+    const rtL = (obB || mtB || fvB) && x.c > x.o, rtS = (obS || mtS || fvS) && x.c < x.o;
     const boL = x.c > x.o && body >= dispReq && (bullBreak || boxUp), boS = x.c < x.o && body >= dispReq && (bearBreak || boxDn);
     const lT = rtL ? "retest" : boL ? "breakout" : "", sT = rtS ? "retest" : boS ? "breakout" : "";
     const ev = (dir, stype) => { if (!stype) return ""; let score = 0, hard = false, soft = false; const rulesOn = P.setupRules && !P.useWeighted, risk = P.atrMult * a;
@@ -108,8 +116,9 @@ function runPhoenix(b, htf, daily, opts = {}) {
       if (Math.abs(x.c - ema10[i]) / a > 1.5 && !(rulesOn && stype === "breakout")) { score--; soft = true; }
       return P.useWeighted ? (hard && P.softHard ? "AVOID" : score >= P.minTake ? "TAKE" : score >= P.minWait ? "WAIT" : "AVOID") : hard ? "AVOID" : soft ? "WAIT" : "TAKE"; };
     const tDir = st.T ? st.T.dir : 0;
-    const gL = lT && !sT && (tDir !== 1 || (P.allowCont && i - st.lastSigBar >= P.minBetween));
-    const gS = sT && !lT && (tDir !== -1 || (P.allowCont && i - st.lastSigBar >= P.minBetween));
+    const cool = i - st.exitI >= 3;
+    const gL = cool && lT && !sT && (tDir !== 1 || (P.allowCont && i - st.lastSigBar >= P.minBetween));
+    const gS = cool && sT && !lT && (tDir !== -1 || (P.allowCont && i - st.lastSigBar >= P.minBetween));
     const qL = gL ? ev(1, lT) : "", qS = gS ? ev(-1, sT) : "";
     const classic = P.style === "classic";
     let takeL = gL && (classic || qL === "TAKE"), takeS = gS && (classic || qS === "TAKE");
@@ -124,7 +133,7 @@ function runPhoenix(b, htf, daily, opts = {}) {
         if (T.stage < 2 && x.l <= T.tp2) { T.stage = 2; T.hit2 = true; T.sl = Math.min(T.sl, T.tp1); }
         if (x.l <= T.tp3) { ex = T.tp3; T.hit3 = true; } else if (T.stage >= 1) T.sl = Math.min(T.sl, x.c + (T.stage >= 2 ? P.trail2 : P.trail1) * a); } }
       if (!isFinite(ex) && ((T.dir === 1 && takeS) || (T.dir === -1 && takeL))) { ex = x.c; T.opp = true; }
-      if (isFinite(ex)) { trades.push({ ...T, exit: ex, exitT: x.t, R: (ex - T.e) / T.risk * T.dir }); st.T = null; } }
+      if (isFinite(ex)) { trades.push({ ...T, exit: ex, exitT: x.t, R: (ex - T.e) / T.risk * T.dir }); st.T = null; st.exitI = i; } }
     if (takeL || takeS) { const d = takeL ? 1 : -1, sl = x.c - d * P.atrMult * a, r = Math.abs(x.c - sl);
       st.T = { dir: d, bar: i, t: x.t, e: x.c, sl, risk: r, d: r / x.c, tp1: x.c + d * P.tp1 * r, tp2: x.c + d * P.tp2 * r, tp3: x.c + d * P.tp3 * r, stage: 0, hit1: false, hit2: false, hit3: false,
         setup: (takeL ? lT : sT), q: takeL ? qL : qS };
