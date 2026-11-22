@@ -458,8 +458,9 @@ f_update(array<Zone> zs, bool isFvg, bool makeMit) =>
                     sB := z.bot
                     kS := z.kind
                 dead := isFvg ? (fvgMode == "50% Consequent Encroachment (CE)" ? high >= (z.top + z.bot) / 2 : high >= z.top) : close > z.top
-            if dead and bar_index > z.born
-                if makeMit and showMit
+            bool tapped = bar_index > z.born and (z.dir == 1 ? (low <= z.top and close >= z.bot) : (high >= z.bot and close <= z.top))
+            if (dead and bar_index > z.born) or (purgeSMC and tapped)
+                if dead and makeMit and showMit
                     mb = box.new(z.born, z.top, bar_index + liqExt, z.bot, border_color = color.new(#787b86, 30), border_style = mitStyle, bgcolor = cMit, text = "MITIGATION", text_size = size.tiny, text_color = color.new(#b2b5be, mitTxtT), text_halign = text.align_right, text_valign = text.align_center)
                     array.push(mits, Zone.new(mb, z.top, z.bot, -z.dir, bar_index, "Mitigation Block"))
                 if purgeSMC

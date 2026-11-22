@@ -4,7 +4,7 @@ const H1 = 3600000, DAY = 86400000;
 const DEF = {
   swingLen: 7, obSearch: 10, obMinDisp: 0.3, obMax: 5, mitMax: 4, fvgMinAtr: 0.1, fvgMax: 4,
   majorLen: 20, minorLen: 7, eqTol: 0.15, htfOn: true,
-  boxHours: 3, adaptive: true, useHtf: false, adrLen: 14, adrLimit: 85,
+  boxHours: 3, purgeTap: true, adaptive: true, useHtf: false, adrLen: 14, adrLimit: 85,
   chopLen: 14, chopThr: 55, adxLen: 14, adxMin: 20,
   style: "classic", allowCont: false, minBetween: 23, dispBody: 0.35,
   blockLiq: true, reqDelta: true, reqVP: true, useWeighted: false, minTake: 2, minWait: 0, setupRules: true, softHard: true,
@@ -71,14 +71,17 @@ function runPhoenix(b, htf, daily, opts = {}) {
     while (st.obs.length > P.obMax * 2) st.obs.shift();
     const upd = (zs, mk) => { let B = false, S = false; for (let k = zs.length - 1; k >= 0; k--) { const z = zs[k]; let dead;
       if (z.dir === 1) { if (i > z.born && x.l <= z.top && x.c >= z.bot) B = true; dead = x.c < z.bot; } else { if (i > z.born && x.h >= z.bot && x.c <= z.top) S = true; dead = x.c > z.top; }
-      if (dead && i > z.born) { if (mk) st.mits.push({ top: z.top, bot: z.bot, dir: -z.dir, born: i }); zs.splice(k, 1); } } return [B, S]; };
+      const tapped = i > z.born && (z.dir === 1 ? (x.l <= z.top && x.c >= z.bot) : (x.h >= z.bot && x.c <= z.top));
+      if (dead && i > z.born && mk) st.mits.push({ top: z.top, bot: z.bot, dir: -z.dir, born: i });
+      if ((dead && i > z.born) || (P.purgeTap && tapped)) zs.splice(k, 1); } return [B, S]; };
     const b2 = b[i - 2];
     if (x.l > b2.h && x.l - b2.h >= P.fvgMinAtr * a) st.fvgs.push({ top: x.l, bot: b2.h, dir: 1, born: i, fvg: true });
     if (x.h < b2.l && b2.l - x.h >= P.fvgMinAtr * a) st.fvgs.push({ top: b2.l, bot: x.h, dir: -1, born: i, fvg: true });
     while (st.fvgs.length > P.fvgMax * 2) st.fvgs.shift();
     const updF = zs => { let B = false, S = false; for (let k = zs.length - 1; k >= 0; k--) { const z = zs[k]; let dead;
       if (z.dir === 1) { if (i > z.born && x.l <= z.top && x.c >= z.bot) B = true; dead = x.l <= z.bot; } else { if (i > z.born && x.h >= z.bot && x.c <= z.top) S = true; dead = x.h >= z.top; }
-      if (dead && i > z.born) zs.splice(k, 1); } return [B, S]; };
+      const tapped = i > z.born && (z.dir === 1 ? (x.l <= z.top && x.c >= z.bot) : (x.h >= z.bot && x.c <= z.top));
+      if ((dead && i > z.born) || (P.purgeTap && tapped)) zs.splice(k, 1); } return [B, S]; };
     const [obB, obS] = upd(st.obs, true), [mtB, mtS] = upd(st.mits, false);
     const [fvB, fvS] = updF(st.fvgs); while (st.mits.length > P.mitMax) st.mits.shift();
     // pools
