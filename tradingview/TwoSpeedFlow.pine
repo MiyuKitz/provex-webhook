@@ -816,7 +816,7 @@ f_eval(int dir, string stype, float risk) =>
         why := "Low Confidence Score (" + str.tostring(score) + ")"
     if q == "WAIT" and why == ""
         why := "Moderate Confidence Score (" + str.tostring(score) + ")"
-    string lk = q == "TAKE" ? "Targeting TP1 expansion" : q == "WAIT" ? "Wait for pullback to 10 EMA / origin zone" : look == "" ? "Stand aside" : look
+    string lk = q == "TAKE" ? (stype == "breakout" ? "Targeting TP1 momentum push" : "Targeting TP1 expansion") : q == "WAIT" ? "Wait for pullback to 10 EMA / origin zone" : look == "" ? "Stand aside" : look
     [q, score, why, lk]
 
 useB = engine == "Breakout Only" or engine == "Hybrid (Breakout + OB Retest)"
@@ -889,6 +889,8 @@ if tDir != 0 and bar_index > tBar and barstate.isconfirmed
                 tSL := math.max(tSL, tTP1)
             if high >= tTP3
                 exitPx := tTP3
+            else if tStage >= 1
+                tSL := math.max(tSL, close - (tStage >= 2 ? 1.0 : 1.5) * atr14)
     else
         if high >= tSL
             exitPx := tSL
@@ -901,6 +903,8 @@ if tDir != 0 and bar_index > tBar and barstate.isconfirmed
                 tSL := math.min(tSL, tTP1)
             if low <= tTP3
                 exitPx := tTP3
+            else if tStage >= 1
+                tSL := math.min(tSL, close + (tStage >= 2 ? 1.0 : 1.5) * atr14)
 if na(exitPx) and tDir != 0 and ((tDir == 1 and takeS) or (tDir == -1 and takeL))
     exitPx := close
 if not na(exitPx)
@@ -950,8 +954,8 @@ if takeL or takeS
     array.push(tLabels, b3)
     array.push(tLabels, b4)
 
-// NOTE: dynamic trailing suggestion = 1.5 x ATR from price, never looser than the active SL
-trailSug = tDir == 1 ? math.max(tSL, close - 1.5 * atr14) : tDir == -1 ? math.min(tSL, close + 1.5 * atr14) : na
+// Trailing: before TP1 the HUD suggests a 1.5 x ATR trail; after TP1 the stop itself trails (1.5 x ATR, 1.0 x ATR after TP2)
+trailSug = tDir == 0 ? na : tStage >= 1 ? tSL : tDir == 1 ? math.max(tSL, close - 1.5 * atr14) : math.min(tSL, close + 1.5 * atr14)
 plot(showTrail and tDir != 0 ? trailSug : na, "Dynamic Trailing Line", color = cTrail, style = plot.style_linebr, linewidth = 1)
 
 if takeL or waitL or avoidL
@@ -1086,16 +1090,16 @@ if barstate.islast and hudOn
     pbRisk = pbExt < 0.75 ? "LOW" : pbExt < 1.5 ? "NORMAL" : "HIGH"
     pips = tDir != 0 ? (trailSug - tEntry) * tDir / syminfo.mintick : 0.0
     nextTgt = tStage == 0 ? "TP1 (" + f_px(tTP1) + ")" : tStage == 1 ? "TP2 (" + f_px(tTP2) + ")" : "TP3 (" + f_px(tTP3) + ")"
-    lookTxt = tDir != 0 and lastOk ? (tStage == 0 ? "Targeting TP1 expansion" : tStage == 1 ? "SL At Breakeven — targeting TP2" : "Runner — seeking TP3") : lastLook
+    lookTxt = tDir != 0 and lastOk ? (tStage == 0 ? lastLook : tStage == 1 ? "SL At Breakeven — targeting TP2" : "Runner — seeking TP3") : lastLook
     opinCol = str.contains(lastQ, "TAKE") ? cTeal : lastQ == "WAIT" ? cWait : lastQ == "AVOID" ? cPink : cTeal
     lookCol = lastQ == "AVOID" or lastQ == "WAIT" ? cPink : cTeal
     biasTxt = (structTrend == 1 ? "BULLISH" : structTrend == -1 ? "BEARISH" : "NEUTRAL") + (na(pocPx) ? "" : close > pocPx ? " (Above POC)" : " (Below POC)")
     htfTxt = htfBias == 1 ? "BULL" : htfBias == -1 ? "BEAR" : "N/A"
-    sesTxt = restrictSes ? (inMorning ? "Morning (Active)" : inEvening ? "Evening (Active)" : "Closed (Filtered)") : "Open (Global)"
+    sesTxt = inMorning ? "Morning Session" : inEvening ? "Evening Session" : restrictSes ? "Closed (Filtered)" : "Open (Global)"
     adrTxt = str.tostring(adrPct, "#.#") + "%" + (adrExh ? " [EXHAUSTED]" : "")
     absorb = vol > volAvg * 1.5 and body < 0.3 * atr14
     flowTxt = absorb ? "Institutional Absorption" : sDelta > 0 ? "Buying Dominance" : sDelta < 0 ? "Selling Dominance" : "Balanced"
-    dTxt = (sDelta > 0 ? "+" : "") + str.tostring(sDelta, format.volume)
+    dTxt = (sDelta > 0 ? "+" : "") + str.tostring(math.round(sDelta))
     sweepTxt = "Asia High: " + (aSweptH ? "Swept" : "Intact") + " | Asia Low: " + (aSweptL ? "Swept" : "Intact")
     pressTxt = str.tostring(buyPct, "#") + "% Buy Volume vs " + str.tostring(100 - buyPct, "#") + "% Sell Volume"
     regimeTxt = isChoppy ? "CONSOLIDATING" : isWeak ? "WEAK TREND" : structTrend == 1 ? "TRENDING UP" : structTrend == -1 ? "TRENDING DOWN" : "CONSOLIDATING"
