@@ -840,8 +840,8 @@ slS = f_sl(-1)
 [qL, scL, whyL, lkL] = f_eval(1, lType, math.abs(close - slL))
 [qS, scS, whyS, lkS] = f_eval(-1, sType, math.abs(close - slS))
 
-gateL = barstate.isconfirmed and lType != "" and sType == "" and sessionOk and tDir != 1 and (lastSigDir != 1 or (allowCont and bar_index - lastSigBar >= minBetween))
-gateS = barstate.isconfirmed and sType != "" and lType == "" and sessionOk and tDir != -1 and (lastSigDir != -1 or (allowCont and bar_index - lastSigBar >= minBetween))
+gateL = barstate.isconfirmed and lType != "" and sType == "" and sessionOk and (tDir != 1 or (allowCont and bar_index - lastSigBar >= minBetween))
+gateS = barstate.isconfirmed and sType != "" and lType == "" and sessionOk and (tDir != -1 or (allowCont and bar_index - lastSigBar >= minBetween))
 
 bool recL = false
 bool recS = false
@@ -1034,7 +1034,7 @@ if barstate.islast and vpOn
         fullW = math.max(4, math.min(400, int(spanBars * vpWidthP / 100)))
         split = vpLayout == "Split Buy/Sell (Bidirectional)"
         cx = split ? vpStart + int(fullW / 2) : vpStart
-        if (showHist or showNodes) and mx > 0
+        if showHist and mx > 0
             for r = 0 to rows - 1
                 v = array.get(rv, r)
                 if v > 0
@@ -1116,7 +1116,7 @@ if barstate.islast and hudOn
             f_cell(0, 7, "• Trailing SL: Move Stop " + str.tostring(pips, "#.#") + " pips from entry → Set SL at " + f_px(trailSug), cWhite)
             f_cell(0, 8, "• Target Expansion: Seeking continuation to " + nextTgt, cTeal)
         else
-            f_cell(0, 0, "🤖  TS ORDER FLOW: " + regimeTxt, structTrend == 1 ? #ffa726 : cTeal)
+            f_cell(0, 0, "🤖  TS ORDER FLOW: CONSOLIDATING", structTrend == 1 ? #ffa726 : cTeal)
             f_cell(0, 1, "• Bias: " + biasTxt + " | HTF: " + htfTxt, cWhite)
             f_cell(0, 2, "   Session: " + sesTxt + " | ADR: " + adrTxt, cGray)
             f_cell(0, 3, "• Order Flow State: " + flowTxt + " | Net Δ: " + dTxt, cWhite)

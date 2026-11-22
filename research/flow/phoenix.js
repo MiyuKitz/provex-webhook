@@ -108,8 +108,8 @@ function runPhoenix(b, htf, daily, opts = {}) {
       if (Math.abs(x.c - ema10[i]) / a > 1.5 && !(rulesOn && stype === "breakout")) { score--; soft = true; }
       return P.useWeighted ? (hard && P.softHard ? "AVOID" : score >= P.minTake ? "TAKE" : score >= P.minWait ? "WAIT" : "AVOID") : hard ? "AVOID" : soft ? "WAIT" : "TAKE"; };
     const tDir = st.T ? st.T.dir : 0;
-    const gL = lT && !sT && tDir !== 1 && (st.lastSigDir !== 1 || (P.allowCont && i - st.lastSigBar >= P.minBetween));
-    const gS = sT && !lT && tDir !== -1 && (st.lastSigDir !== -1 || (P.allowCont && i - st.lastSigBar >= P.minBetween));
+    const gL = lT && !sT && (tDir !== 1 || (P.allowCont && i - st.lastSigBar >= P.minBetween));
+    const gS = sT && !lT && (tDir !== -1 || (P.allowCont && i - st.lastSigBar >= P.minBetween));
     const qL = gL ? ev(1, lT) : "", qS = gS ? ev(-1, sT) : "";
     const classic = P.style === "classic";
     let takeL = gL && (classic || qL === "TAKE"), takeS = gS && (classic || qS === "TAKE");
