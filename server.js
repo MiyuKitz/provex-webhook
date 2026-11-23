@@ -1127,7 +1127,7 @@ ${trail2 ? `<b>Breakeven:</b> at +${AGGRO_BE_R}R ($${agFmt(fillPx + sgn * AGGRO_
 ${AGGRO_STRATS.map(n => `${sig.agree.includes(n) ? "✅" : "▫️"} ${CF_LABEL[n]}${sig.triggers.includes(n) ? " ← trigger" : ""}`).join("\n")}
 ${sig.withTrend ? "✅" : "▫️"} With the 4H trend
 
-<b>Size:</b> ${filled} ${coin} (≈ ${agFmt(+(filled * px).toFixed(0))} VST) │ risk ≈ ${agFmt(+(filled * R).toFixed(0))} VST
+<b>Size:</b> ${filled} ${coin} (≈ ${agFmt(+(filled * px).toFixed(0))} VST) │ <b>Margin:</b> ≈ ${agFmt(+(filled * px / lev).toFixed(0))} VST │ risk ≈ ${agFmt(+(filled * R).toFixed(0))} VST
 <b>Aggro balance:</b> ${agFmt(+a.balance.toFixed(0))} VST │ ${+(AGGRO_RISK * 100).toFixed(2)}% at risk per trade
 ${stop.ok ? "✅ Stop placed" : "❌ Stop NOT placed, check BingX"}${trail2 ? "" : ` │ ${tp.ok ? "✅ TP1 placed" : "❌ TP1 not placed"}`}`);
 }
