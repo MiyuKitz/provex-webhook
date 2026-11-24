@@ -1,6 +1,6 @@
 //@version=6
 // ============================================================================
-//  TWO-SPEED FLOW  v2.1  (Next-Trade Scout HUD, Auto HTF, signal age)
+//  TWO-SPEED FLOW  v2.1.1  (Next-Trade Scout HUD, Auto HTF, signal age)
 //  Rebuilt to match the settings, defaults, chart objects and HUD layout of the
 //  reference order-flow indicator, from its public description, settings
 //  screens and chart screenshots. Same inputs, same defaults, same HUD rows.
@@ -1181,11 +1181,35 @@ roomS = na(nearSSL) or close - nearSSL >= math.max(tp1M, 1.0) * scRisk
 cleanReg = not isChoppy and not isWeak
 ckL = array.from(htfBias == 1, structTrend == 1, buyPct >= 50, na(pocPx) or close > pocPx, cleanReg, roomL, not adrExh)
 ckS = array.from(htfBias == -1, structTrend == -1, buyPct <= 50, na(pocPx) or close < pocPx, cleanReg, roomS, not adrExh)
-ckNames = array.from("HTF", "Struct", "Flow", "POC", "Regime", "Room", "ADR")
+ckNames = array.from("HTF", "Str", "Flow", "POC", "Reg", "Room", "ADR")
+f_why(string w) =>
+    string r = w
+    r := str.replace_all(r, "Fighting HTF Trend", "HTF against")
+    r := str.replace_all(r, "Clean Breakout Confluence", "clean breakout")
+    r := str.replace_all(r, "Prime Retest Confluence", "clean retest")
+    r := str.replace_all(r, "Liquidity Sweep Confluence", "clean sweep")
+    r := str.replace_all(r, "Pullback Confirmed", "pullback done")
+    r := str.replace_all(r, "Counter-Structure Retest", "vs structure")
+    r := str.replace_all(r, "Delta Not Confirming", "flow weak")
+    r := str.replace_all(r, "Testing Under POC", "under POC")
+    r := str.replace_all(r, "Testing Above POC", "above POC")
+    r := str.replace_all(r, "Choppy Regime Breakout", "chop")
+    r := str.replace_all(r, "Major Liquidity Trap", "major liq ahead")
+    r := str.replace_all(r, "Minor Liquidity Ahead", "minor liq ahead")
+    r := str.replace_all(r, "Breakout Into Liquidity", "liq ahead")
+    r := str.replace_all(r, "Liquidity Ahead", "liq ahead")
+    r := str.replace_all(r, "ADR Exhausted Breakout", "ADR used up")
+    r := str.replace_all(r, "ADR Stretched", "ADR stretched")
+    r := str.replace_all(r, "EMA Overextension", "overextended")
+    r := str.replace_all(r, "High Confidence Score", "score")
+    r := str.replace_all(r, "Moderate Confidence Score", "score")
+    r := str.replace_all(r, "Low Confidence Score", "score")
+    r
+
 f_ckLine(array<bool> ck) =>
     string o = ""
     for i = 0 to array.size(ck) - 1
-        o += (i == 0 ? "" : "  ") + array.get(ckNames, i) + " " + (array.get(ck, i) ? "✅" : "❌")
+        o += (i == 0 ? "" : " ") + array.get(ckNames, i) + (array.get(ck, i) ? "✅" : "❌")
     o
 f_ckCount(array<bool> ck) =>
     int n = 0
@@ -1258,28 +1282,32 @@ if barstate.islast and hudOn
             nL = f_ckCount(ckL)
             nS = f_ckCount(ckS)
             lean = nL - nS >= 2 ? 1 : nS - nL >= 2 ? -1 : 0
-            leanTxt = lean == 1 ? "LONG" : lean == -1 ? "SHORT" : "NONE (mixed)"
             [bzT, bzB, bzK] = f_pickZone(obs, mits, fvgs, 1, close)
             [szT, szB, szK] = f_pickZone(obs, mits, fvgs, -1, close)
-            bTrigTxt = na(buyTrig) ? "no open level above — wait for a new swing / session" : "strong close above " + f_px(buyTrig) + " (" + buyFrom + ", +" + str.tostring((buyTrig - close) / close * 100, "#.##") + "%)"
-            sTrigTxt = na(sellTrig) ? "no open level below — wait for a new swing / session" : "strong close below " + f_px(sellTrig) + " (" + sellFrom + ", -" + str.tostring((close - sellTrig) / close * 100, "#.##") + "%)"
-            zoneTxtL = na(bzT) ? "none below" : bzK + " " + f_px(bzB) + "–" + f_px(bzT)
-            zoneTxtS = na(szT) ? "none above" : szK + " " + f_px(szB) + "–" + f_px(szT)
-            liqTxt = "BSL " + (na(nearBSL) ? "none" : f_px(nearBSL) + (nearBSLHard ? " (major)" : "")) + "  |  SSL " + (na(nearSSL) ? "none" : f_px(nearSSL) + (nearSSLHard ? " (major)" : ""))
-            leadQ = lean == 1 ? rdL : lean == -1 ? rdS : ""
-            leadWhy = lean == 1 ? rwL : lean == -1 ? rwS : ""
-            planTxt = lean == 0 ? "No-trade zone: sides are split (" + str.tostring(nL) + " vs " + str.tostring(nS) + "). Wait for HTF + structure to line up" : leadQ == "TAKE" ? "Ready: " + (lean == 1 ? "BUY on a " + (na(buyTrig) ? "bull breakout / zone retest" : "strong close above " + f_px(buyTrig)) : "SELL on a " + (na(sellTrig) ? "bear breakout / zone retest" : "strong close below " + f_px(sellTrig))) : "Lean " + leanTxt + " but a breakout now = " + leadQ + " (" + leadWhy + "). Better: retest of " + (lean == 1 ? zoneTxtL : zoneTxtS)
-            f_cell(0, 0, "🔭  TS FLOW AI: NEXT TRADE SCOUT  |  " + regimeTxt, lean == 1 ? cTeal : lean == -1 ? cPink : #ffa726)
-            f_cell(0, 1, "• Lean: " + leanTxt + "  (long " + str.tostring(nL) + "/7 vs short " + str.tostring(nS) + "/7) | Bias: " + biasTxt + " | HTF " + htfTxt, cWhite)
-            f_cell(0, 2, "▲ BUY trigger: " + bTrigTxt, cTeal)
-            f_cell(0, 3, "   If it fired now: " + rdL + " — " + rwL + "   |   " + f_ckLine(ckL), rdL == "TAKE" ? cTeal : rdL == "WAIT" ? cWait : cGray)
-            f_cell(0, 4, "▼ SELL trigger: " + sTrigTxt, cPink)
-            f_cell(0, 5, "   If it fired now: " + rdS + " — " + rwS + "   |   " + f_ckLine(ckS), rdS == "TAKE" ? cPink : rdS == "WAIT" ? cWait : cGray)
-            f_cell(0, 6, "• Retest zones: Buy " + zoneTxtL + "  |  Sell " + zoneTxtS, cWhite)
-            f_cell(0, 7, "• Liquidity targets: " + liqTxt, cWhite)
-            f_cell(0, 8, "• Flow: " + flowTxt + " | " + pressTxt + " | ADR " + adrTxt, cGray)
-            f_cell(0, 9, "• Last signal: " + lastOpin + ageTxt, opinCol)
-            f_cell(0, 10, "• Plan: " + planTxt, lean == 1 ? cTeal : lean == -1 ? cPink : #ffa726)
+            regS = isChoppy ? "CHOP" : isWeak ? "WEAK" : structTrend == 1 ? "TREND ↑" : structTrend == -1 ? "TREND ↓" : "RANGE"
+            leanS = lean == 1 ? "LONG ↑" : lean == -1 ? "SHORT ↓" : "NONE"
+            biasS = (structTrend == 1 ? "↑" : structTrend == -1 ? "↓" : "–") + (na(pocPx) ? "" : close > pocPx ? " >POC" : " <POC")
+            htfS = htfName + " " + (htfBias == 1 ? "↑" : htfBias == -1 ? "↓" : "–")
+            bTrig = na(buyTrig) ? "▲ BUY: no level yet" : "▲ BUY > " + f_px(buyTrig) + " (" + (buyFrom == "swing high" ? "swing" : "session") + ", +" + str.tostring((buyTrig - close) / close * 100, "#.#") + "%) → " + rdL + (rdL == "TAKE" ? "" : ": " + f_why(rwL))
+            sTrig = na(sellTrig) ? "▼ SELL: no level yet" : "▼ SELL < " + f_px(sellTrig) + " (" + (sellFrom == "swing low" ? "swing" : "session") + ", -" + str.tostring((close - sellTrig) / close * 100, "#.#") + "%) → " + rdS + (rdS == "TAKE" ? "" : ": " + f_why(rwS))
+            zL = na(bzT) ? "–" : bzK + " " + f_px(bzB) + "–" + f_px(bzT)
+            zS = na(szT) ? "–" : szK + " " + f_px(szB) + "–" + f_px(szT)
+            liqS = "Liq: BSL " + (na(nearBSL) ? "–" : f_px(nearBSL) + (nearBSLHard ? "★" : "")) + " | SSL " + (na(nearSSL) ? "–" : f_px(nearSSL) + (nearSSLHard ? "★" : ""))
+            leadQ = lean == 1 ? rdL : rdS
+            planS = lean == 0 ? "👉 No trade: mixed. Wait HTF + structure align" : leadQ == "TAKE" ? (lean == 1 ? "👉 BUY on close > " + (na(buyTrig) ? "breakout" : f_px(buyTrig)) : "👉 SELL on close < " + (na(sellTrig) ? "breakout" : f_px(sellTrig))) : "👉 Lean " + (lean == 1 ? "↑" : "↓") + " but breakout = " + leadQ + ". Wait retest " + (lean == 1 ? zL : zS)
+            ageS = na(lastOpinBar) ? "" : " (" + str.tostring(bar_index - lastOpinBar) + " bars)"
+            lastS = lastQ == "" ? "Last: –" : "Last: " + lastQ + " · " + f_why(str.contains(lastOpin, " — ") ? str.substring(lastOpin, str.pos(lastOpin, " — ") + 3) : lastOpin) + ageS
+            cLean = lean == 1 ? cTeal : lean == -1 ? cPink : #ffa726
+            f_cell(0, 0, "🔭 NEXT TRADE | " + regS, cLean)
+            f_cell(0, 1, "Lean: " + leanS + " " + str.tostring(math.max(nL, nS)) + "/7 vs " + str.tostring(math.min(nL, nS)) + "/7 | Bias " + biasS + " | HTF " + htfS, cWhite)
+            f_cell(0, 2, bTrig, cTeal)
+            f_cell(0, 3, "   " + f_ckLine(ckL), cGray)
+            f_cell(0, 4, sTrig, cPink)
+            f_cell(0, 5, "   " + f_ckLine(ckS), cGray)
+            f_cell(0, 6, "Zones: 🟢 " + zL + " | 🔴 " + zS, cWhite)
+            f_cell(0, 7, liqS + " | " + (buyPct >= 50 ? "Buy " + str.tostring(buyPct, "#") : "Sell " + str.tostring(100 - buyPct, "#")) + "% | ADR " + str.tostring(adrPct, "#") + "%" + (adrExh ? "⚠" : ""), cGray)
+            f_cell(0, 8, lastS, opinCol)
+            f_cell(0, 9, planS, cLean)
         else
             f_cell(0, 0, "🤖  TS ORDER FLOW: CONSOLIDATING", structTrend == 1 ? #ffa726 : cTeal)
             f_cell(0, 1, "• Bias: " + biasTxt + " | HTF: " + htfTxt, cWhite)
@@ -1343,10 +1371,10 @@ if barstate.islast
     if scoutLn and scoutOn and tDir == 0
         if not na(buyTrig)
             scBuyLn := line.new(bar_index - 5, buyTrig, bar_index + 10, buyTrig, color = color.new(cTeal, 30), style = line.style_dotted, width = 1)
-            scBuyLb := label.new(bar_index + 10, buyTrig, "▲ BUY trigger " + f_px(buyTrig) + " [" + rdL + "]", style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.new(cTeal, 20), size = size.tiny)
+            scBuyLb := label.new(bar_index + 10, buyTrig, "▲ " + f_px(buyTrig) + " " + rdL, style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.new(cTeal, 20), size = size.tiny)
         if not na(sellTrig)
             scSellLn := line.new(bar_index - 5, sellTrig, bar_index + 10, sellTrig, color = color.new(cPink, 30), style = line.style_dotted, width = 1)
-            scSellLb := label.new(bar_index + 10, sellTrig, "▼ SELL trigger " + f_px(sellTrig) + " [" + rdS + "]", style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.new(cPink, 20), size = size.tiny)
+            scSellLb := label.new(bar_index + 10, sellTrig, "▼ " + f_px(sellTrig) + " " + rdS, style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.new(cPink, 20), size = size.tiny)
 
 // ═════════════════════════════ ALERTS ═════════════════════════════
 f_msg(int d, string q) =>
