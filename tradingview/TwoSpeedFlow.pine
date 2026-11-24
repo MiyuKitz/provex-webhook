@@ -279,6 +279,9 @@ var int waitDir     = 0
 var int exitBar     = -100000
 var string tName    = ""
 var string resName  = ""
+var string resHit   = ""
+var string resExit  = ""
+var bool resWin     = false
 var int waitBar     = 0
 var float waitTop   = na
 var float waitBot   = na
@@ -884,10 +887,12 @@ if waitRecov and (waitL or waitS) and not (classic and (takeL or takeS))
 
 // ═════════════════════════════ TRADE MANAGEMENT ═════════════════════════════
 float exitPx = na
+string exitWhy = ""
 if tDir != 0 and bar_index > tBar and barstate.isconfirmed
     if tDir == 1
         if low <= tSL
             exitPx := tSL
+            exitWhy := tStage == 0 ? "Stop Loss" : tSL <= tEntry ? "Breakeven stop" : "Trailing stop"
         else
             if tStage < 1 and high >= tTP1
                 tStage := 1
@@ -897,11 +902,13 @@ if tDir != 0 and bar_index > tBar and barstate.isconfirmed
                 tSL := math.max(tSL, tTP1)
             if high >= tTP3
                 exitPx := tTP3
+                exitWhy := "TP3"
             else if tStage >= 1
                 tSL := math.max(tSL, close - (tStage >= 2 ? 1.0 : 1.5) * atr14)
     else
         if high >= tSL
             exitPx := tSL
+            exitWhy := tStage == 0 ? "Stop Loss" : tSL >= tEntry ? "Breakeven stop" : "Trailing stop"
         else
             if tStage < 1 and low <= tTP1
                 tStage := 1
@@ -911,11 +918,18 @@ if tDir != 0 and bar_index > tBar and barstate.isconfirmed
                 tSL := math.min(tSL, tTP1)
             if low <= tTP3
                 exitPx := tTP3
+                exitWhy := "TP3"
             else if tStage >= 1
                 tSL := math.min(tSL, close + (tStage >= 2 ? 1.0 : 1.5) * atr14)
 if na(exitPx) and tDir != 0 and ((tDir == 1 and takeS) or (tDir == -1 and takeL))
     exitPx := close
+    exitWhy := "Opposite signal"
 if not na(exitPx)
+    hitTxt = "TP1 " + (tStage >= 1 ? "✅" : "❌") + "  TP2 " + (tStage >= 2 ? "✅" : "❌") + "  TP3 " + (exitWhy == "TP3" ? "✅" : "❌")
+    rR = (exitPx - tEntry) / tRisk * tDir
+    resHit := hitTxt
+    resExit := "Closed by " + exitWhy + " at " + f_px(exitPx) + " (" + (rR >= 0 ? "+" : "") + str.tostring(rR, "#.##") + "R)"
+    resWin := rR >= 0
     for l in tLines
         if keepHist
             line.set_color(l, color.new(#787b86, histT))
@@ -1134,9 +1148,11 @@ if barstate.islast and hudOn
             f_cell(0, 1, "• Position State: Setup closed / resolved", cWhite)
             f_cell(0, 2, "   Cycle Cooldown: " + str.tostring(math.min(bar_index - exitBar, 3)) + "/3 bars elapsed before next hunt", cGray)
             f_cell(0, 3, "• Resolved Setup: " + resName, cWhite)
-            f_cell(0, 4, "• ADR Range: " + str.tostring(adrPct, "#.#") + "% | Gate: " + gateTxt, cWhite)
-            f_cell(0, 5, "• Sweeps: " + sweepTxt, cWhite)
-            f_cell(0, 6, "• Next Seeking Setup: Stand by for next session cycle", cTeal)
+            f_cell(0, 4, "• Targets Hit: " + resHit, cWhite)
+            f_cell(0, 5, "• Result: " + resExit, resWin ? cTeal : cPink)
+            f_cell(0, 6, "• ADR Range: " + str.tostring(adrPct, "#.#") + "% | Gate: " + gateTxt, cWhite)
+            f_cell(0, 7, "• Sweeps: " + sweepTxt, cWhite)
+            f_cell(0, 8, "• Next Seeking Setup: Stand by for next session cycle", cTeal)
         else
             f_cell(0, 0, "🤖  TS ORDER FLOW: CONSOLIDATING", structTrend == 1 ? #ffa726 : cTeal)
             f_cell(0, 1, "• Bias: " + biasTxt + " | HTF: " + htfTxt, cWhite)
