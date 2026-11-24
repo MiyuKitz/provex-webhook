@@ -209,6 +209,12 @@ hudPos  = input.string("Top Right", "HUD Position", options = ["Top Right", "Top
 hudSzIn = input.string("Small", "HUD Size", options = ["Tiny", "Small", "Normal"], group = g17)
 hudBgT  = input.int(15, "Dashboard Background Transparency (%)", minval = 0, maxval = 100, group = g17)
 
+g18 = "=== CHART CLEANUP (extra) ==="
+zoneTxt    = input.string("Tiny", "Box / Zone Text", options = ["Tiny", "Hidden"], group = g18)
+sigSizeIn  = input.string("Tiny", "Signal Label Size", options = ["Tiny", "Small", "Normal"], group = g18)
+hideHtfBox = input.bool(true, "Hide Session Boxes on 1H and Above", tooltip = "Boxes still drive signals, they just aren't drawn. Keeps higher timeframes readable.", group = g18)
+pocW       = input.int(1, "POC Line Width", minval = 1, maxval = 4, group = g18)
+
 // ═════════════════════════════ PRESETS (effective values) ═════════════════════════════
 // NOTE: the original's preset values are not public; these are best estimates.
 isScalp = preset == "Scalping (Fast)"
@@ -229,6 +235,10 @@ fvgStyle = f_style(fvgStyleIn)
 tgtFont  = f_size(tgtFontIn)
 nodeSz   = f_size(nodeSzIn)
 hudSz    = f_size(hudSzIn)
+sigSz    = f_size(sigSizeIn)
+boxTxtOn = zoneTxt != "Hidden"
+boxVis   = not (hideHtfBox and timeframe.in_seconds() >= 3600)
+f_t(string x) => boxTxtOn ? x : ""
 
 // ═════════════════════════════ TYPES & STATE ═════════════════════════════
 type Zone
@@ -464,7 +474,7 @@ f_update(array<Zone> zs, bool isFvg, bool makeMit) =>
             bool tapped = bar_index > z.born and (z.dir == 1 ? (low <= z.top and close >= z.bot) : (high >= z.bot and close <= z.top))
             if (dead and bar_index > z.born) or (purgeSMC and tapped)
                 if dead and makeMit and showMit
-                    mb = box.new(z.born, z.top, bar_index + liqExt, z.bot, border_color = color.new(#787b86, 30), border_style = mitStyle, bgcolor = cMit, text = "MITIGATION", text_size = size.tiny, text_color = color.new(#b2b5be, mitTxtT), text_halign = text.align_right, text_valign = text.align_center)
+                    mb = box.new(z.born, z.top, bar_index + liqExt, z.bot, border_color = color.new(#787b86, 30), border_style = mitStyle, bgcolor = cMit, text = f_t("MITIGATION"), text_size = size.tiny, text_color = color.new(#b2b5be, mitTxtT), text_halign = text.align_right, text_valign = text.align_center)
                     array.push(mits, Zone.new(mb, z.top, z.bot, -z.dir, bar_index, "Mitigation Block"))
                 if purgeSMC
                     box.delete(z.bx)
@@ -482,7 +492,7 @@ if bullBreak and showOB
             k0 := k
             break
     if k0 > 0 and close - high[k0] >= obMinDisp * atr14
-        b = box.new(bar_index - k0, high[k0], bar_index + liqExt, low[k0], border_color = cBullLbl, border_width = obWidth, border_style = obStyle, bgcolor = cBullOB, text = "BULL OB", text_size = size.tiny, text_color = color.new(#b2b5be, obTxtT), text_halign = text.align_right, text_valign = text.align_center)
+        b = box.new(bar_index - k0, high[k0], bar_index + liqExt, low[k0], border_color = cBullLbl, border_width = obWidth, border_style = obStyle, bgcolor = cBullOB, text = f_t("BULL OB"), text_size = size.tiny, text_color = color.new(#b2b5be, obTxtT), text_halign = text.align_right, text_valign = text.align_center)
         array.push(obs, Zone.new(b, high[k0], low[k0], 1, bar_index, "Order Block"))
 if bearBreak and showOB
     int k1 = -1
@@ -491,17 +501,17 @@ if bearBreak and showOB
             k1 := k
             break
     if k1 > 0 and low[k1] - close >= obMinDisp * atr14
-        b = box.new(bar_index - k1, high[k1], bar_index + liqExt, low[k1], border_color = cBearLbl, border_width = obWidth, border_style = obStyle, bgcolor = cBearOB, text = "BEAR OB", text_size = size.tiny, text_color = color.new(#b2b5be, obTxtT), text_halign = text.align_right, text_valign = text.align_center)
+        b = box.new(bar_index - k1, high[k1], bar_index + liqExt, low[k1], border_color = cBearLbl, border_width = obWidth, border_style = obStyle, bgcolor = cBearOB, text = f_t("BEAR OB"), text_size = size.tiny, text_color = color.new(#b2b5be, obTxtT), text_halign = text.align_right, text_valign = text.align_center)
         array.push(obs, Zone.new(b, high[k1], low[k1], -1, bar_index, "Order Block"))
 f_trim(obs, obMax * 2)
 
 bullGap = low > high[2] and (low - high[2]) >= fvgMinAtr * atr14
 bearGap = high < low[2] and (low[2] - high) >= fvgMinAtr * atr14
 if showFVG and bullGap
-    b = box.new(bar_index - 2, low, bar_index + liqExt, high[2], border_color = color.new(cBullLbl, 60), border_style = fvgStyle, bgcolor = cBullFVG, text = "VOID (FVG)", text_size = size.tiny, text_color = color.new(#b2b5be, fvgTxtT), text_halign = text.align_right, text_valign = text.align_center)
+    b = box.new(bar_index - 2, low, bar_index + liqExt, high[2], border_color = color.new(cBullLbl, 60), border_style = fvgStyle, bgcolor = cBullFVG, text = f_t("VOID (FVG)"), text_size = size.tiny, text_color = color.new(#b2b5be, fvgTxtT), text_halign = text.align_right, text_valign = text.align_center)
     array.push(fvgs, Zone.new(b, low, high[2], 1, bar_index, "Fair Value Gap (FVG)"))
 if showFVG and bearGap
-    b = box.new(bar_index - 2, low[2], bar_index + liqExt, high, border_color = color.new(cBearLbl, 60), border_style = fvgStyle, bgcolor = cBearFVG, text = "VOID (FVG)", text_size = size.tiny, text_color = color.new(#b2b5be, fvgTxtT), text_halign = text.align_right, text_valign = text.align_center)
+    b = box.new(bar_index - 2, low[2], bar_index + liqExt, high, border_color = color.new(cBearLbl, 60), border_style = fvgStyle, bgcolor = cBearFVG, text = f_t("VOID (FVG)"), text_size = size.tiny, text_color = color.new(#b2b5be, fvgTxtT), text_halign = text.align_right, text_valign = text.align_center)
     array.push(fvgs, Zone.new(b, low[2], high, -1, bar_index, "Fair Value Gap (FVG)"))
 f_trim(fvgs, fvgMax * 2)
 
@@ -537,7 +547,7 @@ f_addPool(float lvl, int dir, int x1, bool major, bool htf, float wTop, float wB
             bot = useWick ? math.min(wTop, wBot) : dir == 1 ? lvl - h : lvl
             txt = (htf ? "HTF " : "") + (dir == 1 ? "BSL" : "SSL") + (htf ? " [" + htfName + "]" : major ? " [MAJOR]" : "")
             showTxt = htf or major or minorTxt
-            bx = box.new(x1, top, bar_index + liqExt, bot, border_color = color.new(col, 0), bgcolor = color.new(col, 15), text = showTxt ? txt : "", text_size = size.tiny, text_color = color.new(color.white, 15), text_halign = text.align_right, text_valign = text.align_center)
+            bx = box.new(x1, top, bar_index + liqExt, bot, border_color = color.new(col, 0), bgcolor = color.new(col, 15), text = f_t(showTxt ? txt : ""), text_size = size.tiny, text_color = color.new(color.white, 15), text_halign = text.align_right, text_valign = text.align_center)
             array.push(pools, Pool.new(bx, lvl, dir, t, major, htf))
             if array.size(pools) > 60
                 old = array.shift(pools)
@@ -646,7 +656,7 @@ if boxOn
         bUpDone := false
         bDnDone := false
         xLive := false
-        aBox := box.new(dyn ? bar_index - sqMinBars + 1 : bar_index, bHi, bar_index, bLo, border_color = cBoxBorder, border_style = line.style_dashed, bgcolor = color.new(cBox, boxBgT), text = nm, text_size = size.tiny, text_color = color.new(color.white, 20), text_valign = text.align_top, text_halign = text.align_left)
+        aBox := box.new(dyn ? bar_index - sqMinBars + 1 : bar_index, bHi, bar_index, bLo, border_color = boxVis ? cBoxBorder : color.new(cBoxBorder, 100), border_style = line.style_dashed, bgcolor = color.new(cBox, boxVis ? boxBgT : 100), text = boxVis ? f_t(nm) : "", text_size = size.tiny, text_color = color.new(color.white, 20), text_valign = text.align_top, text_halign = text.align_left)
         f_pushBox(aBox)
     else
         if bLive
@@ -656,11 +666,11 @@ if boxOn
                 if close > bHi and close > open and body >= dispReq
                     boxBreakUp := true
                     bLive := false
-                    box.set_text(aBox, "AI BULL EXPANSION")
+                    box.set_text(aBox, f_t("AI BULL EXPANSION"))
                 else if close < bLo and close < open and body >= dispReq
                     boxBreakDn := true
                     bLive := false
-                    box.set_text(aBox, "AI BEAR EXPANSION")
+                    box.set_text(aBox, f_t("AI BEAR EXPANSION"))
                 else if close > bHi + driftBuf * atr14 or close < bLo - driftBuf * atr14
                     bLive := false
                 else
@@ -690,7 +700,7 @@ if boxOn
             xHi := high
             xLo := low
             xLive := true
-            xBox := box.new(bar_index, high, bar_index, low, border_color = boxBreakUp ? cBullLbl : cBearLbl, border_style = line.style_dashed, bgcolor = color.new(cBox, boxBgT), text = boxBreakUp ? "SESSION BULL BREAKOUT" : "SESSION BEAR BREAKOUT", text_size = size.tiny, text_color = color.new(color.white, 20), text_valign = text.align_top, text_halign = text.align_left)
+            xBox := box.new(bar_index, high, bar_index, low, border_color = color.new(boxBreakUp ? cBullLbl : cBearLbl, boxVis ? 0 : 100), border_style = line.style_dashed, bgcolor = color.new(cBox, boxVis ? boxBgT : 100), text = not boxVis ? "" : f_t(boxBreakUp ? "SESSION BULL BREAKOUT" : "SESSION BEAR BREAKOUT"), text_size = size.tiny, text_color = color.new(color.white, 20), text_valign = text.align_top, text_halign = text.align_left)
             f_pushBox(xBox)
         else if xLive
             xHi := math.max(xHi, high)
@@ -999,20 +1009,20 @@ if takeS or waitS or avoidS
 // ═════════════════════════════ SIGNAL VISUALS ═════════════════════════════
 if showSig and not classic
     if takeL
-        label.new(bar_index, low, recL ? "BUY [RETEST TAKE]" : "BUY [TAKE]", yloc = yloc.belowbar, style = label.style_label_up, color = recL ? cBuyRet : cBuyTake, textcolor = cLblTxt, size = size.small)
+        label.new(bar_index, low, recL ? "BUY [RETEST TAKE]" : "BUY [TAKE]", yloc = yloc.belowbar, style = label.style_label_up, color = recL ? cBuyRet : cBuyTake, textcolor = cLblTxt, size = sigSz)
     if takeS
-        label.new(bar_index, high, recS ? "SELL [RETEST TAKE]" : "SELL [TAKE]", yloc = yloc.abovebar, style = label.style_label_down, color = recS ? cSellRet : cSellTake, textcolor = cLblTxt, size = size.small)
+        label.new(bar_index, high, recS ? "SELL [RETEST TAKE]" : "SELL [TAKE]", yloc = yloc.abovebar, style = label.style_label_down, color = recS ? cSellRet : cSellTake, textcolor = cLblTxt, size = sigSz)
     if waitL
-        label.new(bar_index, low, "BUY [WAIT]", yloc = yloc.belowbar, style = label.style_label_up, color = cWait, textcolor = cWaitTxt, size = size.small)
+        label.new(bar_index, low, "BUY [WAIT]", yloc = yloc.belowbar, style = label.style_label_up, color = cWait, textcolor = cWaitTxt, size = sigSz)
     if waitS
-        label.new(bar_index, high, "SELL [WAIT]", yloc = yloc.abovebar, style = label.style_label_down, color = cWait, textcolor = cWaitTxt, size = size.small)
+        label.new(bar_index, high, "SELL [WAIT]", yloc = yloc.abovebar, style = label.style_label_down, color = cWait, textcolor = cWaitTxt, size = sigSz)
     if avoidL
-        label.new(bar_index, low, "BUY [AVOID]", yloc = yloc.belowbar, style = label.style_label_up, color = cAvoid, textcolor = cAvoidTxt, size = size.small)
+        label.new(bar_index, low, "BUY [AVOID]", yloc = yloc.belowbar, style = label.style_label_up, color = cAvoid, textcolor = cAvoidTxt, size = sigSz)
     if avoidS
-        label.new(bar_index, high, "SELL [AVOID]", yloc = yloc.abovebar, style = label.style_label_down, color = cAvoid, textcolor = cAvoidTxt, size = size.small)
+        label.new(bar_index, high, "SELL [AVOID]", yloc = yloc.abovebar, style = label.style_label_down, color = cAvoid, textcolor = cAvoidTxt, size = sigSz)
 
-plotshape(showSig and classic and takeL, "Buy Signal (Classic)", shape.triangleup, location.belowbar, cBuyTake, text = "BUY", textcolor = color.white, size = size.small)
-plotshape(showSig and classic and takeS, "Sell Signal (Classic)", shape.triangledown, location.abovebar, cSellTake, text = "SELL", textcolor = color.white, size = size.small)
+plotshape(showSig and classic and takeL, "Buy Signal (Classic)", shape.triangleup, location.belowbar, cBuyTake, text = "BUY", textcolor = color.white, size = size.tiny)
+plotshape(showSig and classic and takeS, "Sell Signal (Classic)", shape.triangledown, location.abovebar, cSellTake, text = "SELL", textcolor = color.white, size = size.tiny)
 
 // ═════════════════════════════ VOLUME PROFILE DRAWING ═════════════════════════════
 float vah = na
@@ -1093,7 +1103,7 @@ if barstate.islast and vpOn
                         array.push(vpBoxes, box.new(cx, yt, cx + w, yb, border_color = color.new(cc, bT), bgcolor = color.new(cc, fT), text = showNodes ? txtT : "", text_size = nodeSz, text_color = tcol, text_halign = center ? text.align_left : text.align_right))
         pocY = (minB + (pr + 0.5) * rowSz) * vpStep
         xEnd = vpStart + fullW
-        array.push(vpLines, line.new(vpStart, pocY, extPOC ? bar_index + liqExt : xEnd, pocY, color = cPOC, width = 2))
+        array.push(vpLines, line.new(vpStart, pocY, extPOC ? bar_index + liqExt : xEnd, pocY, color = cPOC, width = pocW))
         array.push(vpLines, line.new(vpStart, vah, extVA ? bar_index + liqExt : xEnd, vah, color = cVA, style = line.style_dashed))
         array.push(vpLines, line.new(vpStart, val, extVA ? bar_index + liqExt : xEnd, val, color = cVA, style = line.style_dashed))
         if pocLbl
