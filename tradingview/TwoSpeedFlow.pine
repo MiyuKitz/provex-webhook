@@ -1,6 +1,6 @@
 //@version=6
 // ============================================================================
-//  TWO-SPEED FLOW  v2.1.3  (Next-Trade Scout HUD, Auto HTF, signal age)
+//  TWO-SPEED FLOW  v2.1.4  (Next-Trade Scout HUD, Auto HTF, signal age)
 //  Rebuilt to match the settings, defaults, chart objects and HUD layout of the
 //  reference order-flow indicator, from its public description, settings
 //  screens and chart screenshots. Same inputs, same defaults, same HUD rows.
@@ -216,6 +216,7 @@ sigSizeIn  = input.string("Tiny", "Signal Label Size", options = ["Tiny", "Small
 hideHtfBox = input.bool(true, "Hide Session Boxes on 1H and Above", tooltip = "Boxes still drive signals, they just aren't drawn. Keeps higher timeframes readable.", group = g18)
 pocW       = input.int(1, "POC Line Width", minval = 1, maxval = 4, group = g18)
 sigT       = input.int(55, "Signal Label Transparency %", minval = 0, maxval = 95, group = g18)
+oldCase    = input.bool(true, "Old / Resolved Signals in Normal Case", tooltip = "Only the live signal stays in CAPS. Filled, failed or older signals show as Buy [Take], Sell [Wait]…", group = g18)
 poolT      = input.int(75, "Liquidity Pool (BSL/SSL) Transparency %", minval = 0, maxval = 100, group = g18)
 scoutOn    = input.bool(true, "Next-Trade Scout HUD (when no trade is open)", tooltip = "Replaces the plain CONSOLIDATING box with: where a BUY/SELL would trigger, which checks pass right now, nearest retest zones and liquidity targets.", group = g18)
 scoutLn    = input.bool(true, "Show Next-Trade Trigger Lines", group = g18)
@@ -1020,19 +1021,39 @@ if takeS or waitS or avoidS
     lastOpinBar := bar_index
 
 // ═════════════════════════════ SIGNAL VISUALS ═════════════════════════════
+// Newest signal stays in CAPS while live; once it is old (a newer signal printed) or its trade resolved,
+// its text switches to normal case ("Buy [Take]") so the live one stands out.
+f_tc(string t) =>
+    string r = str.replace_all(t, "RETEST TAKE", "Retest Take")
+    r := str.replace_all(r, "BUY", "Buy")
+    r := str.replace_all(r, "SELL", "Sell")
+    r := str.replace_all(r, "TAKE", "Take")
+    r := str.replace_all(r, "WAIT", "Wait")
+    str.replace_all(r, "AVOID", "Avoid")
+var label liveSig = na
+label newSig = na
 if showSig and not classic
     if takeL
-        label.new(bar_index, low, recL ? "BUY [RETEST TAKE]" : "BUY [TAKE]", yloc = yloc.belowbar, style = label.style_label_up, color = color.new(recL ? cBuyRet : cBuyTake, sigT), textcolor = cLblTxt, size = sigSz)
+        newSig := label.new(bar_index, low, recL ? "BUY [RETEST TAKE]" : "BUY [TAKE]", yloc = yloc.belowbar, style = label.style_label_up, color = color.new(recL ? cBuyRet : cBuyTake, sigT), textcolor = cLblTxt, size = sigSz)
     if takeS
-        label.new(bar_index, high, recS ? "SELL [RETEST TAKE]" : "SELL [TAKE]", yloc = yloc.abovebar, style = label.style_label_down, color = color.new(recS ? cSellRet : cSellTake, sigT), textcolor = cLblTxt, size = sigSz)
+        newSig := label.new(bar_index, high, recS ? "SELL [RETEST TAKE]" : "SELL [TAKE]", yloc = yloc.abovebar, style = label.style_label_down, color = color.new(recS ? cSellRet : cSellTake, sigT), textcolor = cLblTxt, size = sigSz)
     if waitL
-        label.new(bar_index, low, "BUY [WAIT]", yloc = yloc.belowbar, style = label.style_label_up, color = color.new(cWait, sigT), textcolor = sigT >= 40 ? cLblTxt : cWaitTxt, size = sigSz)
+        newSig := label.new(bar_index, low, "BUY [WAIT]", yloc = yloc.belowbar, style = label.style_label_up, color = color.new(cWait, sigT), textcolor = sigT >= 40 ? cLblTxt : cWaitTxt, size = sigSz)
     if waitS
-        label.new(bar_index, high, "SELL [WAIT]", yloc = yloc.abovebar, style = label.style_label_down, color = color.new(cWait, sigT), textcolor = sigT >= 40 ? cLblTxt : cWaitTxt, size = sigSz)
+        newSig := label.new(bar_index, high, "SELL [WAIT]", yloc = yloc.abovebar, style = label.style_label_down, color = color.new(cWait, sigT), textcolor = sigT >= 40 ? cLblTxt : cWaitTxt, size = sigSz)
     if avoidL
-        label.new(bar_index, low, "BUY [AVOID]", yloc = yloc.belowbar, style = label.style_label_up, color = color.new(cAvoid, sigT), textcolor = cAvoidTxt, size = sigSz)
+        newSig := label.new(bar_index, low, "BUY [AVOID]", yloc = yloc.belowbar, style = label.style_label_up, color = color.new(cAvoid, sigT), textcolor = cAvoidTxt, size = sigSz)
     if avoidS
-        label.new(bar_index, high, "SELL [AVOID]", yloc = yloc.abovebar, style = label.style_label_down, color = color.new(cAvoid, sigT), textcolor = cAvoidTxt, size = sigSz)
+        newSig := label.new(bar_index, high, "SELL [AVOID]", yloc = yloc.abovebar, style = label.style_label_down, color = color.new(cAvoid, sigT), textcolor = cAvoidTxt, size = sigSz)
+
+if oldCase
+    if not na(newSig)
+        if not na(liveSig)
+            label.set_text(liveSig, f_tc(label.get_text(liveSig)))
+        liveSig := newSig
+    else if not na(liveSig) and not na(exitPx)
+        label.set_text(liveSig, f_tc(label.get_text(liveSig)))
+        liveSig := na
 
 plotshape(showSig and classic and takeL, "Buy Signal (Classic)", shape.triangleup, location.belowbar, cBuyTake, text = "BUY", textcolor = color.white, size = size.tiny)
 plotshape(showSig and classic and takeS, "Sell Signal (Classic)", shape.triangledown, location.abovebar, cSellTake, text = "SELL", textcolor = color.white, size = size.tiny)
