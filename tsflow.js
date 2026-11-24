@@ -1,5 +1,8 @@
-// tsflow.js — server-side Two-Speed Flow engine (same rules as tradingview/TwoSpeedFlow.pine v2, his defaults). Analysis only: never places orders.
-// Backtest port of tradingview/TwoSpeedFlow.pine v2.0.1 (his defaults). Same order of operations as the Pine script.
+// tsflow.js — server-side Two-Speed Flow engine. Analysis only: never places orders.
+// SYNCED WITH tradingview/TwoSpeedFlow.pine v2.1.4 (default settings). Same order of operations as the Pine script.
+// Sync contract: any rule change in the Pine file must land here in the same commit (see tradingview/SYNC.md).
+//   htf     = trend HTF bars (Pine "Auto HTF": 15m-30m -> 1H, 1H -> 4H, 2H-4H -> 1D; use autoHtf(tfMs) to pick)
+//   opts.htfLiq = HTF liquidity bars (Pine "HTF Liquidity Resolution" 60m: only used on charts below 1H; omit on 1H/4H)
 "use strict";
 const H1 = 3600000, DAY = 86400000;
 const DEF = {
@@ -10,7 +13,10 @@ const DEF = {
   style: "classic", allowCont: false, minBetween: 23, dispBody: 0.35,
   blockLiq: true, reqDelta: true, reqVP: true, useWeighted: false, minTake: 2, minWait: 0, setupRules: true, softHard: true,
   atrMult: 3, tp1: 0.5, tp2: 2, tp3: 3, trail1: 1.5, trail2: 1.0,
+  waitRecov: false, maxWait: 8,
 };
+// Pine "Auto HTF": next higher timeframe for a chart timeframe (ms in, Binance/BingX interval string out)
+function autoHtf(tfMs) { const s = tfMs / 1000; return s <= 1800 ? "1h" : s <= 3600 ? "4h" : s <= 14400 ? "1d" : s <= 86400 ? "1w" : "1M"; }
 const rma = (src, n) => { const o = Array(src.length).fill(NaN); let s = 0, c = 0, p = NaN; for (let i = 0; i < src.length; i++) { const v = src[i]; if (!isFinite(v)) continue; if (c < n) { s += v; c++; if (c === n) { p = s / n; o[i] = p; } } else { p = (p * (n - 1) + v) / n; o[i] = p; } } return o; };
 const ema = (src, n) => { const o = Array(src.length).fill(NaN), a = 2 / (n + 1); let p = NaN, s = 0, c = 0; for (let i = 0; i < src.length; i++) { if (c < n) { s += src[i]; c++; if (c === n) { p = s / n; o[i] = p; } continue; } p = a * src[i] + (1 - a) * p; o[i] = p; } return o; };
 const sma = (src, n) => { const o = Array(src.length).fill(NaN); let s = 0; for (let i = 0; i < src.length; i++) { s += src[i]; if (i >= n) s -= src[i - n]; if (i >= n - 1) o[i] = s / n; } return o; };
@@ -32,13 +38,15 @@ function runPhoenix(b, htf, daily, opts = {}) {
   const mdm = b.map((x, i) => { if (!i) return 0; const u = x.h - b[i - 1].h, d = b[i - 1].l - x.l; return d > u && d > 0 ? d : 0; });
   const trR = rma(tr, P.adxLen), pR = rma(pdm, P.adxLen), mR = rma(mdm, P.adxLen);
   const adx = rma(b.map((_, i) => { const p = pR[i] / trR[i], m = mR[i] / trR[i]; return isFinite(p + m) && p + m > 0 ? 100 * Math.abs(p - m) / (p + m) : NaN; }), P.adxLen);
-  const hCl = htf.map(x => x.c), hF = ema(hCl, 10), hS = ema(hCl, 30), hPH = htf.map((_, i) => pivot(htf, i, 3, true)), hPL = htf.map((_, i) => pivot(htf, i, 3, false));
+  const hCl = htf.map(x => x.c), hF = ema(hCl, 10), hS = ema(hCl, 30);
+  const LQ = P.htfLiq && P.htfLiq.length > 1 ? P.htfLiq : null, lqMs = LQ ? LQ[1].t - LQ[0].t : 0;
+  const hPH = LQ ? LQ.map((_, i) => pivot(LQ, i, 3, true)) : [], hPL = LQ ? LQ.map((_, i) => pivot(LQ, i, 3, false)) : [];
   const dAtr = rma(trs(daily), P.adrLen);
-  const htfPools = htfMs > tf && P.htfOn;
-  let hi = -1, di = -1;
+  const htfPools = !!LQ && lqMs > tf && P.htfOn;
+  let hi = -1, li = -1, di = -1;
   const st = { obs: [], mits: [], fvgs: [], exitI: -1e9, pools: [], recHi: [], recLo: [], swHi: NaN, swHiDone: true, swLo: NaN, swLoDone: true, trend: 0,
     bHi: NaN, bLo: NaN, bStart: 0, bLive: false, bUp: false, bDn: false, prevSess: -1, vp: new Map(), step: NaN, pocB: NaN, pocV: 0, dayKey: null, dHi: 0, dLo: 0,
-    lastSigDir: 0, lastSigBar: -1e9, T: null };
+    lastSigDir: 0, lastSigBar: -1e9, T: null, waitDir: 0, waitBar: 0, waitTop: NaN, waitBot: NaN };
   const trades = [];
   let curA = 0;
   const addPool = (lvl, dir, major, htfP) => {
@@ -52,7 +60,8 @@ function runPhoenix(b, htf, daily, opts = {}) {
     const sess = sessOf(x.t), sessStart = sess !== st.prevSess; st.prevSess = sess;
     if (!isFinite(a) || i < 60) continue;
     curA = a;
-    while (hi + 1 < htf.length && htf[hi + 1].t + htfMs <= x.t) { hi++; if (htfPools) { if (isFinite(hPH[hi])) addPool(hPH[hi], 1, true, true); if (isFinite(hPL[hi])) addPool(hPL[hi], -1, true, true); } }
+    while (hi + 1 < htf.length && htf[hi + 1].t + htfMs <= x.t) hi++;
+    while (LQ && li + 1 < LQ.length && LQ[li + 1].t + lqMs <= x.t) { li++; if (htfPools) { if (isFinite(hPH[li]) && hPH[li] !== hPH[li - 1]) addPool(hPH[li], 1, true, true); if (isFinite(hPL[li]) && hPL[li] !== hPL[li - 1]) addPool(hPL[li], -1, true, true); } }
     while (di + 1 < daily.length && daily[di + 1].t + DAY <= x.t) di++;
     const htfBias = hi >= 0 && isFinite(hF[hi]) && isFinite(hS[hi]) ? (hF[hi] > hS[hi] ? 1 : -1) : 0;
     const dk = Math.floor(x.t / DAY); if (st.dayKey !== dk) { st.dayKey = dk; st.dHi = x.h; st.dLo = x.l; } else { st.dHi = Math.max(st.dHi, x.h); st.dLo = Math.min(st.dLo, x.l); }
@@ -125,7 +134,18 @@ function runPhoenix(b, htf, daily, opts = {}) {
     const gS = cool && sT && !lT && (tDir !== -1 || (P.allowCont && i - st.lastSigBar >= P.minBetween));
     const qL = gL ? ev(1, lT) : "", qS = gS ? ev(-1, sT) : "";
     const classic = P.style === "classic";
-    let takeL = gL && (classic || qL === "TAKE"), takeS = gS && (classic || qS === "TAKE");
+    // WAIT retest recovery (Pine "Enable WAIT Retest Recovery Triggers", default off)
+    let recL = false, recS = false;
+    if (P.waitRecov && st.waitDir !== 0 && i > st.waitBar) {
+      if (i - st.waitBar > P.maxWait || tDir === st.waitDir) st.waitDir = 0;
+      else { const pocOk = isFinite(poc);
+        const tapL = x.l <= ema10[i] || x.l <= st.waitTop || (pocOk && x.l <= poc && x.c > poc) || obB || fvB;
+        const tapS = x.h >= ema10[i] || x.h >= st.waitBot || (pocOk && x.h >= poc && x.c < poc) || obS || fvS;
+        if (st.waitDir === 1 && tapL && x.c > x.o && buyPct >= 50 && x.c > ema10[i]) { recL = true; st.waitDir = 0; }
+        else if (st.waitDir === -1 && tapS && x.c < x.o && buyPct <= 50 && x.c < ema10[i]) { recS = true; st.waitDir = 0; } } }
+    let takeL = (gL && (classic || qL === "TAKE")) || recL, takeS = (gS && (classic || qS === "TAKE")) || recS;
+    const waitL = gL && qL === "WAIT", waitS = gS && qS === "WAIT";
+    if (P.waitRecov && (waitL || waitS) && !(classic && (takeL || takeS))) { st.waitDir = waitL ? 1 : -1; st.waitBar = i; st.waitTop = Math.max(x.o, x.c); st.waitBot = Math.min(x.o, x.c); }
     if (P.hold && st.T) { takeL = false; takeS = false; }   // variant: ignore new arrows until SL/TP3 closes the trade
     // trade management
     const T = st.T;
@@ -138,14 +158,25 @@ function runPhoenix(b, htf, daily, opts = {}) {
         if (x.l <= T.tp3) { ex = T.tp3; T.hit3 = true; } else if (T.stage >= 1) T.sl = Math.min(T.sl, x.c + (T.stage >= 2 ? P.trail2 : P.trail1) * a); } }
       if (!isFinite(ex) && ((T.dir === 1 && takeS) || (T.dir === -1 && takeL))) { ex = x.c; T.opp = true; }
       if (isFinite(ex)) { trades.push({ ...T, exit: ex, exitT: x.t, R: (ex - T.e) / T.risk * T.dir }); st.T = null; st.exitI = i; } }
+    // Next-Trade Scout (Pine v2.1.x HUD): trigger levels, 7 checks per side, lean with the HTF block
+    let buyTrig = NaN, sellTrig = NaN;
+    if (!st.swHiDone && isFinite(st.swHi) && st.swHi > x.c) buyTrig = st.swHi;
+    if (!st.bUp && isFinite(st.bHi) && st.bHi > x.c && (!isFinite(buyTrig) || st.bHi < buyTrig)) buyTrig = st.bHi;
+    if (!st.swLoDone && isFinite(st.swLo) && st.swLo < x.c) sellTrig = st.swLo;
+    if (!st.bDn && isFinite(st.bLo) && st.bLo < x.c && (!isFinite(sellTrig) || st.bLo > sellTrig)) sellTrig = st.bLo;
+    const scR = P.atrMult * a, clean = !isChoppy && !isWeak;
+    const ckL = [htfBias === 1, st.trend === 1, buyPct >= 50, !isFinite(poc) || x.c > poc, clean, !isFinite(nB) || nB - x.c >= Math.max(P.tp1, 1) * scR, !adrExh];
+    const ckS = [htfBias === -1, st.trend === -1, buyPct <= 50, !isFinite(poc) || x.c < poc, clean, !isFinite(nS) || x.c - nS >= Math.max(P.tp1, 1) * scR, !adrExh];
+    const nL = ckL.filter(Boolean).length, nSc = ckS.filter(Boolean).length;
+    const rawLean = nL - nSc >= 2 ? 1 : nSc - nL >= 2 ? -1 : 0, htfBlock = rawLean !== 0 && htfBias === -rawLean, lean = htfBlock ? 0 : rawLean;
     if (P.trace) P.trace.push({ t: x.t, act: st.T && !(takeL || takeS) ? st.T.dir : (takeL ? 1 : takeS ? -1 : 0), last: takeL ? 1 : takeS ? -1 : st.lastSigDir, trend: st.trend, htf: htfBias, poc: isFinite(poc) ? (x.c > poc ? 1 : -1) : 0,
       opL: lT ? ev(1, lT) : (gL ? qL : ""), opS: sT ? ev(-1, sT) : "", evL: ev(1, "retest"), evS: ev(-1, "retest"), evLb: ev(1, "breakout"), evSb: ev(-1, "breakout"),
-      nB, nS, nBH, nSH, c: x.c, atr: a });
+      nB, nS, nBH, nSH, c: x.c, atr: a, buyTrig, sellTrig, ckL, ckS, nLong: nL, nShort: nSc, rawLean, htfBlock, lean });
     if (takeL || takeS) { const d = takeL ? 1 : -1, sl = x.c - d * P.atrMult * a, r = Math.abs(x.c - sl);
       st.T = { dir: d, bar: i, t: x.t, e: x.c, sl, risk: r, d: r / x.c, tp1: x.c + d * P.tp1 * r, tp2: x.c + d * P.tp2 * r, tp3: x.c + d * P.tp3 * r, stage: 0, hit1: false, hit2: false, hit3: false,
-        setup: (takeL ? lT : sT), q: takeL ? qL : qS };
+        setup: (takeL ? lT : sT), q: takeL ? (recL ? "RETEST TAKE" : qL) : (recS ? "RETEST TAKE" : qS) };
       st.lastSigDir = d; st.lastSigBar = i; }
   }
   return trades;
 }
-module.exports = { runPhoenix, DEF };
+module.exports = { runPhoenix, autoHtf, DEF };

@@ -38,7 +38,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = process.env.BINGX_BASE_URL || "https://open-api-vst.bingx.com";   // VST demo by default
 const IS_LIVE = !BINGX_BASE_URL.includes("vst");
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v27.0-paper-combo";
+const SERVER_VERSION = "v27.1-tsflow-sync";
 
 // v25.1 — one codebase, two deployments. The demo service keeps the defaults.
 // A second Railway service runs the REAL-money "Aggro only" copy with:
@@ -1402,19 +1402,27 @@ function readPaper() { try { return JSON.parse(fs.readFileSync(PAPER_FILE, "utf8
 function writePaper(p) { fs.writeFileSync(PAPER_FILE, JSON.stringify(p)); }
 // v27.0 COMBO PAPER TEST: Two-Speed Flow as the bot's analyst (no orders). For each setup the live rules would take,
 // record what TS Flow says: its 1H trade direction (skip-if-opposite idea) and its 4H opinion (AVOID = strong momentum idea).
-const { runPhoenix } = require("./tsflow");
+// v27.1: engine synced with tradingview/TwoSpeedFlow.pine v2.1.4 — Auto HTF (4H chart -> 1D trend, 1H chart -> 4H trend)
+// and the Next-Trade Scout lean (7 checks, no lean against the HTF). Trading-rule output (act / grades) unchanged.
+const { runPhoenix, autoHtf } = require("./tsflow");
+const { tsflowSync } = require("./scripts/check-tsflow-sync");
+const TSFLOW_SYNC = (() => { try { return tsflowSync(); } catch (e) { return { inSync: false, err: e.message }; } })();
+if (!TSFLOW_SYNC.inSync) console.warn("[tsflow] TradingView indicator and bot engine versions differ:", TSFLOW_SYNC);
+if (autoHtf(4 * 3600000) !== "1d" || autoHtf(3600000) !== "4h") console.warn("[tsflow] autoHtf mapping changed — update flowTag HTF inputs");
 async function flowTag(symbol, t, side) {
   try {
     const d = side === "Long" ? 1 : -1;
     const [b4, h1, d1] = await Promise.all([agKlines(symbol, "4h", 500), agKlines(symbol, "1h", 1000), agKlines(symbol, "1d", 120)]);
     if (!b4?.length || !h1?.length || !d1?.length) return { err: "klines" };
     const tr4 = [], tr1 = [];
-    runPhoenix(b4, h1, d1, { trace: tr4 });
-    runPhoenix(h1, h1, d1, { trace: tr1 });
+    // trend HTF picked exactly like the Pine "Auto HTF" setting
+    runPhoenix(b4, d1 /* autoHtf(4H) = 1d */, d1, { trace: tr4 });
+    runPhoenix(h1, b4 /* autoHtf(1H) = 4h */, d1, { trace: tr1 });
     const s4 = tr4.find(s => s.t === t), s1 = tr1.find(s => s.t === t + 3 * 3600000);
     if (!s4 || !s1) return { err: "no flow state" };
     const op4 = d === 1 ? s4.evLb : s4.evSb;
-    return { flow1h: s1.act, flow4h: s4.act, op4h: op4, oppose1h: s1.act === -d, momentum: op4 === "AVOID" };
+    return { flow1h: s1.act, flow4h: s4.act, op4h: op4, oppose1h: s1.act === -d, momentum: op4 === "AVOID",
+      lean4h: s4.lean, htfBlock4h: s4.htfBlock, checks4h: d === 1 ? s4.nLong : s4.nShort, lean1h: s1.lean, htfBlock1h: s1.htfBlock, engine: "tsflow-v2.1.4" };
   } catch (e) { return { err: e.message }; }
 }
 
@@ -1471,7 +1479,10 @@ function paperSummary() {
     combo: (() => { const C = S.filter(x => x.baseR != null && x.flow && !x.flow.err); const sum = v => +v.reduce((a, x) => a + x.baseR, 0).toFixed(2);
       const g = f => { const v = C.filter(f); return { n: v.length, totalR: sum(v), avgR: v.length ? +(sum(v) / v.length).toFixed(3) : 0 }; };
       return { note: "Same live-rule trades, judged by what Two-Speed Flow said at entry. No orders.", allTrades: g(() => true),
-        skipIf1hOpposite: g(x => !x.flow.oppose1h), wouldBeSkipped: g(x => x.flow.oppose1h), strongMomentum4hAvoid: g(x => x.flow.momentum), otherTrades: g(x => !x.flow.momentum) }; })(),
+        skipIf1hOpposite: g(x => !x.flow.oppose1h), wouldBeSkipped: g(x => x.flow.oppose1h), strongMomentum4hAvoid: g(x => x.flow.momentum), otherTrades: g(x => !x.flow.momentum),
+        // v27.1 scout lean (only setups tagged after the sync have it)
+        scoutLean4hAgrees: g(x => x.flow.lean4h != null && x.flow.lean4h === (x.side === "Long" ? 1 : -1)),
+        scoutLean4hNoneOrAgainst: g(x => x.flow.lean4h != null && x.flow.lean4h !== (x.side === "Long" ? 1 : -1)) }; })(),
     sameSetupsCompared: { n: both.length, baseTotalR: +both.reduce((a, x) => a + x.baseR, 0).toFixed(2), e1bTotalR: +both.reduce((a, x) => a + (x.e1bR || 0), 0).toFixed(2) },
     e1bOutcomes: { entered: count("entered"), waiting: count("waiting"), skippedStopHitFirst: count("stop hit before confirmation"), skippedNoConfirmation: count("no confirmation in 3 candles"), skippedOther: count("stop distance out of range") + count("lost bars") },
     last20: S.slice(-20).map(x => ({ symbol: x.symbol, side: x.side, signal: new Date(x.t + 14400000).toISOString(), baseR: x.baseR ?? "open", e1b: x.e1bStatus, e1bR: x.e1bR ?? (x.e1b ? "open" : "-") })) };
@@ -1483,7 +1494,7 @@ const server = http.createServer(async (req, res) => {
   const pathname = urlObj.pathname;
   const json = (obj, code = 200) => { res.writeHead(code, { "Content-Type": "application/json" }); res.end(JSON.stringify(obj, null, 2)); };
   if (req.method === "GET" && pathname === "/") {
-    return json({ bot: "Two-Speed", label: BOT_LABEL || "demo", exchange: BINGX_BASE_URL.includes("vst") ? "BingX DEMO (VST)" : "BingX LIVE", coreOn: CORE_ON, shadowOn: SHADOW_ON, version: SERVER_VERSION, regime: regimeCache.value, core: { execute: CORE_EXECUTE, coins: CORE_ASSETS, shorts: CORE_SHORTS },
+    return json({ bot: "Two-Speed", label: BOT_LABEL || "demo", exchange: BINGX_BASE_URL.includes("vst") ? "BingX DEMO (VST)" : "BingX LIVE", coreOn: CORE_ON, shadowOn: SHADOW_ON, version: SERVER_VERSION, tsflow: TSFLOW_SYNC, regime: regimeCache.value, core: { execute: CORE_EXECUTE, coins: CORE_ASSETS, shorts: CORE_SHORTS },
       aggro: { on: AGGRO, account: AGGRO_SEPARATE ? "own sub-account" : "shared main account", coins: AGGRO_COINS, timeframe: AGGRO_TF, minConfluence: AGGRO_MIN_CONF, strategies: AGGRO_STRATS, maxLeverage: AGGRO_LEVERAGE },
       shadow: { coins: SHADOW_COINS, timeframes: ["1h", "4h"] } });
   }
