@@ -335,7 +335,7 @@ sessName  = sessId == 0 ? "ASIA" : sessId == 1 ? "LONDON" : "NY"
 tfSec   = timeframe.in_seconds()
 htfRes  = htfAuto ? (tfSec <= 1800 ? "60" : tfSec <= 3600 ? "240" : tfSec <= 14400 ? "D" : tfSec <= 86400 ? "W" : "M") : htfTf
 htfSecs = timeframe.in_seconds(htfRes)
-htfName = htfSecs >= 2592000 ? "1M" : htfSecs >= 604800 ? "1W" : htfSecs >= 86400 ? "1D" : htfSecs >= 3600 ? str.tostring(htfSecs / 3600) + "H" : str.tostring(htfSecs / 60) + "m"
+htfTrName = htfSecs >= 2592000 ? "1M" : htfSecs >= 604800 ? "1W" : htfSecs >= 86400 ? "1D" : htfSecs >= 3600 ? str.tostring(htfSecs / 3600) + "H" : str.tostring(htfSecs / 60) + "m"
 [hFast, hSlow] = request.security(syminfo.tickerid, htfRes, [ta.ema(close, htfFast)[1], ta.ema(close, htfSlow)[1]], lookahead = barmerge.lookahead_on)
 htfBias = na(hFast) or na(hSlow) ? 0 : hFast > hSlow ? 1 : -1
 
@@ -1244,7 +1244,7 @@ if barstate.islast and hudOn
     opinCol = str.contains(lastQ, "TAKE") ? cTeal : lastQ == "WAIT" ? cWait : lastQ == "AVOID" ? cPink : cTeal
     lookCol = lastQ == "AVOID" or lastQ == "WAIT" ? cPink : cTeal
     biasTxt = (structTrend == 1 ? "BULLISH" : structTrend == -1 ? "BEARISH" : "NEUTRAL") + (na(pocPx) ? "" : close > pocPx ? " (Above POC)" : " (Below POC)")
-    htfTxt = htfName + " " + (htfBias == 1 ? "BULL" : htfBias == -1 ? "BEAR" : "N/A")
+    htfTxt = htfTrName + " " + (htfBias == 1 ? "BULL" : htfBias == -1 ? "BEAR" : "N/A")
     ageN = na(lastOpinBar) ? 0 : bar_index - lastOpinBar
     ageTxt = na(lastOpinBar) ? "" : ageN == 0 ? " (this bar)" : " (" + str.tostring(ageN) + " bars ago)"
     sesTxt = inMorning ? "Morning Session" : inEvening ? "Evening Session" : restrictSes ? "Closed (Filtered)" : "Open (Global)"
@@ -1287,7 +1287,7 @@ if barstate.islast and hudOn
             regS = isChoppy ? "CHOP" : isWeak ? "WEAK" : structTrend == 1 ? "TREND ↑" : structTrend == -1 ? "TREND ↓" : "RANGE"
             leanS = lean == 1 ? "LONG ↑" : lean == -1 ? "SHORT ↓" : "NONE"
             biasS = (structTrend == 1 ? "↑" : structTrend == -1 ? "↓" : "–") + (na(pocPx) ? "" : close > pocPx ? " >POC" : " <POC")
-            htfS = htfName + " " + (htfBias == 1 ? "↑" : htfBias == -1 ? "↓" : "–")
+            htfS = htfTrName + " " + (htfBias == 1 ? "↑" : htfBias == -1 ? "↓" : "–")
             bTrig = na(buyTrig) ? "▲ BUY: no level yet" : "▲ BUY > " + f_px(buyTrig) + " (" + (buyFrom == "swing high" ? "swing" : "session") + ", +" + str.tostring((buyTrig - close) / close * 100, "#.#") + "%) → " + rdL + (rdL == "TAKE" ? "" : ": " + f_why(rwL))
             sTrig = na(sellTrig) ? "▼ SELL: no level yet" : "▼ SELL < " + f_px(sellTrig) + " (" + (sellFrom == "swing low" ? "swing" : "session") + ", -" + str.tostring((close - sellTrig) / close * 100, "#.#") + "%) → " + rdS + (rdS == "TAKE" ? "" : ": " + f_why(rwS))
             zL = na(bzT) ? "–" : bzK + " " + f_px(bzB) + "–" + f_px(bzT)
