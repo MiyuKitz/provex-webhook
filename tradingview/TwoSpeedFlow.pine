@@ -214,6 +214,8 @@ zoneTxt    = input.string("Tiny", "Box / Zone Text", options = ["Tiny", "Hidden"
 sigSizeIn  = input.string("Tiny", "Signal Label Size", options = ["Tiny", "Small", "Normal"], group = g18)
 hideHtfBox = input.bool(true, "Hide Session Boxes on 1H and Above", tooltip = "Boxes still drive signals, they just aren't drawn. Keeps higher timeframes readable.", group = g18)
 pocW       = input.int(1, "POC Line Width", minval = 1, maxval = 4, group = g18)
+sigT       = input.int(55, "Signal Label Transparency %", minval = 0, maxval = 95, group = g18)
+poolT      = input.int(75, "Liquidity Pool (BSL/SSL) Transparency %", minval = 0, maxval = 100, group = g18)
 
 // ═════════════════════════════ PRESETS (effective values) ═════════════════════════════
 // NOTE: the original's preset values are not public; these are best estimates.
@@ -547,7 +549,7 @@ f_addPool(float lvl, int dir, int x1, bool major, bool htf, float wTop, float wB
             bot = useWick ? math.min(wTop, wBot) : dir == 1 ? lvl - h : lvl
             txt = (htf ? "HTF " : "") + (dir == 1 ? "BSL" : "SSL") + (htf ? " [" + htfName + "]" : major ? " [MAJOR]" : "")
             showTxt = htf or major or minorTxt
-            bx = box.new(x1, top, bar_index + liqExt, bot, border_color = color.new(col, 0), bgcolor = color.new(col, 15), text = f_t(showTxt ? txt : ""), text_size = size.tiny, text_color = color.new(color.white, 15), text_halign = text.align_right, text_valign = text.align_center)
+            bx = box.new(x1, top, bar_index + liqExt, bot, border_color = color.new(col, math.min(100, poolT - 20)), bgcolor = color.new(col, poolT), text = f_t(showTxt ? txt : ""), text_size = size.tiny, text_color = color.new(color.white, 15), text_halign = text.align_right, text_valign = text.align_center)
             array.push(pools, Pool.new(bx, lvl, dir, t, major, htf))
             if array.size(pools) > 60
                 old = array.shift(pools)
@@ -1009,17 +1011,17 @@ if takeS or waitS or avoidS
 // ═════════════════════════════ SIGNAL VISUALS ═════════════════════════════
 if showSig and not classic
     if takeL
-        label.new(bar_index, low, recL ? "BUY [RETEST TAKE]" : "BUY [TAKE]", yloc = yloc.belowbar, style = label.style_label_up, color = recL ? cBuyRet : cBuyTake, textcolor = cLblTxt, size = sigSz)
+        label.new(bar_index, low, recL ? "BUY [RETEST TAKE]" : "BUY [TAKE]", yloc = yloc.belowbar, style = label.style_label_up, color = color.new(recL ? cBuyRet : cBuyTake, sigT), textcolor = cLblTxt, size = sigSz)
     if takeS
-        label.new(bar_index, high, recS ? "SELL [RETEST TAKE]" : "SELL [TAKE]", yloc = yloc.abovebar, style = label.style_label_down, color = recS ? cSellRet : cSellTake, textcolor = cLblTxt, size = sigSz)
+        label.new(bar_index, high, recS ? "SELL [RETEST TAKE]" : "SELL [TAKE]", yloc = yloc.abovebar, style = label.style_label_down, color = color.new(recS ? cSellRet : cSellTake, sigT), textcolor = cLblTxt, size = sigSz)
     if waitL
-        label.new(bar_index, low, "BUY [WAIT]", yloc = yloc.belowbar, style = label.style_label_up, color = cWait, textcolor = cWaitTxt, size = sigSz)
+        label.new(bar_index, low, "BUY [WAIT]", yloc = yloc.belowbar, style = label.style_label_up, color = color.new(cWait, sigT), textcolor = sigT >= 40 ? cLblTxt : cWaitTxt, size = sigSz)
     if waitS
-        label.new(bar_index, high, "SELL [WAIT]", yloc = yloc.abovebar, style = label.style_label_down, color = cWait, textcolor = cWaitTxt, size = sigSz)
+        label.new(bar_index, high, "SELL [WAIT]", yloc = yloc.abovebar, style = label.style_label_down, color = color.new(cWait, sigT), textcolor = sigT >= 40 ? cLblTxt : cWaitTxt, size = sigSz)
     if avoidL
-        label.new(bar_index, low, "BUY [AVOID]", yloc = yloc.belowbar, style = label.style_label_up, color = cAvoid, textcolor = cAvoidTxt, size = sigSz)
+        label.new(bar_index, low, "BUY [AVOID]", yloc = yloc.belowbar, style = label.style_label_up, color = color.new(cAvoid, sigT), textcolor = cAvoidTxt, size = sigSz)
     if avoidS
-        label.new(bar_index, high, "SELL [AVOID]", yloc = yloc.abovebar, style = label.style_label_down, color = cAvoid, textcolor = cAvoidTxt, size = sigSz)
+        label.new(bar_index, high, "SELL [AVOID]", yloc = yloc.abovebar, style = label.style_label_down, color = color.new(cAvoid, sigT), textcolor = cAvoidTxt, size = sigSz)
 
 plotshape(showSig and classic and takeL, "Buy Signal (Classic)", shape.triangleup, location.belowbar, cBuyTake, text = "BUY", textcolor = color.white, size = size.tiny)
 plotshape(showSig and classic and takeS, "Sell Signal (Classic)", shape.triangledown, location.abovebar, cSellTake, text = "SELL", textcolor = color.white, size = size.tiny)
