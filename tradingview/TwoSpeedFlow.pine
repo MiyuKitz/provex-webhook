@@ -1,6 +1,6 @@
 //@version=6
 // ============================================================================
-//  TWO-SPEED FLOW  v2.0
+//  TWO-SPEED FLOW  v2.1  (Next-Trade Scout HUD, Auto HTF, signal age)
 //  Rebuilt to match the settings, defaults, chart objects and HUD layout of the
 //  reference order-flow indicator, from its public description, settings
 //  screens and chart screenshots. Same inputs, same defaults, same HUD rows.
@@ -89,6 +89,7 @@ offsetBox  = input.bool(true, "Offset Box Right Edge Away From Active Candle", g
 g8 = "=== HIGHER TIMEFRAME (HTF) TREND ENGINE ==="
 useHtfIn = input.bool(false, "Enable HTF Trend Filter", group = g8)
 htfTf    = input.timeframe("60", "HTF Trend Resolution", group = g8)
+htfAuto  = input.bool(true, "Auto HTF (pick the next higher timeframe for this chart)", tooltip = "ON: 15m-30m chart → 1H, 1H → 4H, 2H-4H → 1D, 1D → 1W. Ignores the resolution above. OFF: uses the resolution above.", group = g8)
 htfFast  = input.int(10, "HTF Fast Baseline", minval = 1, group = g8)
 htfSlow  = input.int(30, "HTF Slow Baseline", minval = 2, group = g8)
 
@@ -216,6 +217,8 @@ hideHtfBox = input.bool(true, "Hide Session Boxes on 1H and Above", tooltip = "B
 pocW       = input.int(1, "POC Line Width", minval = 1, maxval = 4, group = g18)
 sigT       = input.int(55, "Signal Label Transparency %", minval = 0, maxval = 95, group = g18)
 poolT      = input.int(75, "Liquidity Pool (BSL/SSL) Transparency %", minval = 0, maxval = 100, group = g18)
+scoutOn    = input.bool(true, "Next-Trade Scout HUD (when no trade is open)", tooltip = "Replaces the plain CONSOLIDATING box with: where a BUY/SELL would trigger, which checks pass right now, nearest retest zones and liquidity targets.", group = g18)
+scoutLn    = input.bool(true, "Show Next-Trade Trigger Lines", group = g18)
 
 // ═════════════════════════════ PRESETS (effective values) ═════════════════════════════
 // NOTE: the original's preset values are not public; these are best estimates.
@@ -287,6 +290,7 @@ var string lastQ    = ""
 var string lastOpin = "Scanning"
 var string lastLook = "Scanning for confluence"
 var bool lastOk     = true
+var int lastOpinBar = na
 var int waitDir     = 0
 var int exitBar     = -100000
 var string tName    = ""
@@ -328,7 +332,11 @@ sessStart = sessId >= 0 and sessId != nz(sessId[1], -1)
 asiaOpen  = inAsia and not inAsia[1]
 sessName  = sessId == 0 ? "ASIA" : sessId == 1 ? "LONDON" : "NY"
 
-[hFast, hSlow] = request.security(syminfo.tickerid, htfTf, [ta.ema(close, htfFast)[1], ta.ema(close, htfSlow)[1]], lookahead = barmerge.lookahead_on)
+tfSec   = timeframe.in_seconds()
+htfRes  = htfAuto ? (tfSec <= 1800 ? "60" : tfSec <= 3600 ? "240" : tfSec <= 14400 ? "D" : tfSec <= 86400 ? "W" : "M") : htfTf
+htfSecs = timeframe.in_seconds(htfRes)
+htfName = htfSecs >= 2592000 ? "1M" : htfSecs >= 604800 ? "1W" : htfSecs >= 86400 ? "1D" : htfSecs >= 3600 ? str.tostring(htfSecs / 3600) + "H" : str.tostring(htfSecs / 60) + "m"
+[hFast, hSlow] = request.security(syminfo.tickerid, htfRes, [ta.ema(close, htfFast)[1], ta.ema(close, htfSlow)[1]], lookahead = barmerge.lookahead_on)
 htfBias = na(hFast) or na(hSlow) ? 0 : hFast > hSlow ? 1 : -1
 
 adrVal = request.security(syminfo.tickerid, "D", ta.atr(adrLen)[1], lookahead = barmerge.lookahead_on)
@@ -1002,11 +1010,13 @@ if takeL or waitL or avoidL
     lastOpin := recL ? "RETEST TAKE — Pullback Confirmed" : qL + " — " + whyL
     lastLook := recL ? "Targeting TP1 expansion" : lkL
     lastOk   := recL or qL == "TAKE"
+    lastOpinBar := bar_index
 if takeS or waitS or avoidS
     lastQ    := recS ? "RETEST TAKE" : qS
     lastOpin := recS ? "RETEST TAKE — Pullback Confirmed" : qS + " — " + whyS
     lastLook := recS ? "Targeting TP1 expansion" : lkS
     lastOk   := recS or qS == "TAKE"
+    lastOpinBar := bar_index
 
 // ═════════════════════════════ SIGNAL VISUALS ═════════════════════════════
 if showSig and not classic
@@ -1111,6 +1121,83 @@ if barstate.islast and vpOn
         if pocLbl
             array.push(vpLbls, label.new(extPOC ? bar_index + liqExt : xEnd, pocY, "POC", style = label.style_label_lower_left, color = color.new(color.black, 100), textcolor = cPOC, size = size.tiny))
 
+// ═════════════════════════════ NEXT-TRADE SCOUT ═════════════════════════════
+// What would have to happen for the next BUY / SELL, and how it would be graded if it fired right now.
+f_nearZone(array<Zone> zs, int d, float px) =>
+    float zt = na
+    float zb = na
+    string zk = ""
+    if array.size(zs) > 0
+        for z in zs
+            if z.dir == d and (d == 1 ? z.top < px : z.bot > px)
+                if na(zt) or (d == 1 ? z.top > zt : z.bot < zb)
+                    zt := z.top
+                    zb := z.bot
+                    zk := z.kind
+    [zt, zb, zk]
+
+f_pickZone(array<Zone> a1, array<Zone> a2, array<Zone> a3, int d, float px) =>
+    [t1, b1, k1] = f_nearZone(a1, d, px)
+    [t2, b2, k2] = f_nearZone(a2, d, px)
+    [t3, b3, k3] = f_nearZone(a3, d, px)
+    float zt = t1
+    float zb = b1
+    string zk = k1
+    if not na(t2) and (na(zt) or (d == 1 ? t2 > zt : b2 < zb))
+        zt := t2
+        zb := b2
+        zk := k2
+    if not na(t3) and (na(zt) or (d == 1 ? t3 > zt : b3 < zb))
+        zt := t3
+        zb := b3
+        zk := k3
+    [zt, zb, zk == "Order Block" ? "OB" : zk == "Mitigation Block" ? "MB" : zk == "" ? "" : "FVG"]
+
+// trigger levels: nearest unbroken swing / session-box edge in each direction
+float buyTrig = na
+string buyFrom = ""
+float sellTrig = na
+string sellFrom = ""
+if not swHiDone and not na(swHi) and swHi > close
+    buyTrig := swHi
+    buyFrom := "swing high"
+if boxOn and not bUpDone and not na(bHi) and bHi > close and (na(buyTrig) or bHi < buyTrig)
+    buyTrig := bHi
+    buyFrom := "session high"
+if not swLoDone and not na(swLo) and swLo < close
+    sellTrig := swLo
+    sellFrom := "swing low"
+if boxOn and not bDnDone and not na(bLo) and bLo < close and (na(sellTrig) or bLo > sellTrig)
+    sellTrig := bLo
+    sellFrom := "session low"
+
+// grade a breakout as if it fired on this bar
+[rdL, rsL, rwL, rkL] = f_eval(1, "breakout", atrMult * atr14)
+[rdS, rsS, rwS, rkS] = f_eval(-1, "breakout", atrMult * atr14)
+
+scRisk = atrMult * atr14
+roomL = na(nearBSL) or nearBSL - close >= math.max(tp1M, 1.0) * scRisk
+roomS = na(nearSSL) or close - nearSSL >= math.max(tp1M, 1.0) * scRisk
+cleanReg = not isChoppy and not isWeak
+ckL = array.from(htfBias == 1, structTrend == 1, buyPct >= 50, na(pocPx) or close > pocPx, cleanReg, roomL, not adrExh)
+ckS = array.from(htfBias == -1, structTrend == -1, buyPct <= 50, na(pocPx) or close < pocPx, cleanReg, roomS, not adrExh)
+ckNames = array.from("HTF", "Struct", "Flow", "POC", "Regime", "Room", "ADR")
+f_ckLine(array<bool> ck) =>
+    string o = ""
+    for i = 0 to array.size(ck) - 1
+        o += (i == 0 ? "" : "  ") + array.get(ckNames, i) + " " + (array.get(ck, i) ? "✅" : "❌")
+    o
+f_ckCount(array<bool> ck) =>
+    int n = 0
+    for b in ck
+        n += b ? 1 : 0
+    n
+
+var line scBuyLn  = na
+var line scSellLn = na
+var label scBuyLb  = na
+var label scSellLb = na
+
 // ═════════════════════════════ TELEMETRY & AI SYNTHESIS HUD ═════════════════════════════
 hudP = hudPos == "Top Right" ? position.top_right : hudPos == "Top Left" ? position.top_left : hudPos == "Bottom Right" ? position.bottom_right : position.bottom_left
 var table hud = table.new(hudP, 8, 12, bgcolor = color.new(#1e2433, hudBgT), border_color = color.new(#2a2e39, 0), border_width = 1, frame_color = color.new(#2a2e39, 0), frame_width = 1)
@@ -1133,7 +1220,9 @@ if barstate.islast and hudOn
     opinCol = str.contains(lastQ, "TAKE") ? cTeal : lastQ == "WAIT" ? cWait : lastQ == "AVOID" ? cPink : cTeal
     lookCol = lastQ == "AVOID" or lastQ == "WAIT" ? cPink : cTeal
     biasTxt = (structTrend == 1 ? "BULLISH" : structTrend == -1 ? "BEARISH" : "NEUTRAL") + (na(pocPx) ? "" : close > pocPx ? " (Above POC)" : " (Below POC)")
-    htfTxt = htfBias == 1 ? "BULL" : htfBias == -1 ? "BEAR" : "N/A"
+    htfTxt = htfName + " " + (htfBias == 1 ? "BULL" : htfBias == -1 ? "BEAR" : "N/A")
+    ageN = na(lastOpinBar) ? 0 : bar_index - lastOpinBar
+    ageTxt = na(lastOpinBar) ? "" : ageN == 0 ? " (this bar)" : " (" + str.tostring(ageN) + " bars ago)"
     sesTxt = inMorning ? "Morning Session" : inEvening ? "Evening Session" : restrictSes ? "Closed (Filtered)" : "Open (Global)"
     adrTxt = str.tostring(adrPct, "#.#") + "%" + (adrExh ? " [EXHAUSTED]" : "")
     absorb = vol > volAvg * 1.5 and body < 0.3 * atr14
@@ -1148,7 +1237,7 @@ if barstate.islast and hudOn
             f_cell(0, 0, "⚡  TS FLOW AI: " + sideTxt, tDir == 1 ? cTeal : cPink)
             f_cell(0, 1, "• Fill Price: " + f_px(tEntry) + " | Stop Loss (SL): " + f_px(tSL), cWhite)
             f_cell(0, 2, "   Risk Distance: " + f_dist(tRisk) + " pts | Pullback Risk: " + pbRisk, cGray)
-            f_cell(0, 3, "• Profit Targets: TP1: " + f_px(tTP1) + " (1:1R) | TP2: " + f_px(tTP2), cWhite)
+            f_cell(0, 3, "• Profit Targets: TP1: " + f_px(tTP1) + " (" + str.tostring(tp1M) + "R) | TP2: " + f_px(tTP2), cWhite)
             f_cell(0, 4, "   Live Pressure: " + pressTxt, cWhite)
             f_cell(0, 5, "• AI Trade Opinion: " + lastOpin, opinCol)
             f_cell(0, 6, "   What To Look For: " + lookTxt, lookCol)
@@ -1165,13 +1254,39 @@ if barstate.islast and hudOn
             f_cell(0, 6, "• ADR Range: " + str.tostring(adrPct, "#.#") + "% | Gate: " + gateTxt, cWhite)
             f_cell(0, 7, "• Sweeps: " + sweepTxt, cWhite)
             f_cell(0, 8, "• Next Seeking Setup: Stand by for next session cycle", cTeal)
+        else if scoutOn
+            nL = f_ckCount(ckL)
+            nS = f_ckCount(ckS)
+            lean = nL - nS >= 2 ? 1 : nS - nL >= 2 ? -1 : 0
+            leanTxt = lean == 1 ? "LONG" : lean == -1 ? "SHORT" : "NONE (mixed)"
+            [bzT, bzB, bzK] = f_pickZone(obs, mits, fvgs, 1, close)
+            [szT, szB, szK] = f_pickZone(obs, mits, fvgs, -1, close)
+            bTrigTxt = na(buyTrig) ? "no open level above — wait for a new swing / session" : "strong close above " + f_px(buyTrig) + " (" + buyFrom + ", +" + str.tostring((buyTrig - close) / close * 100, "#.##") + "%)"
+            sTrigTxt = na(sellTrig) ? "no open level below — wait for a new swing / session" : "strong close below " + f_px(sellTrig) + " (" + sellFrom + ", -" + str.tostring((close - sellTrig) / close * 100, "#.##") + "%)"
+            zoneTxtL = na(bzT) ? "none below" : bzK + " " + f_px(bzB) + "–" + f_px(bzT)
+            zoneTxtS = na(szT) ? "none above" : szK + " " + f_px(szB) + "–" + f_px(szT)
+            liqTxt = "BSL " + (na(nearBSL) ? "none" : f_px(nearBSL) + (nearBSLHard ? " (major)" : "")) + "  |  SSL " + (na(nearSSL) ? "none" : f_px(nearSSL) + (nearSSLHard ? " (major)" : ""))
+            leadQ = lean == 1 ? rdL : lean == -1 ? rdS : ""
+            leadWhy = lean == 1 ? rwL : lean == -1 ? rwS : ""
+            planTxt = lean == 0 ? "No-trade zone: sides are split (" + str.tostring(nL) + " vs " + str.tostring(nS) + "). Wait for HTF + structure to line up" : leadQ == "TAKE" ? "Ready: " + (lean == 1 ? "BUY on a " + (na(buyTrig) ? "bull breakout / zone retest" : "strong close above " + f_px(buyTrig)) : "SELL on a " + (na(sellTrig) ? "bear breakout / zone retest" : "strong close below " + f_px(sellTrig))) : "Lean " + leanTxt + " but a breakout now = " + leadQ + " (" + leadWhy + "). Better: retest of " + (lean == 1 ? zoneTxtL : zoneTxtS)
+            f_cell(0, 0, "🔭  TS FLOW AI: NEXT TRADE SCOUT  |  " + regimeTxt, lean == 1 ? cTeal : lean == -1 ? cPink : #ffa726)
+            f_cell(0, 1, "• Lean: " + leanTxt + "  (long " + str.tostring(nL) + "/7 vs short " + str.tostring(nS) + "/7) | Bias: " + biasTxt + " | HTF " + htfTxt, cWhite)
+            f_cell(0, 2, "▲ BUY trigger: " + bTrigTxt, cTeal)
+            f_cell(0, 3, "   If it fired now: " + rdL + " — " + rwL + "   |   " + f_ckLine(ckL), rdL == "TAKE" ? cTeal : rdL == "WAIT" ? cWait : cGray)
+            f_cell(0, 4, "▼ SELL trigger: " + sTrigTxt, cPink)
+            f_cell(0, 5, "   If it fired now: " + rdS + " — " + rwS + "   |   " + f_ckLine(ckS), rdS == "TAKE" ? cPink : rdS == "WAIT" ? cWait : cGray)
+            f_cell(0, 6, "• Retest zones: Buy " + zoneTxtL + "  |  Sell " + zoneTxtS, cWhite)
+            f_cell(0, 7, "• Liquidity targets: " + liqTxt, cWhite)
+            f_cell(0, 8, "• Flow: " + flowTxt + " | " + pressTxt + " | ADR " + adrTxt, cGray)
+            f_cell(0, 9, "• Last signal: " + lastOpin + ageTxt, opinCol)
+            f_cell(0, 10, "• Plan: " + planTxt, lean == 1 ? cTeal : lean == -1 ? cPink : #ffa726)
         else
             f_cell(0, 0, "🤖  TS ORDER FLOW: CONSOLIDATING", structTrend == 1 ? #ffa726 : cTeal)
             f_cell(0, 1, "• Bias: " + biasTxt + " | HTF: " + htfTxt, cWhite)
             f_cell(0, 2, "   Session: " + sesTxt + " | ADR: " + adrTxt, cGray)
             f_cell(0, 3, "• Order Flow State: " + flowTxt + " | Net Δ: " + dTxt, cWhite)
             f_cell(0, 4, "• Session Sweeps: " + sweepTxt, cWhite)
-            f_cell(0, 5, "• AI Trade Opinion: " + lastOpin, opinCol)
+            f_cell(0, 5, "• AI Trade Opinion: " + lastOpin + ageTxt, opinCol)
             f_cell(0, 6, "   What To Look For: " + lastLook, lookCol)
     else if hudMode == "Mobile Assistant"
         // NOTE: layout not confirmed from the original yet; compact two-column version
@@ -1179,13 +1294,16 @@ if barstate.islast and hudOn
         f_cell(0, 0, "⚡ TS FLOW AI", cTeal)
         f_cell(1, 0, act, tDir == 1 ? cTeal : tDir == -1 ? cPink : cWhite)
         f_cell(0, 1, "Opinion", cGray)
-        f_cell(1, 1, lastOpin, opinCol)
+        f_cell(1, 1, lastOpin + (tDir == 0 ? ageTxt : ""), opinCol)
         f_cell(0, 2, "Entry / SL", cGray)
         f_cell(1, 2, tDir != 0 ? f_px(tEntry) + " / " + f_px(tSL) : "-", cWhite)
         f_cell(0, 3, "TP1 / TP2", cGray)
         f_cell(1, 3, tDir != 0 ? f_px(tTP1) + " / " + f_px(tTP2) : "-", cWhite)
         f_cell(0, 4, "ADR | Sweep", cGray)
         f_cell(1, 4, adrTxt + " | AH:" + (aSweptH ? "✓" : "✗") + " AL:" + (aSweptL ? "✓" : "✗"), cWhite)
+        if tDir == 0 and scoutOn
+            f_cell(0, 5, "Next ▲ / ▼", cGray)
+            f_cell(1, 5, (na(buyTrig) ? "-" : f_px(buyTrig) + " " + rdL) + "  /  " + (na(sellTrig) ? "-" : f_px(sellTrig) + " " + rdS), cWhite)
     else if hudMode == "Slim Telemetry"
         f_cell(0, 0, "Bias " + biasTxt, structTrend == 1 ? cTeal : cPink)
         f_cell(1, 0, "HTF " + htfTxt, cWhite)
@@ -1212,9 +1330,23 @@ if barstate.islast and hudOn
         f_cell(2, 3, "Sweeps", cGray)
         f_cell(3, 3, "AH:" + (aSweptH ? "✓" : "✗") + " | AL:" + (aSweptL ? "✓" : "✗"), cWhite)
         f_cell(0, 4, "Opinion", cGray)
-        f_cell(1, 4, lastOpin, opinCol)
+        f_cell(1, 4, lastOpin + (tDir == 0 ? ageTxt : ""), opinCol)
         f_cell(2, 4, "Trade", cGray)
         f_cell(3, 4, tDir != 0 ? sideTxt + " @ " + f_px(tEntry) + " | SL " + f_px(tSL) : "None", cWhite)
+
+// next-trade trigger lines (only while flat)
+if barstate.islast
+    line.delete(scBuyLn)
+    line.delete(scSellLn)
+    label.delete(scBuyLb)
+    label.delete(scSellLb)
+    if scoutLn and scoutOn and tDir == 0
+        if not na(buyTrig)
+            scBuyLn := line.new(bar_index - 5, buyTrig, bar_index + 10, buyTrig, color = color.new(cTeal, 30), style = line.style_dotted, width = 1)
+            scBuyLb := label.new(bar_index + 10, buyTrig, "▲ BUY trigger " + f_px(buyTrig) + " [" + rdL + "]", style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.new(cTeal, 20), size = size.tiny)
+        if not na(sellTrig)
+            scSellLn := line.new(bar_index - 5, sellTrig, bar_index + 10, sellTrig, color = color.new(cPink, 30), style = line.style_dotted, width = 1)
+            scSellLb := label.new(bar_index + 10, sellTrig, "▼ SELL trigger " + f_px(sellTrig) + " [" + rdS + "]", style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.new(cPink, 20), size = size.tiny)
 
 // ═════════════════════════════ ALERTS ═════════════════════════════
 f_msg(int d, string q) =>
