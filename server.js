@@ -38,7 +38,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = process.env.BINGX_BASE_URL || "https://open-api-vst.bingx.com";   // VST demo by default
 const IS_LIVE = !BINGX_BASE_URL.includes("vst");
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v27.0-paper-combo";
+const SERVER_VERSION = "v27.1-tsflow-sync";
 
 // v25.1 — one codebase, two deployments. The demo service keeps the defaults.
 // A second Railway service runs the REAL-money "Aggro only" copy with:
@@ -1409,8 +1409,9 @@ async function flowTag(symbol, t, side) {
     const [b4, h1, d1] = await Promise.all([agKlines(symbol, "4h", 500), agKlines(symbol, "1h", 1000), agKlines(symbol, "1d", 120)]);
     if (!b4?.length || !h1?.length || !d1?.length) return { err: "klines" };
     const tr4 = [], tr1 = [];
-    runPhoenix(b4, h1, d1, { trace: tr4 });
-    runPhoenix(h1, h1, d1, { trace: tr1 });
+    // Auto HTF like the TradingView indicator: 4H chart trend from 1D, 1H chart trend from 4H
+    runPhoenix(b4, h1, d1, { trace: tr4, trendBars: d1 });
+    runPhoenix(h1, h1, d1, { trace: tr1, trendBars: b4 });
     const s4 = tr4.find(s => s.t === t), s1 = tr1.find(s => s.t === t + 3 * 3600000);
     if (!s4 || !s1) return { err: "no flow state" };
     const op4 = d === 1 ? s4.evLb : s4.evSb;

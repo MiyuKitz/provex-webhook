@@ -1,5 +1,8 @@
 // tsflow.js — server-side Two-Speed Flow engine (same rules as tradingview/TwoSpeedFlow.pine v2, his defaults). Analysis only: never places orders.
-// Backtest port of tradingview/TwoSpeedFlow.pine v2.0.1 (his defaults). Same order of operations as the Pine script.
+// Port of tradingview/TwoSpeedFlow.pine v2.1.4 signal logic (his defaults). Same order of operations as the Pine script.
+// HTF trend = Auto HTF (Pine v2.1): pass opts.trendBars = next-higher timeframe bars (4H chart -> 1D, 1H chart -> 4H).
+// `htf` bars are only used for HTF liquidity pools (Pine "HTF Liquidity Resolution", default 1H).
+// Pine v2.1+ display-only features (Next-Trade Scout, normal-case labels) do not affect signals and are not ported.
 "use strict";
 const H1 = 3600000, DAY = 86400000;
 const DEF = {
@@ -32,10 +35,11 @@ function runPhoenix(b, htf, daily, opts = {}) {
   const mdm = b.map((x, i) => { if (!i) return 0; const u = x.h - b[i - 1].h, d = b[i - 1].l - x.l; return d > u && d > 0 ? d : 0; });
   const trR = rma(tr, P.adxLen), pR = rma(pdm, P.adxLen), mR = rma(mdm, P.adxLen);
   const adx = rma(b.map((_, i) => { const p = pR[i] / trR[i], m = mR[i] / trR[i]; return isFinite(p + m) && p + m > 0 ? 100 * Math.abs(p - m) / (p + m) : NaN; }), P.adxLen);
-  const hCl = htf.map(x => x.c), hF = ema(hCl, 10), hS = ema(hCl, 30), hPH = htf.map((_, i) => pivot(htf, i, 3, true)), hPL = htf.map((_, i) => pivot(htf, i, 3, false));
+  const tb = P.trendBars || htf, tbMs = tb.length > 1 ? tb[1].t - tb[0].t : htfMs;
+  const tCl = tb.map(x => x.c), hF = ema(tCl, 10), hS = ema(tCl, 30), hPH = htf.map((_, i) => pivot(htf, i, 3, true)), hPL = htf.map((_, i) => pivot(htf, i, 3, false));
   const dAtr = rma(trs(daily), P.adrLen);
   const htfPools = htfMs > tf && P.htfOn;
-  let hi = -1, di = -1;
+  let hi = -1, di = -1, ti = -1;
   const st = { obs: [], mits: [], fvgs: [], exitI: -1e9, pools: [], recHi: [], recLo: [], swHi: NaN, swHiDone: true, swLo: NaN, swLoDone: true, trend: 0,
     bHi: NaN, bLo: NaN, bStart: 0, bLive: false, bUp: false, bDn: false, prevSess: -1, vp: new Map(), step: NaN, pocB: NaN, pocV: 0, dayKey: null, dHi: 0, dLo: 0,
     lastSigDir: 0, lastSigBar: -1e9, T: null };
@@ -54,7 +58,8 @@ function runPhoenix(b, htf, daily, opts = {}) {
     curA = a;
     while (hi + 1 < htf.length && htf[hi + 1].t + htfMs <= x.t) { hi++; if (htfPools) { if (isFinite(hPH[hi])) addPool(hPH[hi], 1, true, true); if (isFinite(hPL[hi])) addPool(hPL[hi], -1, true, true); } }
     while (di + 1 < daily.length && daily[di + 1].t + DAY <= x.t) di++;
-    const htfBias = hi >= 0 && isFinite(hF[hi]) && isFinite(hS[hi]) ? (hF[hi] > hS[hi] ? 1 : -1) : 0;
+    while (ti + 1 < tb.length && tb[ti + 1].t + tbMs <= x.t) ti++;
+    const htfBias = ti >= 0 && isFinite(hF[ti]) && isFinite(hS[ti]) ? (hF[ti] > hS[ti] ? 1 : -1) : 0;
     const dk = Math.floor(x.t / DAY); if (st.dayKey !== dk) { st.dayKey = dk; st.dHi = x.h; st.dLo = x.l; } else { st.dHi = Math.max(st.dHi, x.h); st.dLo = Math.min(st.dLo, x.l); }
     const adrPct = di >= 0 && dAtr[di] > 0 ? (st.dHi - st.dLo) / dAtr[di] * 100 : 0, adrExh = adrPct >= P.adrLimit;
     let hh = -Infinity, ll = Infinity, s1 = 0; for (let k = i - P.chopLen + 1; k <= i; k++) { hh = Math.max(hh, b[k].h); ll = Math.min(ll, b[k].l); s1 += tr[k]; }
