@@ -1,6 +1,6 @@
 //@version=6
 // ============================================================================
-//  TWO-SPEED FLOW  v2.1.2  (Next-Trade Scout HUD, Auto HTF, signal age)
+//  TWO-SPEED FLOW  v2.1.3  (Next-Trade Scout HUD, Auto HTF, signal age)
 //  Rebuilt to match the settings, defaults, chart objects and HUD layout of the
 //  reference order-flow indicator, from its public description, settings
 //  screens and chart screenshots. Same inputs, same defaults, same HUD rows.
@@ -403,6 +403,7 @@ htfName = htfLiqTf == "D" ? "1D" : htfLiqTf == "W" ? "1W" : htfLiqTf + "m"
 
 // price formatting on chart tags and HUD: 2 decimals (finer for very small prices)
 f_px(float x) => math.abs(x) >= 0.1 ? str.tostring(x, "#.##") : str.tostring(x, format.mintick)
+f_pxT(float x) => str.tostring(x, format.mintick)
 f_dist(float x) => x >= 0.001 ? str.tostring(x, "#.####") : str.tostring(x, format.mintick)
 
 // ═════════════════════════════ MARKET STRUCTURE ═════════════════════════════
@@ -1291,13 +1292,13 @@ if barstate.islast and hudOn
             leanS = lean == 1 ? "LONG ↑" : lean == -1 ? "SHORT ↓" : htfBlock ? "NONE ✋HTF" : "NONE"
             biasS = (structTrend == 1 ? "↑" : structTrend == -1 ? "↓" : "–") + (na(pocPx) ? "" : close > pocPx ? " >POC" : " <POC")
             htfS = htfTrName + " " + (htfBias == 1 ? "↑" : htfBias == -1 ? "↓" : "–")
-            bTrig = na(buyTrig) ? "▲ BUY: no level yet" : "▲ BUY > " + f_px(buyTrig) + " (" + (buyFrom == "swing high" ? "swing" : "session") + ", +" + str.tostring((buyTrig - close) / close * 100, "#.#") + "%) → " + rdL + (rdL == "TAKE" ? "" : ": " + f_why(rwL))
-            sTrig = na(sellTrig) ? "▼ SELL: no level yet" : "▼ SELL < " + f_px(sellTrig) + " (" + (sellFrom == "swing low" ? "swing" : "session") + ", -" + str.tostring((close - sellTrig) / close * 100, "#.#") + "%) → " + rdS + (rdS == "TAKE" ? "" : ": " + f_why(rwS))
-            zL = na(bzT) ? "–" : bzK + " " + f_px(bzB) + "–" + f_px(bzT)
-            zS = na(szT) ? "–" : szK + " " + f_px(szB) + "–" + f_px(szT)
-            liqS = "Liq: BSL " + (na(nearBSL) ? "–" : f_px(nearBSL) + (nearBSLHard ? "★" : "")) + " | SSL " + (na(nearSSL) ? "–" : f_px(nearSSL) + (nearSSLHard ? "★" : ""))
+            bTrig = na(buyTrig) ? "▲ BUY: no level yet" : "▲ BUY > " + f_pxT(buyTrig) + " (" + (buyFrom == "swing high" ? "swing" : "session") + ", +" + str.tostring((buyTrig - close) / close * 100, "#.#") + "%) → " + rdL + (rdL == "TAKE" ? "" : ": " + f_why(rwL))
+            sTrig = na(sellTrig) ? "▼ SELL: no level yet" : "▼ SELL < " + f_pxT(sellTrig) + " (" + (sellFrom == "swing low" ? "swing" : "session") + ", -" + str.tostring((close - sellTrig) / close * 100, "#.#") + "%) → " + rdS + (rdS == "TAKE" ? "" : ": " + f_why(rwS))
+            zL = na(bzT) ? "–" : bzK + " " + f_pxT(bzB) + "–" + f_pxT(bzT)
+            zS = na(szT) ? "–" : szK + " " + f_pxT(szB) + "–" + f_pxT(szT)
+            liqS = "Liq: BSL " + (na(nearBSL) ? "–" : f_pxT(nearBSL) + (nearBSLHard ? "★" : "")) + " | SSL " + (na(nearSSL) ? "–" : f_pxT(nearSSL) + (nearSSLHard ? "★" : ""))
             leadQ = lean == 1 ? rdL : rdS
-            planS = htfBlock ? "👉 No trade: " + (rawLean == 1 ? "↑" : "↓") + " vs HTF " + htfTrName + " " + (htfBias == 1 ? "↑" : "↓") + ". Wait align" : lean == 0 ? "👉 No trade: mixed. Wait HTF + structure align" : leadQ == "TAKE" ? (lean == 1 ? "👉 BUY on close > " + (na(buyTrig) ? "breakout" : f_px(buyTrig)) : "👉 SELL on close < " + (na(sellTrig) ? "breakout" : f_px(sellTrig))) : "👉 Lean " + (lean == 1 ? "↑" : "↓") + " but breakout = " + leadQ + ". Wait retest " + (lean == 1 ? zL : zS)
+            planS = htfBlock ? "👉 No trade: " + (rawLean == 1 ? "↑" : "↓") + " vs HTF " + htfTrName + " " + (htfBias == 1 ? "↑" : "↓") + ". Wait align" : lean == 0 ? "👉 No trade: mixed. Wait HTF + structure align" : leadQ == "TAKE" ? (lean == 1 ? "👉 BUY on close > " + (na(buyTrig) ? "breakout" : f_pxT(buyTrig)) : "👉 SELL on close < " + (na(sellTrig) ? "breakout" : f_pxT(sellTrig))) : "👉 Lean " + (lean == 1 ? "↑" : "↓") + " but breakout = " + leadQ + ". Wait retest " + (lean == 1 ? zL : zS)
             ageS = na(lastOpinBar) ? "" : " (" + str.tostring(bar_index - lastOpinBar) + " bars)"
             lastS = lastQ == "" ? "Last: –" : "Last: " + lastQ + " · " + f_why(str.contains(lastOpin, " — ") ? str.substring(lastOpin, str.pos(lastOpin, " — ") + 3) : lastOpin) + ageS
             cLean = lean == 1 ? cTeal : lean == -1 ? cPink : #ffa726
@@ -1374,10 +1375,10 @@ if barstate.islast
     if scoutLn and scoutOn and tDir == 0
         if not na(buyTrig)
             scBuyLn := line.new(bar_index - 5, buyTrig, bar_index + 10, buyTrig, color = color.new(cTeal, 30), style = line.style_dotted, width = 1)
-            scBuyLb := label.new(bar_index + 10, buyTrig, "▲ " + f_px(buyTrig) + " " + rdL, style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.new(cTeal, 20), size = size.tiny)
+            scBuyLb := label.new(bar_index + 10, buyTrig, "▲ " + f_pxT(buyTrig) + " " + rdL, style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.new(cTeal, 20), size = size.tiny)
         if not na(sellTrig)
             scSellLn := line.new(bar_index - 5, sellTrig, bar_index + 10, sellTrig, color = color.new(cPink, 30), style = line.style_dotted, width = 1)
-            scSellLb := label.new(bar_index + 10, sellTrig, "▼ " + f_px(sellTrig) + " " + rdS, style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.new(cPink, 20), size = size.tiny)
+            scSellLb := label.new(bar_index + 10, sellTrig, "▼ " + f_pxT(sellTrig) + " " + rdS, style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.new(cPink, 20), size = size.tiny)
 
 // ═════════════════════════════ ALERTS ═════════════════════════════
 f_msg(int d, string q) =>
