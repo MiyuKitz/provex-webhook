@@ -1,6 +1,6 @@
 //@version=6
 // ============================================================================
-//  TWO-SPEED FLOW  v2.1.1  (Next-Trade Scout HUD, Auto HTF, signal age)
+//  TWO-SPEED FLOW  v2.1.2  (Next-Trade Scout HUD, Auto HTF, signal age)
 //  Rebuilt to match the settings, defaults, chart objects and HUD layout of the
 //  reference order-flow indicator, from its public description, settings
 //  screens and chart screenshots. Same inputs, same defaults, same HUD rows.
@@ -1281,11 +1281,14 @@ if barstate.islast and hudOn
         else if scoutOn
             nL = f_ckCount(ckL)
             nS = f_ckCount(ckS)
-            lean = nL - nS >= 2 ? 1 : nS - nL >= 2 ? -1 : 0
+            rawLean = nL - nS >= 2 ? 1 : nS - nL >= 2 ? -1 : 0
+            // bigger timeframe wins: no lean against the HTF trend
+            htfBlock = rawLean != 0 and htfBias == -rawLean
+            lean = htfBlock ? 0 : rawLean
             [bzT, bzB, bzK] = f_pickZone(obs, mits, fvgs, 1, close)
             [szT, szB, szK] = f_pickZone(obs, mits, fvgs, -1, close)
             regS = isChoppy ? "CHOP" : isWeak ? "WEAK" : structTrend == 1 ? "TREND ↑" : structTrend == -1 ? "TREND ↓" : "RANGE"
-            leanS = lean == 1 ? "LONG ↑" : lean == -1 ? "SHORT ↓" : "NONE"
+            leanS = lean == 1 ? "LONG ↑" : lean == -1 ? "SHORT ↓" : htfBlock ? "NONE ✋HTF" : "NONE"
             biasS = (structTrend == 1 ? "↑" : structTrend == -1 ? "↓" : "–") + (na(pocPx) ? "" : close > pocPx ? " >POC" : " <POC")
             htfS = htfTrName + " " + (htfBias == 1 ? "↑" : htfBias == -1 ? "↓" : "–")
             bTrig = na(buyTrig) ? "▲ BUY: no level yet" : "▲ BUY > " + f_px(buyTrig) + " (" + (buyFrom == "swing high" ? "swing" : "session") + ", +" + str.tostring((buyTrig - close) / close * 100, "#.#") + "%) → " + rdL + (rdL == "TAKE" ? "" : ": " + f_why(rwL))
@@ -1294,12 +1297,12 @@ if barstate.islast and hudOn
             zS = na(szT) ? "–" : szK + " " + f_px(szB) + "–" + f_px(szT)
             liqS = "Liq: BSL " + (na(nearBSL) ? "–" : f_px(nearBSL) + (nearBSLHard ? "★" : "")) + " | SSL " + (na(nearSSL) ? "–" : f_px(nearSSL) + (nearSSLHard ? "★" : ""))
             leadQ = lean == 1 ? rdL : rdS
-            planS = lean == 0 ? "👉 No trade: mixed. Wait HTF + structure align" : leadQ == "TAKE" ? (lean == 1 ? "👉 BUY on close > " + (na(buyTrig) ? "breakout" : f_px(buyTrig)) : "👉 SELL on close < " + (na(sellTrig) ? "breakout" : f_px(sellTrig))) : "👉 Lean " + (lean == 1 ? "↑" : "↓") + " but breakout = " + leadQ + ". Wait retest " + (lean == 1 ? zL : zS)
+            planS = htfBlock ? "👉 No trade: " + (rawLean == 1 ? "↑" : "↓") + " vs HTF " + htfTrName + " " + (htfBias == 1 ? "↑" : "↓") + ". Wait align" : lean == 0 ? "👉 No trade: mixed. Wait HTF + structure align" : leadQ == "TAKE" ? (lean == 1 ? "👉 BUY on close > " + (na(buyTrig) ? "breakout" : f_px(buyTrig)) : "👉 SELL on close < " + (na(sellTrig) ? "breakout" : f_px(sellTrig))) : "👉 Lean " + (lean == 1 ? "↑" : "↓") + " but breakout = " + leadQ + ". Wait retest " + (lean == 1 ? zL : zS)
             ageS = na(lastOpinBar) ? "" : " (" + str.tostring(bar_index - lastOpinBar) + " bars)"
             lastS = lastQ == "" ? "Last: –" : "Last: " + lastQ + " · " + f_why(str.contains(lastOpin, " — ") ? str.substring(lastOpin, str.pos(lastOpin, " — ") + 3) : lastOpin) + ageS
             cLean = lean == 1 ? cTeal : lean == -1 ? cPink : #ffa726
             f_cell(0, 0, "🔭 NEXT TRADE | " + regS, cLean)
-            f_cell(0, 1, "Lean: " + leanS + " " + str.tostring(math.max(nL, nS)) + "/7 vs " + str.tostring(math.min(nL, nS)) + "/7 | Bias " + biasS + " | HTF " + htfS, cWhite)
+            f_cell(0, 1, "Lean: " + leanS + " (↑" + str.tostring(nL) + " ↓" + str.tostring(nS) + ") | Bias " + biasS + " | HTF " + htfS, cWhite)
             f_cell(0, 2, bTrig, cTeal)
             f_cell(0, 3, "   " + f_ckLine(ckL), cGray)
             f_cell(0, 4, sTrig, cPink)
