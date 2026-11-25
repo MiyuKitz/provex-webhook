@@ -38,7 +38,7 @@ const BINGX_API_SECRET = process.env.BINGX_API_SECRET;
 const BINGX_BASE_URL   = process.env.BINGX_BASE_URL || "https://open-api-vst.bingx.com";   // VST demo by default
 const IS_LIVE = !BINGX_BASE_URL.includes("vst");
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const SERVER_VERSION = "v27.0-paper-combo";
+const SERVER_VERSION = "v27.2-maker-entry";
 
 // v25.1 — one codebase, two deployments. The demo service keeps the defaults.
 // A second Railway service runs the REAL-money "Aggro only" copy with:
@@ -278,7 +278,7 @@ async function stopWatchdogFor(acct) {
   const stopsOf = p => orders.filter(o => o.symbol === p.symbol && o.positionSide === (p.direction === "Short" ? "SHORT" : "LONG")
     && /STOP/.test(o.type || "") && !/TAKE_PROFIT/.test(o.type || ""));
   const covered = p => stopsOf(p).reduce((q, o) => q + (parseFloat(o.origQty ?? o.quantity) || 0), 0);
-  const unprotected = pos.positions.filter(p => covered(p) < p.amt * 0.999);
+  const unprotected = pos.positions.filter(p => covered(p) < p.amt * 0.999 && !agPending.has(`${p.symbol}|${p.direction === "Short" ? "SHORT" : "LONG"}`));
   console.log(`Stop watchdog${acct === "aggro" ? " (Aggro account)" : ""}: ${pos.positions.length} position(s), ${unprotected.length} without a stop`);
   // v26.8 self-repair: if the unprotected position is an Aggro trade, put its stop back (or close it if price is
   // already past the stop) instead of only alerting. BNB/ZRO/WIF were found without stops on Nov 12.
@@ -1010,6 +1010,58 @@ async function agCancel(symbol, id) { if (id) await bingxRequest("DELETE", "/ope
 // Now: place the new stop first, cancel the old one only after the new one is confirmed. If BingX refuses a
 // second stop, fall back to cancel-then-place with retries, and as a last resort put the OLD stop back.
 const agSleep = ms => new Promise(r => setTimeout(r, ms));
+
+// v27.2 MAKER ENTRY: enter with a post-only LIMIT at the best bid (long) / best ask (short) so the entry pays the
+// maker fee (0.02%) instead of taker (0.05%) plus market slippage (demo market orders slipped 0.3-0.85%).
+// Backtest on the same 2,407 trades: +239R -> +300R, last 12 months +48R -> +90R, worst dip 94R -> 84R.
+// Whatever isn't filled within AGGRO_MAKER_WAIT_SEC is cancelled and the rest is bought at market, so no setup is
+// ever missed. Stops stay STOP_MARKET (taker) on purpose: a stop must always fill.
+const AGGRO_MAKER = (process.env.AGGRO_MAKER || "on").toLowerCase() !== "off";
+const AGGRO_MAKER_WAIT_SEC = Math.max(10, Math.min(240, +(process.env.AGGRO_MAKER_WAIT_SEC || 60)));
+const agPending = new Set();   // "SYMBOL|LEG" while a maker entry is working (watchdog leaves it alone)
+async function agBookTop(symbol) {
+  try {
+    const r = await fetch(`${new URL(BINGX_BASE_URL).origin}/openApi/swap/v2/quote/depth?symbol=${symbol}&limit=5`);
+    const j = await r.json();
+    const bid = +j?.data?.bids?.[0]?.[0], ask = +j?.data?.asks?.[0]?.[0];
+    return bid > 0 && ask > 0 && ask > bid ? { bid, ask } : null;
+  } catch { return null; }
+}
+async function agQueryOrder(symbol, id) {
+  try {
+    const r = await bingxRequest("GET", "/openApi/swap/v2/trade/order", { symbol, orderId: id }, AG_ACCT);
+    const o = r?.data?.order || r?.data;
+    if (!o || r.code !== 0) return null;
+    return { status: String(o.status || "").toUpperCase(), filled: parseFloat(o.executedQty) || 0, avg: parseFloat(o.avgPrice) || 0 };
+  } catch { return null; }
+}
+// Returns { filled, avg } of the maker part (filled may be 0), or null if the limit order couldn't be placed.
+async function agMakerEntry(symbol, side, leg, qty, prec) {
+  const top = await agBookTop(symbol); if (!top) return null;
+  const buy = side === "Long", price = buy ? top.bid : top.ask;
+  const o = await agOrder({ symbol, side: buy ? "BUY" : "SELL", positionSide: leg, type: "LIMIT", price, quantity: qty, timeInForce: "PostOnly" });
+  if (!o.ok) { console.log(`Aggro maker entry ${symbol}: limit refused (${JSON.stringify(o.r).slice(0, 150)}), using market`); return null; }
+  const key = `${symbol}|${leg}`; agPending.add(key);
+  try {
+    let filled = 0, avg = 0; const end = Date.now() + AGGRO_MAKER_WAIT_SEC * 1000;
+    while (Date.now() < end) {
+      await agSleep(5000);
+      const q = await agQueryOrder(symbol, o.id);
+      if (!q) continue;
+      filled = q.filled; avg = q.avg || avg;
+      if (q.status === "FILLED" || q.status === "CANCELLED" || q.status === "FAILED") break;   // post-only can be cancelled at once if price jumped
+    }
+    if (filled < qty) {
+      await agCancel(symbol, o.id).catch(() => {});
+      await agSleep(1000);
+      const q = await agQueryOrder(symbol, o.id);   // re-read after the cancel: it may have filled in between
+      if (q) { filled = q.filled; avg = q.avg || avg; }
+    }
+    filled = Number(Math.min(filled, qty).toFixed(prec));
+    console.log(`Aggro maker entry ${symbol} ${side}: ${filled}/${qty} filled as maker @${avg || price}`);
+    return { filled, avg: filled > 0 ? (avg || price) : 0, limit: price };
+  } finally { agPending.delete(key); }
+}
 async function agMoveStop(t, exitSide, qty, price) {
   const p = { symbol: t.symbol, side: exitSide, positionSide: t.leg, type: "STOP_MARKET", quantity: qty, stopPrice: +price.toPrecision(6), workingType: "MARK_PRICE" };
   const oldId = t.stopId, oldStop = t.stop;
@@ -1078,19 +1130,26 @@ async function agEnter(a, symbol, sig, pos) {
     return "nomargin";
   }
   await bingxRequest("POST", "/openApi/swap/v2/trade/leverage", { symbol, side: leg, leverage: lev }, AG_ACCT);
-  let e = await agOrder({ symbol, side: side === "Long" ? "BUY" : "SELL", positionSide: leg, type: "MARKET", quantity: qty });
+  // v27.2: maker (post-only) first, market for whatever is left
+  let mk = AGGRO_MAKER ? await agMakerEntry(symbol, side, leg, qty, prec) : null;
+  const mkQty = mk?.filled || 0, rest = Number((qty - mkQty).toFixed(prec));
+  let e = rest > 0 ? await agOrder({ symbol, side: side === "Long" ? "BUY" : "SELL", positionSide: leg, type: "MARKET", quantity: rest }) : { ok: true, filled: 0, avgPrice: 0 };
   // v25.5: BingX caps position size per leverage tier (e.g. 200k USDT at 40x). The demo's 20k budget at 50% risk
   // asks for more than that on tight stops, so the order was rejected and the trade silently missed.
   // Shrink to just under the tier cap and retry once (risk ends up a bit lower than 50%, the setup is still taken).
   if (!e.ok && e.r?.code === 101209) {
     const capVal = parseFloat(String(e.r.msg || "").replace(/,/g, "").match(/([\d.]+)\s*USDT/)?.[1]);
-    if (capVal > 0) {
+    if (capVal > 0 && !mkQty) {
       qty = Number(((capVal * 0.95) / px).toFixed(prec));
       console.log(`Aggro: ${symbol} size above BingX's ${capVal} USDT cap at ${lev}x, retrying with ${qty}`);
       if (qty > 0) e = await agOrder({ symbol, side: side === "Long" ? "BUY" : "SELL", positionSide: leg, type: "MARKET", quantity: qty });
     }
   }
-  if (!e.ok) { await sendTelegram(`⚠️ <b>Aggro order failed</b>\n${symbol} ${side} ${qty} @${lev}x\n${JSON.stringify(e.r).slice(0, 200)}`); return; }
+  if (!e.ok && !mkQty) { await sendTelegram(`⚠️ <b>Aggro order failed</b>\n${symbol} ${side} ${qty} @${lev}x\n${JSON.stringify(e.r).slice(0, 200)}`); return; }
+  if (!e.ok) e = { ok: true, filled: 0, avgPrice: 0 };   // market part failed but the maker part filled: trade what we have
+  const mktQty = e.filled || 0, mktPx = e.avgPrice > 0 ? e.avgPrice : px;
+  e = { ok: true, filled: mkQty + mktQty, avgPrice: (mkQty * (mk?.avg || px) + mktQty * mktPx) / ((mkQty + mktQty) || 1) };
+  const makerPct = e.filled > 0 ? Math.round(100 * mkQty / e.filled) : 0;
   const fillPx = e.avgPrice > 0 ? e.avgPrice : px;   // v26.2: real fill, not the quote before the order
   // v26.7: keep the PLANNED stop distance from the actual fill. Demo market orders slipped 0.3-0.85%, which turned
   // a planned 1R loss into 1.3-1.8R (ETH -351 instead of ~-200). Same % distance from the fill = same planned risk.
@@ -1107,7 +1166,7 @@ async function agEnter(a, symbol, sig, pos) {
   const tp1Qty = trail2 ? 0 : Number((filled * 0.4).toFixed(prec)), tp1 = fillPx + sgn * R;
   const tp = tp1Qty > 0 ? await agOrder({ symbol, side: exitSide, positionSide: leg, type: "TAKE_PROFIT_MARKET", quantity: tp1Qty, stopPrice: +tp1.toPrecision(6), workingType: "MARK_PRICE" }) : { ok: false };
   const t = { symbol, side, leg, entry: fillPx, stop: sig.stop, R, qty: filled, tp1, tp1Qty, stopId: stop.ok ? stop.id : null, tp1Id: tp.ok ? tp.id : null,
-              part: false, exit: trail2 ? "trail2" : "tp1", trail: false, canAdd: true, riskVST: +(filled * R).toFixed(2), lev, d, openedAt: Date.now(), signalT: sig.t, tf: sig.tf || "1h", score: sig.score, agree: sig.agree };
+              part: false, exit: trail2 ? "trail2" : "tp1", trail: false, canAdd: true, riskVST: +(filled * R).toFixed(2), lev, d, makerPct, openedAt: Date.now(), signalT: sig.t, tf: sig.tf || "1h", score: sig.score, agree: sig.agree };
   a.open = a.open || []; a.open.push(t); writeAggro(a);
   const tfU = (sig.tf || "1h").toUpperCase();
   await sendTelegram(`📊 <b>Trade Setup 🎰 AGGRO</b> (demo)
@@ -1115,7 +1174,7 @@ async function agEnter(a, symbol, sig, pos) {
 <b>${coin}USDT</b> │ ${side} │ ${tfU} │ ${lev}x
 <b>Confluence: ${sig.score}/${AGGRO_STRATS.length}</b> strategies agree
 
-<b>Entry:</b> $${agFmt(px)}
+<b>Entry:</b> $${agFmt(fillPx)} ${makerPct >= 100 ? "(maker ✅ low fee)" : makerPct > 0 ? `(${makerPct}% maker, rest market)` : "(market)"}
 <b>Stop loss:</b> $${agFmt(sig.stop)} (${(d * 100).toFixed(2)}% away, beyond the trigger candle / zone)
 ${trail2 ? `<b>Breakeven:</b> at +${AGGRO_BE_R}R ($${agFmt(fillPx + sgn * AGGRO_BE_R * R)}) the stop moves to entry, so it can't become a loss
 <b>Lock-in:</b> at +2R ($${agFmt(fillPx + sgn * 2 * R)}) the stop jumps to +1R ($${agFmt(fillPx + sgn * R)})
@@ -1257,8 +1316,11 @@ async function agManage(a, pos) {
   a.open = still;
 }
 
+let aggroRunning = false;
 async function aggroTick() {
   if (!AGGRO || !BINGX_API_KEY || !BINGX_API_SECRET) return;
+  if (aggroRunning) { console.log("Aggro: previous tick still running, skipping this one"); return; }
+  aggroRunning = true;
   try {
     const a = readAggro(); a.lastEntryT = a.lastEntryT || {};
     const RESET = process.env.AGGRO_RESET || "";   // v26: new tag = fresh scoreboard (old one archived, open trades kept)
@@ -1288,7 +1350,7 @@ async function aggroTick() {
       } catch (err) { console.error(`Aggro scan ${symbol} failed (non-fatal):`, err.message); }
       await new Promise(r => setTimeout(r, 200));
     }
-  } catch (err) { console.error("aggroTick failed (non-fatal):", err.message); }
+  } catch (err) { console.error("aggroTick failed (non-fatal):", err.message); } finally { aggroRunning = false; }
 }
 
 
