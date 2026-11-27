@@ -1,6 +1,6 @@
 //@version=6
 // ============================================================================
-//  TWO-SPEED FLOW  v2.1.4  (Next-Trade Scout HUD, Auto HTF, signal age)
+//  TWO-SPEED FLOW  v2.2  (Next-Trade Scout HUD, Auto HTF, signal age, Trade History panel)
 //  Rebuilt to match the settings, defaults, chart objects and HUD layout of the
 //  reference order-flow indicator, from its public description, settings
 //  screens and chart screenshots. Same inputs, same defaults, same HUD rows.
@@ -221,6 +221,13 @@ poolT      = input.int(75, "Liquidity Pool (BSL/SSL) Transparency %", minval = 0
 scoutOn    = input.bool(true, "Next-Trade Scout HUD (when no trade is open)", tooltip = "Replaces the plain CONSOLIDATING box with: where a BUY/SELL would trigger, which checks pass right now, nearest retest zones and liquidity targets.", group = g18)
 scoutLn    = input.bool(true, "Show Next-Trade Trigger Lines", group = g18)
 
+g19 = "=== TRADE HISTORY PANEL ==="
+histOn    = input.bool(false, "Show Trade History Panel", tooltip = "A small table of the latest finished trades (date, side, setup, entry → exit, targets hit, result in R) plus win rate and total R for the trades on the loaded chart. Off by default to keep the chart clean: turn it on when you want to review.", group = g19)
+histN     = input.int(10, "Trades Shown", minval = 3, maxval = 25, group = g19)
+histPos   = input.string("Bottom Left", "Panel Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Left", "Middle Right"], group = g19)
+histSzIn  = input.string("Tiny", "Panel Text Size", options = ["Tiny", "Small", "Normal"], group = g19)
+histOpen  = input.bool(true, "Show the Open Trade on Top", group = g19)
+
 // ═════════════════════════════ PRESETS (effective values) ═════════════════════════════
 // NOTE: the original's preset values are not public; these are best estimates.
 isScalp = preset == "Scalping (Fast)"
@@ -285,6 +292,7 @@ var float tTP1    = na
 var float tTP2    = na
 var float tTP3    = na
 var int tStage    = 0
+var int tTime     = na
 var int lastSigDir  = 0
 var int lastSigBar  = -100000
 var string lastQ    = ""
@@ -907,6 +915,19 @@ if waitRecov and (waitL or waitS) and not (classic and (takeL or takeS))
     waitTop := math.max(open, close)
     waitBot := math.min(open, close)
 
+// trade history (filled when a trade resolves, newest first)
+var array<string> hDate  = array.new<string>()
+var array<int>    hDir   = array.new<int>()
+var array<string> hSetup = array.new<string>()
+var array<float>  hEntry = array.new<float>()
+var array<float>  hExit  = array.new<float>()
+var array<int>    hStage = array.new<int>()
+var array<string> hWhy   = array.new<string>()
+var array<float>  hR     = array.new<float>()
+var int   hCnt  = 0
+var int   hWins = 0
+var float hSumR = 0.0
+
 // ═════════════════════════════ TRADE MANAGEMENT ═════════════════════════════
 float exitPx = na
 string exitWhy = ""
@@ -952,6 +973,26 @@ if not na(exitPx)
     resHit := hitTxt
     resExit := "Closed by " + exitWhy + " at " + f_px(exitPx) + " (" + (rR >= 0 ? "+" : "") + str.tostring(rR, "#.##") + "R)"
     resWin := rR >= 0
+    array.unshift(hDate, na(tTime) ? "-" : str.format_time(tTime, "dd MMM HH:mm", syminfo.timezone))
+    array.unshift(hDir, tDir)
+    array.unshift(hSetup, tName)
+    array.unshift(hEntry, tEntry)
+    array.unshift(hExit, exitPx)
+    array.unshift(hStage, exitWhy == "TP3" ? 3 : tStage)
+    array.unshift(hWhy, exitWhy)
+    array.unshift(hR, rR)
+    if array.size(hR) > 25
+        array.pop(hDate)
+        array.pop(hDir)
+        array.pop(hSetup)
+        array.pop(hEntry)
+        array.pop(hExit)
+        array.pop(hStage)
+        array.pop(hWhy)
+        array.pop(hR)
+    hCnt += 1
+    hWins += rR > 0.05 ? 1 : 0
+    hSumR += rR
     for l in tLines
         if keepHist
             line.set_color(l, color.new(#787b86, histT))
@@ -985,6 +1026,7 @@ if takeL or takeS
     tTP2   := close + d * tp2M * tRisk
     tTP3   := close + d * tp3M * tRisk
     tStage := 0
+    tTime  := time
     lNm = lType == "retest" ? zBullKind + " Retest" : boxBreakUp and not bullBreak ? "Session Breakout" : "Structure Breakout"
     sNm = sType == "retest" ? zBearKind + " Retest" : boxBreakDn and not bearBreak ? "Session Breakout" : "Structure Breakout"
     tName := (takeL ? lNm + " (" + (recL ? "RETEST TAKE" : qL) + ")" : sNm + " (" + (recS ? "RETEST TAKE" : qS) + ")")
@@ -1400,6 +1442,65 @@ if barstate.islast
         if not na(sellTrig)
             scSellLn := line.new(bar_index - 5, sellTrig, bar_index + 10, sellTrig, color = color.new(cPink, 30), style = line.style_dotted, width = 1)
             scSellLb := label.new(bar_index + 10, sellTrig, "▼ " + f_pxT(sellTrig) + " " + rdS, style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.new(cPink, 20), size = size.tiny)
+
+// ═════════════════════════════ TRADE HISTORY PANEL ═════════════════════════════
+histP = histPos == "Top Right" ? position.top_right : histPos == "Top Left" ? position.top_left : histPos == "Bottom Right" ? position.bottom_right : histPos == "Middle Left" ? position.middle_left : histPos == "Middle Right" ? position.middle_right : position.bottom_left
+var table ht = table.new(histP, 7, 28, bgcolor = color.new(#1e2433, hudBgT), border_color = color.new(#2a2e39, 0), border_width = 1, frame_color = color.new(#2a2e39, 0), frame_width = 1)
+f_hShort(string n) =>
+    string r = str.replace_all(n, "Structure Breakout", "Structure BO")
+    r := str.replace_all(r, "Session Breakout", "Session BO")
+    r := str.replace_all(r, "Order Block", "OB")
+    r := str.replace_all(r, "Mitigation Block", "MB")
+    r := str.replace_all(r, "RETEST TAKE", "Retest Take")
+    r := str.replace_all(r, "TAKE", "Take")
+    r := str.replace_all(r, "WAIT", "Wait")
+    str.replace_all(r, "AVOID", "Avoid")
+f_hWhy(string w) => w == "Stop Loss" ? "SL" : w == "Breakeven stop" ? "Breakeven" : w == "Trailing stop" ? "Trail stop" : w == "Opposite signal" ? "Flipped" : w == "TP3" ? "TP3 🎯" : w
+f_hHits(int st) => (st >= 1 ? "✅" : "❌") + (st >= 2 ? "✅" : "❌") + (st >= 3 ? "✅" : "❌")
+f_hCell(int c, int r, string t, color tc, int sz) =>
+    table.cell(ht, c, r, t, text_color = tc, text_size = sz == 0 ? size.tiny : sz == 1 ? size.small : size.normal, text_halign = text.align_left, bgcolor = color.new(#1e2433, hudBgT))
+if barstate.islast
+    table.clear(ht, 0, 0, 6, 27)
+    if histOn
+        hz = histSzIn == "Tiny" ? 0 : histSzIn == "Small" ? 1 : 2
+        winP = hCnt > 0 ? 100.0 * hWins / hCnt : 0.0
+        f_hCell(0, 0, "📜 TRADE HISTORY", #ffa726, hz)
+        f_hCell(1, 0, str.tostring(hCnt) + " trades", cWhite, hz)
+        f_hCell(2, 0, "Win " + str.tostring(winP, "#") + "%", winP >= 50 ? cTeal : cPink, hz)
+        f_hCell(3, 0, "Total " + (hSumR >= 0 ? "+" : "") + str.tostring(hSumR, "#.##") + "R", hSumR >= 0 ? cTeal : cPink, hz)
+        f_hCell(4, 0, "Avg " + (hCnt > 0 ? (hSumR >= 0 ? "+" : "") + str.tostring(hSumR / hCnt, "#.##") : "0") + "R", cGray, hz)
+        f_hCell(5, 0, "(loaded chart)", cGray, hz)
+        f_hCell(6, 0, "", cGray, hz)
+        hdr = array.from("Date", "Side", "Setup", "Entry → Exit", "TP1 2 3", "Closed by", "Result")
+        for c = 0 to 6
+            f_hCell(c, 1, array.get(hdr, c), cGray, hz)
+        int row = 2
+        if histOpen and tDir != 0
+            liveR = (close - tEntry) / tRisk * tDir
+            f_hCell(0, row, na(tTime) ? "-" : str.format_time(tTime, "dd MMM HH:mm", syminfo.timezone), cWhite, hz)
+            f_hCell(1, row, tDir == 1 ? "▲ Buy" : "▼ Sell", tDir == 1 ? cTeal : cPink, hz)
+            f_hCell(2, row, f_hShort(tName), cWhite, hz)
+            f_hCell(3, row, f_pxT(tEntry) + " → " + f_pxT(close), cWhite, hz)
+            f_hCell(4, row, f_hHits(tStage), cWhite, hz)
+            f_hCell(5, row, "⏳ Open", #ffa726, hz)
+            f_hCell(6, row, (liveR >= 0 ? "+" : "") + str.tostring(liveR, "#.##") + "R", liveR >= 0 ? cTeal : cPink, hz)
+            row += 1
+        nShow = math.min(histN, array.size(hR))
+        if nShow > 0
+            for k = 0 to nShow - 1
+                r0 = array.get(hR, k)
+                d0 = array.get(hDir, k)
+                rc = r0 > 0.05 ? cTeal : r0 < -0.05 ? cPink : cGray
+                f_hCell(0, row, array.get(hDate, k), cGray, hz)
+                f_hCell(1, row, d0 == 1 ? "▲ Buy" : "▼ Sell", d0 == 1 ? cTeal : cPink, hz)
+                f_hCell(2, row, f_hShort(array.get(hSetup, k)), cWhite, hz)
+                f_hCell(3, row, f_pxT(array.get(hEntry, k)) + " → " + f_pxT(array.get(hExit, k)), cWhite, hz)
+                f_hCell(4, row, f_hHits(array.get(hStage, k)), cWhite, hz)
+                f_hCell(5, row, f_hWhy(array.get(hWhy, k)), cGray, hz)
+                f_hCell(6, row, (r0 >= 0 ? "+" : "") + str.tostring(r0, "#.##") + "R", rc, hz)
+                row += 1
+        if nShow == 0 and not (histOpen and tDir != 0)
+            f_hCell(0, row, "No finished trades on the loaded chart yet", cGray, hz)
 
 // ═════════════════════════════ ALERTS ═════════════════════════════
 f_msg(int d, string q) =>
